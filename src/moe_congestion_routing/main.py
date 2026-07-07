@@ -1,5 +1,9 @@
+def greet(name: str = "moe-congestion-routing") -> str:
+    return f"Hello from {name}!"
+
+
 def main() -> None:
-    print("Hello from moe-congestion-routing!")
+    print(greet())
 
 
 if __name__ == "__main__":
