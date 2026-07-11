@@ -1,6 +1,9 @@
 target-version = "py314"
 line-length = 100
 
+# Vendored/third-party code, not ours to lint:
+extend-exclude = ["Megatron-LM"]
+
 [lint]
 select = [
     "E",   # pycodestyle errors
