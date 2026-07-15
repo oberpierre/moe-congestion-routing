@@ -7,3 +7,6 @@ build/
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
+
+# Generated artifacts
+artifacts/

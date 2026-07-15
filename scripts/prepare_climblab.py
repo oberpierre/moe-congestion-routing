@@ -2,6 +2,7 @@
 """Prepare ClimbLab .bin/.idx train / held-out-validation prefixes from a yaml config.
 
 Usage:
+    uv run python scripts/prepare_climblab.py configs/data/climblab_local.yaml
     uv run python scripts/prepare_climblab.py --list-clusters      # discover cluster names
     uv run python scripts/prepare_climblab.py --plan-conversions   # show planned conversions
 
@@ -14,6 +15,7 @@ import argparse
 
 from moe_congestion_routing.data.climblab import available_clusters, plan_conversions
 from moe_congestion_routing.data.config import DataPrepConfig
+from moe_congestion_routing.data.prepare_dataset import run_preparation
 
 
 def main() -> None:
@@ -50,6 +52,15 @@ def main() -> None:
                 f"({len(conversion.shards):<3} shards) -> {conversion.prefix}"
             )
         return
+
+    prepared = run_preparation(config)
+
+    print(f"Prepared {len(prepared)} prefix(es) in {config.output_dir}:")
+    for p in prepared:
+        print(
+            f"  {p.prefix:<28} role={p.role:<8} cluster={p.cluster:<12} "
+            f"docs={p.num_documents:>9,} tokens={p.num_tokens:>13,}"
+        )
 
 
 if __name__ == "__main__":
