@@ -3,6 +3,7 @@
 
 Usage:
     uv run python scripts/prepare_climblab.py --list-clusters      # discover cluster names
+    uv run python scripts/prepare_climblab.py --plan-conversions   # show planned conversions
 
 Downloads only the selected clusters/shards (never the whole dataset), converts each
 (cluster, split) to its own Megatron IndexedDataset prefix, and writes a manifest.json.
@@ -11,11 +12,13 @@ Requires network + Hugging Face access to nvidia/Nemotron-ClimbLab (CC BY-NC).
 
 import argparse
 
-from moe_congestion_routing.data.climblab import available_clusters
+from moe_congestion_routing.data.climblab import available_clusters, plan_conversions
+from moe_congestion_routing.data.config import DataPrepConfig
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("config", nargs="?", help="path to a DataPrepConfig yaml file")
     parser.add_argument(
         "--list-clusters",
         metavar="REPO",
@@ -23,11 +26,30 @@ def main() -> None:
         const="nvidia/Nemotron-ClimbLab",
         help="list available cluster folder names in the dataset repo and exit",
     )
+    parser.add_argument(
+        "--plan-conversions",
+        action="store_true",
+        help="show planned conversions (cluster, split) -> prefix and exit",
+    )
     args = parser.parse_args()
 
     if args.list_clusters:
         for cluster in available_clusters(args.list_clusters):
             print(cluster)
+        return
+
+    if not args.config:
+        parser.error("a config yaml path is required (or use --list-clusters)")
+
+    config = DataPrepConfig.from_yaml(args.config)
+
+    if args.plan_conversions:
+        for conversion in plan_conversions(config):
+            print(
+                f"{conversion.cluster:<12} {conversion.role:<8} "
+                f"({len(conversion.shards):<3} shards) -> {conversion.prefix}"
+            )
+        return
 
 
 if __name__ == "__main__":
