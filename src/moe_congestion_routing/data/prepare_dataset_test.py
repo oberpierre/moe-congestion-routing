@@ -9,6 +9,8 @@ right order.
 import json
 from pathlib import Path
 
+import pytest
+
 from moe_congestion_routing.data import prepare_dataset
 from moe_congestion_routing.data.climblab import ConversionJob
 from moe_congestion_routing.data.config import DataPrepConfig
@@ -60,9 +62,13 @@ def _patch_io(monkeypatch):
 
 
 def test_downloads_every_shard_once_and_maps_them_per_job(tmp_path, monkeypatch):
+    # convert_workers=1 keeps conversion inline so the monkeypatched convert_shards is reached
+    # (a ProcessPoolExecutor would run the real one in a subprocess, out of the patch's scope).
     download_calls, convert_calls = _patch_io(monkeypatch)
 
-    prepared = prepare_dataset.run_preparation(_config(tmp_path), _cluster_to_shards())
+    prepared = prepare_dataset.run_preparation(
+        _config(tmp_path), _cluster_to_shards(), convert_workers=1
+    )
 
     # (1) exactly one concurrent download batch, holding every distinct shard once, in order.
     assert len(download_calls) == 1
@@ -111,8 +117,58 @@ def test_shared_shard_across_jobs_is_downloaded_once(tmp_path, monkeypatch):
     ]
     monkeypatch.setattr(prepare_dataset, "plan_conversions", lambda *a, **k: jobs)
 
-    prepare_dataset.run_preparation(_config(tmp_path), _cluster_to_shards())
+    prepare_dataset.run_preparation(_config(tmp_path), _cluster_to_shards(), convert_workers=1)
 
     assert download_calls == [[shared]]  # deduped: one shard, one batch
     local = Path(f"/local/{shared.replace('/', '__')}")
     assert dict(convert_calls) == {"job_a": [local], "job_b": [local]}
+
+
+def test_parallel_convert_path_builds_every_prefix(tmp_path, monkeypatch):
+    """The real ProcessPoolExecutor path (convert_workers>1): convert_shards runs for real in
+    worker processes, so this catches pickling / ordering / independence bugs the mocked tests
+    (inline path only) cannot. Gated on megatron like the convert_shards test."""
+    import pyarrow
+    import pyarrow.parquet
+
+    pytest.importorskip("triton", reason="megatron.core requires triton, unavailable on macOS")
+    from moe_congestion_routing.training.megatron_path import (
+        MegatronLMNotVendoredError,
+        ensure_on_path,
+    )
+
+    try:
+        ensure_on_path()
+    except MegatronLMNotVendoredError as e:
+        pytest.skip(str(e))
+    IndexedDataset = pytest.importorskip("megatron.core.datasets.indexed_dataset").IndexedDataset
+
+    # A distinct tiny parquet per planned shard; unique token values let us verify concat order.
+    c2s = _cluster_to_shards()
+    rows_by_shard, local_by_shard = {}, {}
+    for i, cluster in enumerate(sorted(c2s)):
+        for j, shard in enumerate(c2s[cluster]):
+            rows = [[i * 10 + j, i * 10 + j + 1]]  # one document, two tokens, unique per shard
+            path = tmp_path / f"{cluster}__{j}.parquet"
+            table = pyarrow.table({"tokens": pyarrow.array(rows, pyarrow.list_(pyarrow.int32()))})
+            pyarrow.parquet.write_table(table, str(path))
+            rows_by_shard[shard], local_by_shard[shard] = rows, path
+
+    monkeypatch.setattr(
+        prepare_dataset,
+        "download_shards",
+        lambda repo, shards, cache, **_: [local_by_shard[s] for s in shards],
+    )
+
+    prepared = prepare_dataset.run_preparation(_config(tmp_path), c2s, convert_workers=2)
+
+    out = Path(_config(tmp_path).output_dir)
+    for prefix in prepared:
+        ds = IndexedDataset(str(out / prefix.prefix))
+        assert len(ds) == prefix.num_documents
+    # cluster_3's two holdout shards must be concatenated in shard order, across the pool.
+    holdout = IndexedDataset(str(out / "cluster_3_holdout"))
+    assert [holdout[k].tolist() for k in range(len(holdout))] == (
+        rows_by_shard["cluster_3/cluster_3_000.parquet"]
+        + rows_by_shard["cluster_3/cluster_3_001.parquet"]
+    )
