@@ -49,9 +49,15 @@ def run_preparation(
     cache_dir = Path(download_dir) if download_dir is not None else output_dir / "_hf_cache"
     jobs = plan_conversions(config, cluster_to_shards)
 
+    # Download shards across all jobs in one concurrent batch, so shards from different jobs
+    # overlap instead of downloading sequentially.
+    all_shards = list(dict.fromkeys(shard for job in jobs for shard in job.shards))
+    local_paths = download_shards(config.dataset_repo, all_shards, cache_dir)
+    shard_to_local = dict(zip(all_shards, local_paths, strict=True))
+
     prepared: list[PreparedPrefix] = []
     for job in jobs:
-        local_shards = download_shards(config.dataset_repo, job.shards, cache_dir)
+        local_shards = [shard_to_local[shard] for shard in job.shards]
         stats = convert_shards(
             local_shards,
             output_dir / job.prefix,

@@ -82,17 +82,34 @@ def convert_shards(
     )
 
 
-def download_shards(dataset_repo: str, shards: Iterable[str], cache_dir: str | Path) -> list[Path]:
-    """Download parquet shards from the HF dataset repo, returning local file paths."""
+def download_shards(
+    dataset_repo: str,
+    shards: Iterable[str],
+    cache_dir: str | Path,
+    *,
+    max_workers: int = 8,
+) -> list[Path]:
+    """Download parquet shards from the HF dataset repo, returning local file paths.
+
+    Shards download concurrently up to ``max_workers`` at a time. Returned paths preserve the
+    input shard order, which ``convert_shards`` relies on for deterministic document ordering.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
     from huggingface_hub import hf_hub_download
 
-    paths = []
-    for shard in shards:
-        local = hf_hub_download(
-            repo_id=dataset_repo,
-            filename=shard,
-            repo_type="dataset",
-            cache_dir=str(cache_dir),
+    shards = list(shards)
+
+    def fetch(shard: str) -> Path:
+        return Path(
+            hf_hub_download(
+                repo_id=dataset_repo,
+                filename=shard,
+                repo_type="dataset",
+                cache_dir=str(cache_dir),
+            )
         )
-        paths.append(Path(local))
-    return paths
+
+    workers = max(1, min(max_workers, len(shards)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(fetch, shards))  # map preserves input order

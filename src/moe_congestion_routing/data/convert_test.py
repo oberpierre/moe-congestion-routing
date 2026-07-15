@@ -6,7 +6,7 @@ import pyarrow
 import pyarrow.parquet
 import pytest
 
-from moe_congestion_routing.data.convert import convert_shards, iter_token_rows
+from moe_congestion_routing.data.convert import convert_shards, download_shards, iter_token_rows
 from moe_congestion_routing.training.megatron_path import MegatronLMNotVendoredError, ensure_on_path
 
 
@@ -27,6 +27,36 @@ def test_iter_token_rows_raises_on_missing_column(tmp_path):
     _write_parquet(path, [[1, 2]], column="tokens")
     with pytest.raises(KeyError, match="input_ids"):
         list(iter_token_rows(path, "input_ids"))
+
+
+def test_download_shards_preserves_order_and_passes_repo_args(monkeypatch):
+    """Concurrent fetch must return paths in input-shard order (convert_shards depends on it)."""
+    import huggingface_hub
+
+    seen = []
+
+    def fake_download(*, repo_id, filename, repo_type, cache_dir):
+        seen.append((repo_id, filename, repo_type, cache_dir))
+        return f"/cache/{filename}"
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+
+    shards = [f"cluster_1/cluster_1_{i:03d}.tokenized.parquet" for i in range(5)]
+    paths = download_shards("nvidia/Nemotron-ClimbLab", shards, "/cache", max_workers=4)
+
+    assert [p.name for p in paths] == [f"cluster_1_{i:03d}.tokenized.parquet" for i in range(5)]
+    assert all(repo_id == "nvidia/Nemotron-ClimbLab" for repo_id, _, _, _ in seen)
+    assert all(repo_type == "dataset" for _, _, repo_type, _ in seen)
+    assert {filename for _, filename, _, _ in seen} == set(shards)
+
+
+def test_download_shards_empty_is_noop(monkeypatch):
+    import huggingface_hub
+
+    monkeypatch.setattr(
+        huggingface_hub, "hf_hub_download", lambda **_: pytest.fail("should not download")
+    )
+    assert download_shards("repo", [], "/cache") == []
 
 
 def test_convert_shards_yields_correct_results():
