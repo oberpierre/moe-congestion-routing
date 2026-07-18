@@ -64,12 +64,6 @@ class DataPrepConfig:
     vocab_size: int = 50257
     """GPT-2 vocabulary size; used for dtype sanity and the tokenizer shim."""
 
-    seed: int = 1234
-    """Random seed threaded into the downstream ``GPTDataset`` global shuffle order."""
-
-    seq_length: int = 2048
-    """Sequence length of the samples the downstream ``GPTDataset`` packs tokens into."""
-
     def __post_init__(self) -> None:
         if not self.clusters:
             raise ValueError("clusters must be a non-empty list")

@@ -20,10 +20,6 @@ append_eod: false
 eod_token_id: 50256
 vocab_size: 50257
 
-# Threaded into the downstream GPTDataset deterministic global shuffle.
-seed: 1234
-seq_length: 2048
-
 # Worker pool configuration for download and conversion. Note that download_wokers are threaded,
 # while convert_workers are process-based (multiprocessing).
 download_workers: 4
