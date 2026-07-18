@@ -12,6 +12,7 @@ Requires network + Hugging Face access to nvidia/Nemotron-ClimbLab (CC BY-NC).
 """
 
 import argparse
+import logging
 
 from moe_congestion_routing.data.climblab import available_clusters, plan_conversions
 from moe_congestion_routing.data.config import DataPrepConfig
@@ -19,6 +20,10 @@ from moe_congestion_routing.data.prepare_dataset import run_preparation
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", nargs="?", help="path to a DataPrepConfig yaml file")
     parser.add_argument(

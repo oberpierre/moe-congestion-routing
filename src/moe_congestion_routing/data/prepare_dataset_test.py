@@ -8,6 +8,7 @@ right order.
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,14 +18,16 @@ from moe_congestion_routing.data.config import DataPrepConfig
 from moe_congestion_routing.data.convert import ConversionStats
 
 
-def _config(tmp_path):
-    return DataPrepConfig(
-        output_dir=str(tmp_path / "out"),
-        clusters=["cluster_1", "cluster_2"],
-        held_out_clusters=["cluster_3"],
-        shards_per_cluster=2,
-        val_shards_per_cluster=1,
-    )
+def _config(tmp_path, **overrides):
+    base = {
+        "output_dir": str(tmp_path / "out"),
+        "clusters": ["cluster_1", "cluster_2"],
+        "held_out_clusters": ["cluster_3"],
+        "shards_per_cluster": 2,
+        "val_shards_per_cluster": 1,
+    }
+    base.update(overrides)
+    return DataPrepConfig(**base)
 
 
 def _cluster_to_shards():
@@ -35,21 +38,25 @@ def _cluster_to_shards():
 
 
 def _patch_io(monkeypatch):
-    """Replace the two heavy steps; record (download_calls, convert_calls, cache_dirs)."""
-    download_calls = []
-    convert_calls = []
-    cache_dirs = []
+    """Replace the two heavy steps; record their args on a namespace.
 
-    def fake_download(dataset_repo, shards, cache_dir, **_):
+    ``rec.download_calls`` (per-call shard lists), ``rec.cache_dirs`` / ``rec.download_workers``
+    (the cache dir + thread count passed to ``download_shards``), and ``rec.convert_calls``
+    (``(prefix_name, local_paths)`` per job).
+    """
+    rec = SimpleNamespace(download_calls=[], convert_calls=[], cache_dirs=[], download_workers=[])
+
+    def fake_download(dataset_repo, shards, cache_dir, *, max_workers=None, **_):
         shards = list(shards)
-        download_calls.append(shards)
-        cache_dirs.append(cache_dir)
+        rec.download_calls.append(shards)
+        rec.cache_dirs.append(cache_dir)
+        rec.download_workers.append(max_workers)
         # local path is a stable, invertible function of the repo-relative shard path
         return [Path(f"/local/{s.replace('/', '__')}") for s in shards]
 
     def fake_convert(parquet_paths, output_prefix, **_):
         paths = list(parquet_paths)
-        convert_calls.append((Path(output_prefix).name, paths))
+        rec.convert_calls.append((Path(output_prefix).name, paths))
         return ConversionStats(
             prefix=Path(output_prefix).name,
             num_documents=len(paths),
@@ -60,24 +67,26 @@ def _patch_io(monkeypatch):
 
     monkeypatch.setattr(prepare_dataset, "download_shards", fake_download)
     monkeypatch.setattr(prepare_dataset, "convert_shards", fake_convert)
-    return download_calls, convert_calls, cache_dirs
+    return rec
 
 
 def test_downloads_every_shard_once_and_maps_them_per_job(tmp_path, monkeypatch):
     # convert_workers=1 keeps conversion inline so the monkeypatched convert_shards is reached
     # (a ProcessPoolExecutor would run the real one in a subprocess, out of the patch's scope).
-    download_calls, convert_calls, cache_dirs = _patch_io(monkeypatch)
+    rec = _patch_io(monkeypatch)
 
-    config = _config(tmp_path)
-    prepared = prepare_dataset.run_preparation(config, _cluster_to_shards(), convert_workers=1)
+    config = _config(tmp_path, convert_workers=1)
+    prepared = prepare_dataset.run_preparation(config, _cluster_to_shards())
 
-    # (0) shards are cached in the config-resolved cache dir (<output_dir>/_hf_cache by default).
-    assert cache_dirs == [config.cache_path]
+    # (0) shards are cached in the config-resolved cache dir (<output_dir>/_hf_cache by default),
+    #     and downloaded with the config's thread count.
+    assert rec.cache_dirs == [config.cache_path]
     assert config.cache_path == Path(config.output_dir) / "_hf_cache"
+    assert rec.download_workers == [config.download_workers]
 
     # (1) exactly one concurrent download batch, holding every distinct shard once, in order.
-    assert len(download_calls) == 1
-    assert download_calls[0] == [
+    assert len(rec.download_calls) == 1
+    assert rec.download_calls[0] == [
         "cluster_1/cluster_1_000.parquet",
         "cluster_1/cluster_1_001.parquet",
         "cluster_2/cluster_2_000.parquet",
@@ -90,7 +99,7 @@ def test_downloads_every_shard_once_and_maps_them_per_job(tmp_path, monkeypatch)
     def local(shard):
         return Path(f"/local/{shard.replace('/', '__')}")
 
-    assert dict(convert_calls) == {
+    assert dict(rec.convert_calls) == {
         "cluster_1_train": [local("cluster_1/cluster_1_000.parquet")],
         "cluster_1_valid": [local("cluster_1/cluster_1_001.parquet")],
         "cluster_2_train": [local("cluster_2/cluster_2_000.parquet")],
@@ -113,7 +122,7 @@ def test_downloads_every_shard_once_and_maps_them_per_job(tmp_path, monkeypatch)
 
 def test_shared_shard_across_jobs_is_downloaded_once(tmp_path, monkeypatch):
     """If two jobs ever reference the same shard, it must be fetched once and mapped to both."""
-    download_calls, convert_calls, _ = _patch_io(monkeypatch)
+    rec = _patch_io(monkeypatch)
 
     shared = "cluster_1/cluster_1_000.parquet"
     jobs = [
@@ -122,11 +131,114 @@ def test_shared_shard_across_jobs_is_downloaded_once(tmp_path, monkeypatch):
     ]
     monkeypatch.setattr(prepare_dataset, "plan_conversions", lambda *a, **k: jobs)
 
-    prepare_dataset.run_preparation(_config(tmp_path), _cluster_to_shards(), convert_workers=1)
+    prepare_dataset.run_preparation(_config(tmp_path, convert_workers=1), _cluster_to_shards())
 
-    assert download_calls == [[shared]]  # deduped: one shard, one batch
+    assert rec.download_calls == [[shared]]  # deduped: one shard, one batch
     local = Path(f"/local/{shared.replace('/', '__')}")
-    assert dict(convert_calls) == {"job_a": [local], "job_b": [local]}
+    assert dict(rec.convert_calls) == {"job_a": [local], "job_b": [local]}
+
+
+class _RecordingPool:
+    """Stand-in for ProcessPoolExecutor: records how it was built and runs ``map`` inline.
+
+    Running inline (in-process) lets us assert the requested worker count without spawning
+    real subprocesses, and keeps the monkeypatched ``convert_shards`` in scope.
+    """
+
+    def __init__(self, max_workers=None, mp_context=None):
+        self.max_workers = max_workers
+        self.mp_context = mp_context
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def map(self, fn, *iterables):
+        # Non-strict like the real Executor.map: run_preparation passes an infinite repeat(config).
+        return [fn(*args) for args in zip(*iterables)]  # noqa: B905
+
+
+def _record_pools(monkeypatch):
+    """Patch ProcessPoolExecutor with the recording stand-in; return the list of pools built."""
+    created = []
+
+    def factory(max_workers=None, mp_context=None):
+        pool = _RecordingPool(max_workers=max_workers, mp_context=mp_context)
+        created.append(pool)
+        return pool
+
+    monkeypatch.setattr(prepare_dataset, "ProcessPoolExecutor", factory)
+    return created
+
+
+def test_convert_worker_count_is_capped_by_job_count(tmp_path, monkeypatch):
+    """Asking for more workers than jobs caps at the job count, and the pool uses spawn."""
+    _patch_io(monkeypatch)
+    created = _record_pools(monkeypatch)
+
+    # config plans 5 jobs; request 100 workers -> min(100, 5) = 5.
+    prepare_dataset.run_preparation(_config(tmp_path, convert_workers=100), _cluster_to_shards())
+
+    assert [pool.max_workers for pool in created] == [5]
+    assert created[0].mp_context.get_start_method() == "spawn"
+
+
+def test_convert_worker_count_defaults_to_cpu_count(tmp_path, monkeypatch):
+    """convert_workers=None uses os.cpu_count(), still bounded by the job count."""
+    _patch_io(monkeypatch)
+    created = _record_pools(monkeypatch)
+    monkeypatch.setattr(prepare_dataset.os, "cpu_count", lambda: 3)
+
+    prepare_dataset.run_preparation(_config(tmp_path, convert_workers=None), _cluster_to_shards())
+
+    assert [pool.max_workers for pool in created] == [3]  # min(cpu_count=3, jobs=5)
+
+
+def test_convert_workers_one_runs_inline_without_a_pool(tmp_path, monkeypatch):
+    """convert_workers=1 takes the inline path: no process pool is ever constructed."""
+    rec = _patch_io(monkeypatch)
+    created = _record_pools(monkeypatch)
+
+    prepare_dataset.run_preparation(_config(tmp_path, convert_workers=1), _cluster_to_shards())
+
+    assert created == []  # pool never built
+    assert len(rec.convert_calls) == 5  # yet all 5 jobs still converted
+
+
+def test_download_thread_count_comes_from_config(tmp_path, monkeypatch):
+    """download_shards receives config.download_workers as its thread count."""
+    rec = _patch_io(monkeypatch)
+
+    prepare_dataset.run_preparation(
+        _config(tmp_path, convert_workers=1, download_workers=4), _cluster_to_shards()
+    )
+
+    assert rec.download_workers == [4]
+
+
+def test_logs_convert_process_count_for_pool(tmp_path, monkeypatch, caplog):
+    """The parallel path logs how many worker processes are used (here capped to 5 jobs)."""
+    _patch_io(monkeypatch)
+    _record_pools(monkeypatch)
+
+    with caplog.at_level("INFO", logger="moe_congestion_routing.data.prepare_dataset"):
+        prepare_dataset.run_preparation(
+            _config(tmp_path, convert_workers=100), _cluster_to_shards()
+        )
+
+    assert "across 5 worker process(es)" in caplog.text
+
+
+def test_logs_convert_single_process_for_inline(tmp_path, monkeypatch, caplog):
+    """The inline path logs that a single process is used."""
+    _patch_io(monkeypatch)
+
+    with caplog.at_level("INFO", logger="moe_congestion_routing.data.prepare_dataset"):
+        prepare_dataset.run_preparation(_config(tmp_path, convert_workers=1), _cluster_to_shards())
+
+    assert "inline in a single process" in caplog.text
 
 
 def test_parallel_convert_path_builds_every_prefix(tmp_path, monkeypatch):
@@ -165,7 +277,7 @@ def test_parallel_convert_path_builds_every_prefix(tmp_path, monkeypatch):
         lambda repo, shards, cache, **_: [local_by_shard[s] for s in shards],
     )
 
-    prepared = prepare_dataset.run_preparation(_config(tmp_path), c2s, convert_workers=2)
+    prepared = prepare_dataset.run_preparation(_config(tmp_path, convert_workers=2), c2s)
 
     out = Path(_config(tmp_path).output_dir)
     for prefix in prepared:

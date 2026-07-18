@@ -6,6 +6,7 @@ no tokenizer step: we read the token-id column straight into Megatron's
 a boundary in ``document_indices``, which is exactly what ``GPTDataset`` shuffles over).
 """
 
+import logging
 import os
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ import numpy
 import pyarrow.parquet as parquet
 
 from moe_congestion_routing.training.megatron_path import ensure_on_path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,8 @@ def download_shards(
     from huggingface_hub import hf_hub_download
 
     shards = list(shards)
+    if not shards:
+        return []
 
     def fetch(shard: str) -> Path:
         return Path(
@@ -111,5 +116,6 @@ def download_shards(
         )
 
     workers = max(1, min(max_workers, len(shards)))
+    logger.info("Downloading %d shard(s) with %d thread(s)", len(shards), workers)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(fetch, shards))  # map preserves input order

@@ -91,3 +91,23 @@ def test_rejects_negative_val_shards():
 def test_rejects_eod_out_of_range_when_appending():
     with pytest.raises(ValueError, match=re.escape("eod_token_id must be within [0, vocab_size)")):
         _valid(append_eod=True, eod_token_id=99999, vocab_size=50257)
+
+
+def test_worker_defaults():
+    cfg = _valid()
+    assert cfg.download_workers == 8
+    assert cfg.convert_workers is None  # None => os.cpu_count() at run time
+
+
+def test_rejects_non_positive_download_workers():
+    with pytest.raises(ValueError, match="download_workers must be >= 1"):
+        _valid(download_workers=0)
+
+
+def test_rejects_non_positive_convert_workers():
+    with pytest.raises(ValueError, match="convert_workers must be >= 1"):
+        _valid(convert_workers=0)
+
+
+def test_convert_workers_allows_none():
+    assert _valid(convert_workers=None).convert_workers is None

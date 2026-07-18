@@ -50,6 +50,19 @@ def test_download_shards_preserves_order_and_passes_repo_args(monkeypatch):
     assert {filename for _, filename, _, _ in seen} == set(shards)
 
 
+def test_download_shards_logs_thread_count(monkeypatch, caplog):
+    """The effective thread count (capped by shard count) is logged at INFO."""
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **kw: f"/c/{kw['filename']}")
+
+    shards = ["a.parquet", "b.parquet", "c.parquet"]
+    with caplog.at_level("INFO", logger="moe_congestion_routing.data.convert"):
+        download_shards("repo", shards, "/cache", max_workers=8)  # capped to 3 by shard count
+
+    assert "Downloading 3 shard(s) with 3 thread(s)" in caplog.text
+
+
 def test_download_shards_empty_is_noop(monkeypatch):
     import huggingface_hub
 

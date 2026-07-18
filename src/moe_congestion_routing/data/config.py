@@ -25,6 +25,15 @@ class DataPrepConfig:
     """Directory the downloaded parquet shards are cached in. ``None`` (the default) resolves to
     ``<output_dir>/_hf_cache`` via :pyattr:`cache_path`."""
 
+    download_workers: int = 8
+    """Concurrent *threads* used to download shards. Downloads are I/O-bound HTTPS transfers, so
+    threads (not processes) overlap them; keep modest, as they share the link's bandwidth."""
+
+    convert_workers: int | None = None
+    """*Processes* used to convert shards in parallel; conversion is GIL-bound so it needs
+    processes, not threads. ``None`` uses ``os.cpu_count()``, ``1`` runs inline; either way it is
+    bounded by the job count. Each worker holds a whole shard in memory, so watch for OOM."""
+
     dataset_repo: str = "nvidia/Nemotron-ClimbLab"
     """Hugging Face dataset repo id to pull shards from."""
 
@@ -80,6 +89,10 @@ class DataPrepConfig:
                 )
         if self.append_eod and not 0 <= self.eod_token_id < self.vocab_size:
             raise ValueError("eod_token_id must be within [0, vocab_size)")
+        if self.download_workers < 1:
+            raise ValueError("download_workers must be >= 1")
+        if self.convert_workers is not None and self.convert_workers < 1:
+            raise ValueError("convert_workers must be >= 1 (or null for os.cpu_count())")
 
     @property
     def numpy_dtype(self) -> type[numpy.number]:

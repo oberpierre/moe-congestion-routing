@@ -1,5 +1,6 @@
 dataset_repo: nvidia/Nemotron-ClimbLab
 output_dir: artifacts/climblab_local
+cache_dir: artifacts/_hf_cache
 
 # Two training clusters, each capped to a few shards; last shard of each held out as
 # in-distribution validation. One entire cluster reserved as a held-out (domain-shift) set.
@@ -22,3 +23,8 @@ vocab_size: 50257
 # Threaded into the downstream GPTDataset deterministic global shuffle.
 seed: 1234
 seq_length: 2048
+
+# Worker pool configuration for download and conversion. Note that download_wokers are threaded,
+# while convert_workers are process-based (multiprocessing).
+download_workers: 4
+convert_workers: 2
