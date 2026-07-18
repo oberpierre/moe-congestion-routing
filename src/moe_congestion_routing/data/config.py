@@ -21,6 +21,10 @@ class DataPrepConfig:
     clusters: list[str]
     """ClimbLab cluster folder names used for training (and for per-cluster validation)."""
 
+    cache_dir: str | None = None
+    """Directory the downloaded parquet shards are cached in. ``None`` (the default) resolves to
+    ``<output_dir>/_hf_cache`` via :pyattr:`cache_path`."""
+
     dataset_repo: str = "nvidia/Nemotron-ClimbLab"
     """Hugging Face dataset repo id to pull shards from."""
 
@@ -81,6 +85,11 @@ class DataPrepConfig:
     def numpy_dtype(self) -> type[numpy.number]:
         """The numpy dtype the ``.bin`` tokens are stored as."""
         return _DTYPES[self.dtype]
+
+    @property
+    def cache_path(self) -> Path:
+        """Resolved shard cache directory: ``cache_dir`` if set, else ``<output_dir>/_hf_cache``."""
+        return Path(self.cache_dir) if self.cache_dir else Path(self.output_dir) / "_hf_cache"
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "DataPrepConfig":

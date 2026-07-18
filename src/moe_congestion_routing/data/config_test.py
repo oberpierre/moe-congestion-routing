@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 
 import numpy
 import pytest
@@ -18,6 +19,15 @@ def test_defaults_and_numpy_dtype():
     assert cfg.token_column == "tokens"
     assert cfg.numpy_dtype is numpy.uint16
     assert _valid(dtype="int32").numpy_dtype is numpy.int32
+
+
+def test_cache_path_defaults_under_output_dir():
+    assert _valid(output_dir="out").cache_path == Path("out") / "_hf_cache"
+
+
+def test_cache_path_uses_explicit_cache_dir():
+    cfg = _valid(output_dir="out", cache_dir="/scratch/shards")
+    assert cfg.cache_path == Path("/scratch/shards")
 
 
 def test_from_yaml_roundtrip(tmp_path):

@@ -57,24 +57,22 @@ def _convert_job(
 def run_preparation(
     config: DataPrepConfig,
     cluster_to_shards: dict[str, list[str]] | None = None,
-    download_dir: str | Path | None = None,
     *,
     convert_workers: int | None = None,
 ) -> list[PreparedPrefix]:
     """Build all planned prefixes and write the manifest.
 
     Args:
-        config: the preparation config.
+        config: the preparation config. Shards are cached in ``config.cache_path``.
         cluster_to_shards: pre-listed ``{cluster: [shard paths]}``; if ``None`` it is fetched
             from the HF Hub. Injecting it lets callers (and tests) skip the network listing.
-        download_dir: where shards are cached; defaults to ``<output_dir>/_hf_cache``.
         convert_workers: number of *processes* (not threads) used to convert jobs in parallel,
             as conversion is GIL-bound (pyarrow decode -> Python lists -> numpy). As each worker
             holds a whole shard's tokens in memory and shards reach up to 4 GB, take care of OOM.
     """
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = Path(download_dir) if download_dir is not None else output_dir / "_hf_cache"
+    cache_dir = config.cache_path
     jobs = plan_conversions(config, cluster_to_shards)
 
     # Download shards across all jobs in one concurrent batch, so shards from different jobs

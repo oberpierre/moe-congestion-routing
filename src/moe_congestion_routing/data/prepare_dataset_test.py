@@ -35,13 +35,15 @@ def _cluster_to_shards():
 
 
 def _patch_io(monkeypatch):
-    """Replace the two heavy steps; return the recorded (download_calls, convert_calls)."""
+    """Replace the two heavy steps; record (download_calls, convert_calls, cache_dirs)."""
     download_calls = []
     convert_calls = []
+    cache_dirs = []
 
     def fake_download(dataset_repo, shards, cache_dir, **_):
         shards = list(shards)
         download_calls.append(shards)
+        cache_dirs.append(cache_dir)
         # local path is a stable, invertible function of the repo-relative shard path
         return [Path(f"/local/{s.replace('/', '__')}") for s in shards]
 
@@ -58,17 +60,20 @@ def _patch_io(monkeypatch):
 
     monkeypatch.setattr(prepare_dataset, "download_shards", fake_download)
     monkeypatch.setattr(prepare_dataset, "convert_shards", fake_convert)
-    return download_calls, convert_calls
+    return download_calls, convert_calls, cache_dirs
 
 
 def test_downloads_every_shard_once_and_maps_them_per_job(tmp_path, monkeypatch):
     # convert_workers=1 keeps conversion inline so the monkeypatched convert_shards is reached
     # (a ProcessPoolExecutor would run the real one in a subprocess, out of the patch's scope).
-    download_calls, convert_calls = _patch_io(monkeypatch)
+    download_calls, convert_calls, cache_dirs = _patch_io(monkeypatch)
 
-    prepared = prepare_dataset.run_preparation(
-        _config(tmp_path), _cluster_to_shards(), convert_workers=1
-    )
+    config = _config(tmp_path)
+    prepared = prepare_dataset.run_preparation(config, _cluster_to_shards(), convert_workers=1)
+
+    # (0) shards are cached in the config-resolved cache dir (<output_dir>/_hf_cache by default).
+    assert cache_dirs == [config.cache_path]
+    assert config.cache_path == Path(config.output_dir) / "_hf_cache"
 
     # (1) exactly one concurrent download batch, holding every distinct shard once, in order.
     assert len(download_calls) == 1
@@ -97,7 +102,7 @@ def test_downloads_every_shard_once_and_maps_them_per_job(tmp_path, monkeypatch)
     }
 
     # (3) manifest records one prefix per job with its source shards preserved.
-    manifest = json.loads((Path(_config(tmp_path).output_dir) / "manifest.json").read_text())
+    manifest = json.loads((Path(config.output_dir) / "manifest.json").read_text())
     by_prefix = {p["prefix"]: p for p in manifest["prefixes"]}
     assert set(by_prefix) == {p.prefix for p in prepared}
     assert by_prefix["cluster_3_holdout"]["shards"] == [
@@ -108,7 +113,7 @@ def test_downloads_every_shard_once_and_maps_them_per_job(tmp_path, monkeypatch)
 
 def test_shared_shard_across_jobs_is_downloaded_once(tmp_path, monkeypatch):
     """If two jobs ever reference the same shard, it must be fetched once and mapped to both."""
-    download_calls, convert_calls = _patch_io(monkeypatch)
+    download_calls, convert_calls, _ = _patch_io(monkeypatch)
 
     shared = "cluster_1/cluster_1_000.parquet"
     jobs = [
