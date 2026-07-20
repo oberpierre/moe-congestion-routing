@@ -14,6 +14,7 @@ import argparse
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -41,17 +42,23 @@ def main() -> None:
     repo_root = megatron_dir.parent
 
     cfg = MoEPretrainConfig.from_yaml(args.config).resolved(repo_root)
+
+    # Each invocation gets its own <output_dir>/<timestamp>/ for the log, the frozen command,
+    # and checkpoints, so repeated/concurrent runs don't interfere with each other. The dataset
+    # cache is deliberately shared at <output_dir>/cache (keyed by seed/seq_length) so the
+    # sample/shuffle indices are built once and reused across runs.
+    run_dir = Path(cfg.output_dir) / datetime.now().strftime("%Y%m%d-%H%M%S")
+    # Checkpointing enabled (save_interval set) but no explicit save dir → checkpoint into this
+    # run's own dir, keeping each run's weights separate and trivial to locate for inference.
+    if cfg.save_interval and not cfg.save:
+        cfg = replace(cfg, save=str(run_dir / "checkpoints"))
+
     cmd = build_launch_command(cfg, megatron_dir / "pretrain_gpt.py", nproc=args.nproc)
 
     if args.dry_run:
         print(" ".join(cmd))
         return
 
-    # Each invocation gets its own <output_dir>/<timestamp>/ for the log, the frozen command,
-    # and (later) checkpoints, so repeated/concurrent runs don't clobber each other. The dataset
-    # cache is deliberately shared at <output_dir>/cache (keyed by seed/seq_length) so the
-    # sample/shuffle indices are built once and reused across runs.
-    run_dir = Path(cfg.output_dir) / datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
     Path(cfg.data_cache_path).mkdir(parents=True, exist_ok=True)
     if cfg.save:

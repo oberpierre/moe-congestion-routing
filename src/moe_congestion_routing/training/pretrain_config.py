@@ -46,10 +46,16 @@ class MoEPretrainConfig:
     eval_interval: int = 1000
     eval_iters: int = 0
 
-    # checkpointing (off by default; a later slice turns it on)
+    # checkpointing (Megatron semantics). save/load are DIRECTORIES, not single checkpoints: each
+    # save drops an iter_<N>/ subdir + a latest_checkpointed_iteration.txt tracker inside.
+    #   save         : where to write; default: launcher uses <output_dir>/<timestamp>/checkpoints.
+    #   save_interval: iterations between saves and toggles saving (no saves if unset).
+    #   load         : dir to resume/infer from, loads the newest iter_<N>/ per the tracker.
+    #   ckpt_step    : load this iteration instead of the newest (200 => iter_0000200/).
     save: str | None = None
     save_interval: int | None = None
     load: str | None = None
+    ckpt_step: int | None = None
 
     # runtime
     transformer_impl: str = "local"  # avoid Transformer Engine (not installed locally)
@@ -195,6 +201,8 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         args += ["--save-interval", str(cfg.save_interval)]
     if cfg.load:
         args += ["--load", cfg.load]
+    if cfg.ckpt_step:
+        args += ["--ckpt-step", str(cfg.ckpt_step)]
     return args
 
 

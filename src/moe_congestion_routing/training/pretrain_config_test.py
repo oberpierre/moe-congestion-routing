@@ -67,6 +67,19 @@ def test_build_megatron_args_toggles_optional_flags():
     assert "--save-interval" not in off
 
 
+def test_build_megatron_args_emits_load_when_set():
+    on = build_megatron_args(MoEPretrainConfig(load="/ckpt/dir"))
+    assert _pairs(on)["--load"] == "/ckpt/dir"
+    assert "--load" not in build_megatron_args(MoEPretrainConfig(load=None))
+
+
+def test_build_megatron_args_emits_ckpt_step_to_pin_iteration():
+    # load points at the checkpoints DIR; ckpt_step selects which iter_<N>/ inside it.
+    on = build_megatron_args(MoEPretrainConfig(load="/ckpt/dir", ckpt_step=200))
+    assert _pairs(on)["--ckpt-step"] == "200"
+    assert "--ckpt-step" not in build_megatron_args(MoEPretrainConfig(load="/ckpt/dir"))
+
+
 def test_resolved_absolutises_paths_and_derives_cache(tmp_path):
     cfg = MoEPretrainConfig(
         train_data_path="artifacts/x_train",
@@ -85,6 +98,14 @@ def test_resolved_keeps_absolute_paths(tmp_path):
     r = cfg.resolved(tmp_path)
     assert r.train_data_path == "/abs/train"
     assert r.data_cache_path == "/abs/cache"
+
+
+def test_resolved_absolutises_checkpoint_paths(tmp_path):
+    r = MoEPretrainConfig(save="ckpt/out", load="ckpt/in").resolved(tmp_path)
+    assert r.save == str(tmp_path / "ckpt/out")
+    assert r.load == str(tmp_path / "ckpt/in")
+    # unset stays None (launcher derives the per-run save dir when save_interval is on)
+    assert MoEPretrainConfig().resolved(tmp_path).save is None
 
 
 def test_build_launch_command_wraps_torchrun():
