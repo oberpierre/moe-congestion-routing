@@ -5,7 +5,19 @@ import pytest
 from moe_congestion_routing.training.megatron_path import (
     MegatronLMNotVendoredError,
     ensure_on_path,
+    megatron_root,
 )
+
+
+def test_megatron_root_returns_dir_when_present(tmp_path):
+    root = tmp_path / "Megatron-LM"
+    root.mkdir()
+    assert megatron_root(root) == root
+
+
+def test_megatron_root_raises_when_missing(tmp_path):
+    with pytest.raises(MegatronLMNotVendoredError, match="git submodule update --init"):
+        megatron_root(tmp_path / "Megatron-LM")
 
 
 @pytest.fixture

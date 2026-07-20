@@ -10,8 +10,8 @@ def _default_root() -> Path:
     return Path(__file__).resolve().parents[3] / "Megatron-LM"
 
 
-def ensure_on_path(root: Path | None = None) -> None:
-    """Adds the vendored Megatron-LM/ directory to sys.path.
+def megatron_root(root: Path | None = None) -> Path:
+    """Return the validated vendored Megatron-LM/ directory.
 
     Args:
         root: Override for the Megatron-LM directory, mainly for testing in isolation from
@@ -19,16 +19,28 @@ def ensure_on_path(root: Path | None = None) -> None:
             actual vendored submodule path.
 
     Raises:
-        MegatronLMNotVendoredError: if the directory doesn't exist (submodule not
-            initialized). Callers that want to skip rather than hard-fail (e.g. pytest
-            modules that should skip cleanly when the submodule isn't there) should catch
-            this explicitly.
+        MegatronLMNotVendoredError: if the directory doesn't exist (submodule not initialized).
     """
     root = root or _default_root()
     if not root.is_dir():
         raise MegatronLMNotVendoredError(
             f"{root} does not exist. Run 'git submodule update --init' first."
         )
-    path_str = str(root)
+    return root
+
+
+def ensure_on_path(root: Path | None = None) -> None:
+    """Adds the vendored Megatron-LM/ directory to sys.path (for in-process imports).
+
+    Args:
+        root: see :func:`megatron_root`.
+
+    Raises:
+        MegatronLMNotVendoredError: if the directory doesn't exist (submodule not
+            initialized). Callers that want to skip rather than hard-fail (e.g. pytest
+            modules that should skip cleanly when the submodule isn't there) should catch
+            this explicitly.
+    """
+    path_str = str(megatron_root(root))
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
