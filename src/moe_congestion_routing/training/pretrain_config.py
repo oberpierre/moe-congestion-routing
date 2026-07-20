@@ -67,9 +67,12 @@ class MoEPretrainConfig:
     pipeline_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
     log_interval: int = 1
+    # Shared across runs (keyed by seed/seq_length), so the sample/shuffle indices build once.
     data_cache_path: str | None = None  # None → <output_dir>/cache (derived in the launcher)
 
-    # outputs (under gitignored artifacts/)
+    # The launcher writes each run to its own <output_dir>/<timestamp>/ subdir (train.log,
+    # launch_command.txt, and later checkpoints), so repeated/concurrent runs don't interfere
+    # with each other; the dataset cache above is the one shared exception at <output_dir>/cache.
     output_dir: str = "artifacts/moe_smoke"
 
     @classmethod

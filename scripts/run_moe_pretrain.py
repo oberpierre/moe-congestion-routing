@@ -14,6 +14,7 @@ import argparse
 import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from moe_congestion_routing.training.megatron_path import megatron_root
@@ -42,17 +43,22 @@ def main() -> None:
     cfg = MoEPretrainConfig.from_yaml(args.config).resolved(repo_root)
     cmd = build_launch_command(cfg, megatron_dir / "pretrain_gpt.py", nproc=args.nproc)
 
-    # Create output dirs so Megatron can write cache/checkpoints immediately.
-    for path in (cfg.output_dir, cfg.data_cache_path, cfg.save):
-        if path:
-            Path(path).mkdir(parents=True, exist_ok=True)
-
-    # Provenance (the launch.sh "frozen script" equivalent): dump the exact command.
-    (Path(cfg.output_dir) / "launch_command.txt").write_text(" ".join(cmd) + "\n")
-
     if args.dry_run:
         print(" ".join(cmd))
         return
+
+    # Each invocation gets its own <output_dir>/<timestamp>/ for the log, the frozen command,
+    # and (later) checkpoints, so repeated/concurrent runs don't clobber each other. The dataset
+    # cache is deliberately shared at <output_dir>/cache (keyed by seed/seq_length) so the
+    # sample/shuffle indices are built once and reused across runs.
+    run_dir = Path(cfg.output_dir) / datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    Path(cfg.data_cache_path).mkdir(parents=True, exist_ok=True)
+    if cfg.save:
+        Path(cfg.save).mkdir(parents=True, exist_ok=True)
+
+    # Provenance (the launch.sh "frozen script" equivalent): dump the exact command.
+    (run_dir / "launch_command.txt").write_text(" ".join(cmd) + "\n")
 
     # pretrain_gpt.py imports `megatron` in the subprocess, so Megatron must be on its PYTHONPATH
     env = os.environ.copy()
@@ -75,7 +81,7 @@ def main() -> None:
 
     # Tee stdout+stderr to the terminal and <output_dir>/train.log. Capturing turns the child's
     # stdout into a pipe, so tqdm bars won't be live (cosmetic) — use --no-capture if you want them.
-    log_path = Path(cfg.output_dir) / "train.log"
+    log_path = run_dir / "train.log"
     with open(log_path, "w") as logf:
         proc = subprocess.Popen(
             cmd,
