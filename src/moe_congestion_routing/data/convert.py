@@ -25,10 +25,19 @@ class ConversionStats:
     """Result of building one ``.bin``/``.idx`` prefix."""
 
     prefix: str
+    """Output prefix name (no directory, no extension), e.g. ``cluster_00_train``."""
+
     num_documents: int
+    """Number of documents (parquet rows) written to the ``.bin``."""
+
     num_tokens: int
+    """Total token ids written across all documents."""
+
     bin_bytes: int
+    """Size on disk of the ``.bin`` token file, in bytes."""
+
     idx_bytes: int
+    """Size on disk of the ``.idx`` index file, in bytes."""
 
 
 def iter_token_rows(parquet_path: str | Path, token_column: str) -> Iterator[list[int]]:

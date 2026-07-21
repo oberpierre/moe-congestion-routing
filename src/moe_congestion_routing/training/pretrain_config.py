@@ -10,81 +10,145 @@ import yaml
 class MoEPretrainConfig:
     """Everything needed to launch one MoE pretraining run, loadable from a yaml file."""
 
-    # model (tiny for the smoke run)
     num_layers: int = 4
+    """Number of transformer layers."""
+
     hidden_size: int = 256
+    """Model/embedding hidden dimension."""
+
     num_attention_heads: int = 8
+    """Number of attention heads."""
+
     ffn_hidden_size: int = 512
+    """Inner dimension of each expert's MLP."""
+
     seq_length: int = 512
+    """Training sequence length (also used for max position embeddings)."""
 
-    # MoE — vanilla Megatron Switch aux-loss load balancing (no patches)
     num_experts: int = 8
-    moe_router_topk: int = 2
-    moe_router_load_balancing_type: str = "aux_loss"
-    moe_aux_loss_coeff: float = 0.01  # Megatron default is 0.0 → aux loss would be a no-op
+    """Number of routed experts."""
 
-    # data — ClimbLab is pre-tokenized GPT-2; NullTokenizer(vocab_size) sets eod = vocab_size-1
-    # = 50256 = <|endoftext|>, so no vocab/merge files are needed.
+    moe_router_topk: int = 2
+    """Experts activated per token."""
+
+    moe_router_load_balancing_type: str = "aux_loss"
+    """Load-balancing strategy; ``aux_loss`` is the vanilla Switch auxiliary loss."""
+
+    moe_aux_loss_coeff: float = 0.01
+    """Aux-loss weight. Megatron's default is 0.0, which makes the aux loss a no-op."""
+
+    # data — ClimbLab is pre-tokenized GPT-2
     train_data_path: str = "artifacts/climblab_local/cluster_1_train"
+    """``.bin``/``.idx`` prefix for the training split."""
+
     valid_data_path: str = "artifacts/climblab_local/cluster_1_valid"
+    """``.bin``/``.idx`` prefix for the validation split."""
+
     tokenizer_type: str = "NullTokenizer"
+    """NullTokenizer(vocab_size) sets eod = vocab_size-1 = 50256 = <|endoftext|>, so no
+    vocab/merge files are needed for the pre-tokenized data."""
+
     vocab_size: int = 50257
+    """GPT-2 vocabulary size; drives the NullTokenizer eod id above."""
 
     # optimisation / schedule
     lr: float = 3.0e-4
+    """Peak learning rate."""
+
     min_lr: float = 3.0e-5
+    """Floor learning rate for the decay schedule."""
+
     lr_decay_style: str = "constant"
+    """Learning-rate decay schedule."""
+
     lr_warmup_iters: int = 5
+    """Linear warmup iterations before the decay schedule applies."""
 
     # batch / iterations
     micro_batch_size: int = 4
-    global_batch_size: int = 8
-    train_iters: int = 30
-    seed: int = 1234
+    """Samples per micro-batch (one forward/backward)."""
 
-    # eval (off by default: eval_iters=0 skips it; a later slice turns it on)
+    global_batch_size: int = 8
+    """Samples per optimizer step (across gradient accumulation / data parallelism)."""
+
+    train_iters: int = 30
+    """Total training iterations (optimizer steps)."""
+
+    seed: int = 1234
+    """RNG seed; also part of the dataset index cache key."""
+
+    # eval
     eval_interval: int = 1000
+    """Iterations between validation passes."""
+
     eval_iters: int = 0
+    """Batches per validation pass; 0 disables eval entirely."""
 
     # checkpointing (Megatron semantics). save/load are DIRECTORIES, not single checkpoints: each
     # save drops an iter_<N>/ subdir + a latest_checkpointed_iteration.txt tracker inside.
-    #   save         : where to write; default: launcher uses <output_dir>/<timestamp>/checkpoints.
-    #   save_interval: iterations between saves and toggles saving (no saves if unset).
-    #   load         : dir to resume/infer from, loads the newest iter_<N>/ per the tracker.
-    #   ckpt_step    : load this iteration instead of the newest (200 => iter_0000200/).
     save: str | None = None
+    """Directory to write checkpoints to; unset => the launcher uses
+    ``<output_dir>/<timestamp>/checkpoints``."""
+
     save_interval: int | None = None
+    """Iterations between saves and this harness's on-switch, unsetting it means no checkpoints."""
+
     load: str | None = None
+    """Checkpoint DIRECTORY to resume/infer from; loads the newest ``iter_<N>/`` per the tracker."""
+
     ckpt_step: int | None = None
+    """Load this iteration from ``load`` instead of the newest (200 => ``iter_0000200/``)."""
 
     # Use Transformer Engine (its fused attention/LayerNorm/Linear speedup the model).
     # Training and inference both need to use the same implementation, so a checkpoint never
-    # crosses impls — a `local`-trained checkpoint is NOT loadable into a TE model.
+    # crosses impls - a `local`-trained checkpoint is NOT loadable into a TE model.
     transformer_impl: str = "transformer_engine"
     """Megatron transformer implementation. ``transformer_engine`` uses TE's fused modules."""
 
     attention_backend: str = "auto"
     """TE attention backend: flash / fused / unfused / auto / local. ``auto`` lets TE pick."""
 
+    # The Megatron/apex fusion paths below stay OFF: TE supplies its own fused kernels, and the
+    # apex/prebuilt kernels these need aren't installed locally. (Harmless no-ops under TE.)
     persist_layer_norm: bool = False
-    gradient_accumulation_fusion: bool = False
-    masked_softmax_fusion: bool = False  # needs the scaled_masked_softmax_cuda kernel (unbuilt)
-    bias_gelu_fusion: bool = False  # fused act path requires swiglu/quick_gelu under MoE probs
-    # No linear bias (modern default + what the reference uses). Also sidesteps a Megatron
-    # in-place-on-view autograd error in the non-fused MoE expert bias path.
-    add_bias_linear: bool = False
-    bf16: bool = True
-    tensor_model_parallel_size: int = 1
-    pipeline_model_parallel_size: int = 1
-    expert_model_parallel_size: int = 1
-    log_interval: int = 1
-    # Shared across runs (keyed by seed/seq_length), so the sample/shuffle indices build once.
-    data_cache_path: str | None = None  # None → <output_dir>/cache (derived in the launcher)
+    """Megatron's non-TE fused persistent LayerNorm; off (TE has its own)."""
 
-    # The launcher writes each run to its own <output_dir>/<timestamp>/ subdir (train.log,
-    # launch_command.txt, and later checkpoints), so repeated/concurrent runs don't interfere
-    # with each other; the dataset cache above is the one shared exception at <output_dir>/cache.
-    output_dir: str = "artifacts/moe_smoke"
+    gradient_accumulation_fusion: bool = False
+    """apex-fused gradient accumulation; off (apex absent locally; TE handles wgrad)."""
+
+    masked_softmax_fusion: bool = False
+    """Megatron's fused scaled masked softmax; off (kernel unbuilt; TE fuses attention)."""
+
+    bias_gelu_fusion: bool = False
+    """Megatron's fused bias+GELU; off (TE fuses the MLP activation)."""
+
+    add_bias_linear: bool = False
+    """Linear-layer bias. Off (modern default + what the reference uses); also sidesteps a Megatron
+    in-place-on-view autograd error in the non-fused MoE expert bias path."""
+
+    bf16: bool = True
+    """Run in bfloat16."""
+
+    tensor_model_parallel_size: int = 1
+    """Tensor-model-parallel world size."""
+
+    pipeline_model_parallel_size: int = 1
+    """Pipeline-model-parallel world size."""
+
+    expert_model_parallel_size: int = 1
+    """Expert-parallel world size (MoE experts sharded across ranks)."""
+
+    log_interval: int = 1
+    """Iterations between training-log lines."""
+
+    data_cache_path: str | None = None
+    """Dataset sample/shuffle index cache. ``None`` => ``<output_dir>/cache`` (derived in the
+    launcher). Shared across runs (keyed by seed/seq_length) so the indices build once."""
+
+    output_dir: str = "artifacts/runs"
+    """Root for run artifacts. The launcher writes each run to its own ``<output_dir>/<timestamp>/``
+    subdir (train.log, launch_command.txt, checkpoints); the dataset cache above is the one shared
+    exception at ``<output_dir>/cache``."""
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "MoEPretrainConfig":

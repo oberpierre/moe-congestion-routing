@@ -2,7 +2,7 @@
 
 Two concerns, deliberately separated so the split logic is unit-testable without a network:
 
-* `plan_conversions` is pure — given ``{cluster: [shard paths]}`` it returns the list of
+* `plan_conversions` is pure - given ``{cluster: [shard paths]}`` it returns the list of
   conversion jobs (one output ``.bin``/``.idx`` prefix per ``(cluster, split)``), applying
   the per-cluster shard budget and carving disjoint train / held-out-validation shard sets.
 * `list_cluster_shards` / `available_clusters` are thin Hugging Face Hub wrappers that

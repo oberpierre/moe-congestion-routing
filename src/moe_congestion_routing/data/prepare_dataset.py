@@ -29,13 +29,28 @@ class PreparedPrefix:
     """One built ``.bin``/``.idx`` prefix plus its source and counts."""
 
     prefix: str
+    """Output prefix name (no directory, no extension), e.g. ``cluster_00_train``."""
+
     role: str
+    """One of ``TRAIN`` / ``VALID`` / ``HOLDOUT``."""
+
     cluster: str
+    """Source cluster folder name (kept for analysis, e.g. per-cluster BPB)."""
+
     shards: list[str]
+    """Repo-relative parquet paths feeding this prefix."""
+
     num_documents: int
+    """Number of documents (parquet rows) written to the ``.bin``."""
+
     num_tokens: int
+    """Total token ids written across all documents."""
+
     bin_bytes: int
+    """Size on disk of the ``.bin`` token file, in bytes."""
+
     idx_bytes: int
+    """Size on disk of the ``.idx`` index file, in bytes."""
 
 
 def _convert_job(

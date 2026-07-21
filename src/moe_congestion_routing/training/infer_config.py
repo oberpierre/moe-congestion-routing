@@ -3,7 +3,7 @@
 Drives Megatron's shipped static-inference example
 (``examples/inference/advanced/gpt_static_inference.py``), which builds the model, loads the
 checkpoint, and runs the real ``StaticInferenceEngine`` + ``TextGenerationController``. We only
-map this config to that script's CLI args — the actual generation pipeline is Megatron's.
+map this config to that script's CLI args, the actual generation pipeline is Megatron's.
 
 The model-architecture fields MUST match the checkpoint's training config: they define the
 network the weights load into. Their defaults match ``configs/train/climblab_moe_smoke.yaml``.
@@ -21,11 +21,10 @@ class MoEInferConfig:
 
     # checkpoint
     load: str | None = None
-    """Checkpoint DIRECTORY to load (a ``<run>/checkpoints`` dir). Required at launch — set here
-    or via the launcher's ``--load``. Loads the newest ``iter_<N>/`` unless ``ckpt_step`` is set."""
+    """Checkpoint DIRECTORY to load (a ``<run>/checkpoints`` dir). Required at launch."""
 
     ckpt_step: int | None = None
-    """Load this iteration instead of the newest (200 → ``iter_0000200/``)."""
+    """Load this iteration instead of the newest (200 => ``iter_0000200/``)."""
 
     # generation
     prompts: list[str] = field(default_factory=lambda: ["The capital of France is"])
@@ -43,7 +42,7 @@ class MoEInferConfig:
     top_p: float = 0.0
     """Top-p (nucleus) sampling; ``0.0`` disables it."""
 
-    # tokenizer — real GPT-2 BPE for text<->ids, loaded offline from the vendored snapshot dir.
+    # tokenizer - real GPT-2 BPE for text<->ids, loaded offline from the vendored snapshot dir.
     tokenizer_type: str = "HuggingFaceTokenizer"
     """``HuggingFaceTokenizer`` pointed at a local dir loads fully offline (no hub lookup)."""
 
@@ -53,7 +52,7 @@ class MoEInferConfig:
     vocab_size: int = 50257
     """GPT-2 vocabulary size; must match the checkpoint (NullTokenizer training used 50257 too)."""
 
-    # model architecture — MUST match the checkpoint (defaults match the smoke training config).
+    # model architecture - MUST match the checkpoint.
     num_layers: int = 4
     """Number of transformer layers."""
 
@@ -75,14 +74,14 @@ class MoEInferConfig:
     moe_router_topk: int = 2
     """Experts activated per token."""
 
-    # runtime — mirror training so the model instantiates the same way (and the checkpoint, trained
+    # runtime - mirror training so the model instantiates the same way (and the checkpoint, trained
     # under TE, loads into a matching TE model).
     transformer_impl: str = "transformer_engine"
-    """Megatron transformer implementation; must match the checkpoint's (we train under TE)."""
+    """Megatron transformer implementation; must match the checkpoint's."""
 
     attention_backend: str = "auto"
-    """TE attention backend (flash/fused/unfused/auto/local). Local (Ampere) sets ``unfused`` to
-    dodge the cuDNN fused-attn bug; the cluster (Hopper) can use ``auto``/``fused``."""
+    """TE attention backend (flash/fused/unfused/auto/local). Nvidia Ampere should set ``unfused``
+    to dodge the cuDNN fused-attn bug; Nvidia Hopper can use ``auto``/``fused``."""
 
     persist_layer_norm: bool = False
     """Megatron's non-TE fused LayerNorm; off (TE has its own)."""
@@ -100,7 +99,7 @@ class MoEInferConfig:
     """Linear-layer bias; off (matches training / the reference)."""
 
     bf16: bool = True
-    """Run in bfloat16 (matches the saved checkpoint)."""
+    """Run in bfloat16; must match the saved checkpoint."""
 
     tensor_model_parallel_size: int = 1
     """Tensor-model-parallel world size."""
@@ -112,9 +111,7 @@ class MoEInferConfig:
     """Expert-parallel world size."""
 
     use_legacy_static_engine: bool = True
-    """Use the legacy (true static-batching) inference engine. On by default because the modern
-    path builds a dynamic-batching context that requires flash-attn >=2.7.3 (not installed here,
-    same reason we avoid Transformer Engine); legacy static needs neither."""
+    """Use the legacy (true static-batching) inference engine."""
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "MoEInferConfig":
@@ -143,7 +140,7 @@ def build_infer_megatron_args(cfg: MoEInferConfig) -> list[str]:
     if not cfg.load:
         raise ValueError("load is required for inference (set it in the yaml or via --load)")
     args = [
-        # model architecture — must match the checkpoint
+        # model architecture, MUST match the checkpoint
         "--num-layers",
         str(cfg.num_layers),
         "--hidden-size",
