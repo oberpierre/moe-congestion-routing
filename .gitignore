@@ -10,3 +10,4 @@ build/
 
 # Generated artifacts
 artifacts/
+logs/

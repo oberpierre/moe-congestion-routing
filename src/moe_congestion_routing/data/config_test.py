@@ -78,6 +78,28 @@ def test_from_yaml_roundtrip(tmp_path):
     assert cfg.numpy_dtype is numpy.int32
 
 
+def test_from_yaml_expands_env_var_in_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_STORE", "/store/me")
+    monkeypatch.setenv("SCRATCH", "/scratch/me")
+    path = tmp_path / "cfg.yaml"
+    path.write_text(
+        "variant: climbmix_small\n"
+        "output_dir: ${DATA_STORE}/datasets/climbmix_small\n"
+        "cache_dir: ${SCRATCH}/hf_cache\n"
+    )
+    cfg = DataPrepConfig.from_yaml(path)
+    assert cfg.output_dir == "/store/me/datasets/climbmix_small"
+    assert cfg.cache_path == Path("/scratch/me/hf_cache")
+
+
+def test_from_yaml_fails_on_unresolved_env_var(tmp_path, monkeypatch):
+    monkeypatch.delenv("DATA_STORE", raising=False)
+    path = tmp_path / "cfg.yaml"
+    path.write_text("variant: climbmix_small\noutput_dir: ${DATA_STORE}/datasets/climbmix_small\n")
+    with pytest.raises(ValueError, match="unresolved environment variable"):
+        DataPrepConfig.from_yaml(path)
+
+
 def test_from_yaml_rejects_unknown_key(tmp_path):
     path = tmp_path / "cfg.yaml"
     path.write_text("variant: climblab\noutput_dir: out\nclusters: [a]\nbogus_key: 1\n")

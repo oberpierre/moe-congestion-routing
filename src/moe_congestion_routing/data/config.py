@@ -1,5 +1,6 @@
 """Configuration for Nemotron-Climb data preparation (ClimbLab + ClimbMix variants)."""
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +34,22 @@ VARIANTS: dict[str, VariantSpec] = {
     "climblab": VariantSpec("nvidia/Nemotron-ClimbLab", "clustered"),
     "climbmix_small": VariantSpec("nvidia/Nemotron-ClimbMix", "flat", "climbmix_small/"),
 }
+
+
+def _expand_path(value: str) -> str:
+    """Expand ``$VAR``/``${VAR}`` and ``~`` in a path, failing loud if any var is unresolved.
+
+    Lets committed configs reference e.g. ``${DATA_STORE}`` (set in the git-ignored
+    ``config.sh``) so a personal cluster path never enters version control. An unset variable
+    is left literal by ``expandvars``, so a lingering ``$`` means "resolve this first".
+    """
+    expanded = os.path.expanduser(os.path.expandvars(value))
+    if "$" in expanded:
+        raise ValueError(
+            f"unresolved environment variable in path {value!r} (expanded to {expanded!r}); "
+            f"set it (e.g. in config.sh) before loading the config"
+        )
+    return expanded
 
 
 @dataclass(frozen=True)
@@ -162,8 +179,15 @@ class DataPrepConfig:
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "DataPrepConfig":
-        """Build a config from a yaml file. Unknown keys raise ``TypeError`` (fail loud)."""
+        """Build a config from a yaml file. Unknown keys raise ``TypeError`` (fail loud).
+
+        Path fields (``output_dir``, ``cache_dir``) are environment-expanded, so a committed
+        config can reference ``${DATA_STORE}`` instead of a hardcoded personal path.
+        """
         data = yaml.safe_load(Path(path).read_text())
         if not isinstance(data, dict):
             raise ValueError(f"{path} must contain a valid yaml mapping, got {type(data).__name__}")
+        for key in ("output_dir", "cache_dir"):
+            if data.get(key) is not None:
+                data[key] = _expand_path(data[key])
         return cls(**data)
