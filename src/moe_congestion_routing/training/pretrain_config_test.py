@@ -16,6 +16,11 @@ def _pairs(args: list[str]) -> dict[str, str]:
     return out
 
 
+def _cfg(**kw) -> MoEPretrainConfig:
+    """A build-args-ready config: fills the now-required train_data_path (yaml must set it)."""
+    return MoEPretrainConfig(train_data_path="/data/train", **kw)
+
+
 def test_from_yaml_roundtrip(tmp_path):
     path = tmp_path / "run.yaml"
     path.write_text(
@@ -36,8 +41,20 @@ def test_from_yaml_rejects_unknown_key(tmp_path):
         MoEPretrainConfig.from_yaml(path)
 
 
+def test_build_megatron_args_requires_train_data_path():
+    with pytest.raises(ValueError, match="train_data_path is required"):
+        build_megatron_args(MoEPretrainConfig(train_data_path=None))
+
+
+def test_build_megatron_args_valid_data_path_optional():
+    # valid is emitted only when set (enables train-only runs; None doesn't leak into the args).
+    assert "--valid-data-path" not in build_megatron_args(_cfg(valid_data_path=None))
+    on = _pairs(build_megatron_args(_cfg(valid_data_path="/data/valid")))
+    assert on["--valid-data-path"] == "/data/valid"
+
+
 def test_build_megatron_args_carries_moe_and_tokenizer():
-    cfg = MoEPretrainConfig(num_experts=8, moe_router_topk=2, moe_aux_loss_coeff=0.01)
+    cfg = _cfg(num_experts=8, moe_router_topk=2, moe_aux_loss_coeff=0.01)
     pairs = _pairs(build_megatron_args(cfg))
     assert pairs["--num-experts"] == "8"
     assert pairs["--moe-router-topk"] == "2"
@@ -50,40 +67,40 @@ def test_build_megatron_args_carries_moe_and_tokenizer():
 
 
 def test_build_megatron_args_disables_apex_megatron_fusions():
-    # Under TE these apex/Megatron fusion paths stay off (apex absent locally; TE fuses its own).
-    args = build_megatron_args(MoEPretrainConfig())
+    # Under TE these apex/Megatron fusion paths stay off; TE fuses its own.
+    args = build_megatron_args(_cfg())
     assert "--no-persist-layer-norm" in args
     assert "--no-gradient-accumulation-fusion" in args
 
 
 def test_build_megatron_args_attention_backend_overridable():
-    args = build_megatron_args(MoEPretrainConfig(attention_backend="unfused"))
+    args = build_megatron_args(_cfg(attention_backend="unfused"))
     assert _pairs(args)["--attention-backend"] == "unfused"
 
 
 def test_build_megatron_args_toggles_optional_flags():
-    on = build_megatron_args(MoEPretrainConfig(bf16=True, save="ckpt", save_interval=10))
+    on = build_megatron_args(_cfg(bf16=True, save="ckpt", save_interval=10))
     assert "--bf16" in on
     assert _pairs(on)["--save"] == "ckpt"
     assert _pairs(on)["--save-interval"] == "10"
 
-    off = build_megatron_args(MoEPretrainConfig(bf16=False, save=None, save_interval=None))
+    off = build_megatron_args(_cfg(bf16=False, save=None, save_interval=None))
     assert "--bf16" not in off
     assert "--save" not in off
     assert "--save-interval" not in off
 
 
 def test_build_megatron_args_emits_load_when_set():
-    on = build_megatron_args(MoEPretrainConfig(load="/ckpt/dir"))
+    on = build_megatron_args(_cfg(load="/ckpt/dir"))
     assert _pairs(on)["--load"] == "/ckpt/dir"
-    assert "--load" not in build_megatron_args(MoEPretrainConfig(load=None))
+    assert "--load" not in build_megatron_args(_cfg(load=None))
 
 
 def test_build_megatron_args_emits_ckpt_step_to_pin_iteration():
     # load points at the checkpoints DIR; ckpt_step selects which iter_<N>/ inside it.
-    on = build_megatron_args(MoEPretrainConfig(load="/ckpt/dir", ckpt_step=200))
+    on = build_megatron_args(_cfg(load="/ckpt/dir", ckpt_step=200))
     assert _pairs(on)["--ckpt-step"] == "200"
-    assert "--ckpt-step" not in build_megatron_args(MoEPretrainConfig(load="/ckpt/dir"))
+    assert "--ckpt-step" not in build_megatron_args(_cfg(load="/ckpt/dir"))
 
 
 def test_resolved_absolutises_paths_and_derives_cache(tmp_path):
@@ -115,7 +132,7 @@ def test_resolved_absolutises_checkpoint_paths(tmp_path):
 
 
 def test_build_launch_command_wraps_torchrun():
-    cfg = MoEPretrainConfig()
+    cfg = _cfg()
     cmd = build_launch_command(cfg, "/repo/Megatron-LM/pretrain_gpt.py", nproc=1)
     assert cmd[0] == "torchrun"
     assert "--standalone" in cmd

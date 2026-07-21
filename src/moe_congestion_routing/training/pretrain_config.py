@@ -37,11 +37,10 @@ class MoEPretrainConfig:
     moe_aux_loss_coeff: float = 0.01
     """Aux-loss weight. Megatron's default is 0.0, which makes the aux loss a no-op."""
 
-    # data — ClimbLab is pre-tokenized GPT-2
-    train_data_path: str = "artifacts/climblab_local/cluster_1_train"
+    train_data_path: str | None = None
     """``.bin``/``.idx`` prefix for the training split."""
 
-    valid_data_path: str = "artifacts/climblab_local/cluster_1_valid"
+    valid_data_path: str | None = None
     """``.bin``/``.idx`` prefix for the validation split."""
 
     tokenizer_type: str = "NullTokenizer"
@@ -168,8 +167,8 @@ class MoEPretrainConfig:
         output_dir = absolutise(self.output_dir)
         return replace(
             self,
-            train_data_path=absolutise(self.train_data_path),
-            valid_data_path=absolutise(self.valid_data_path),
+            train_data_path=absolutise(self.train_data_path) if self.train_data_path else None,
+            valid_data_path=absolutise(self.valid_data_path) if self.valid_data_path else None,
             output_dir=output_dir,
             data_cache_path=absolutise(self.data_cache_path)
             if self.data_cache_path
@@ -181,6 +180,8 @@ class MoEPretrainConfig:
 
 def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
     """Map the config to a flat Megatron ``pretrain_gpt.py`` CLI arg list (pure)."""
+    if not cfg.train_data_path:
+        raise ValueError("train_data_path is required (set it in the run yaml)")
     args = [
         # model
         "--num-layers",
@@ -211,8 +212,6 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         str(cfg.vocab_size),
         "--train-data-path",
         cfg.train_data_path,
-        "--valid-data-path",
-        cfg.valid_data_path,
         # optimisation / schedule
         "--lr",
         str(cfg.lr),
@@ -252,6 +251,8 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         "--distributed-backend",
         "nccl",
     ]
+    if cfg.valid_data_path:
+        args += ["--valid-data-path", cfg.valid_data_path]
     if not cfg.persist_layer_norm:
         args += ["--no-persist-layer-norm"]
     if not cfg.gradient_accumulation_fusion:
