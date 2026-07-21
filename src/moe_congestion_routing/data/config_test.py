@@ -8,17 +8,47 @@ from moe_congestion_routing.data.config import DataPrepConfig
 
 
 def _valid(**overrides):
-    base = {"output_dir": "out", "clusters": ["c0", "c1"]}
+    base = {"variant": "climblab", "output_dir": "out", "clusters": ["c0", "c1"]}
+    base.update(overrides)
+    return DataPrepConfig(**base)
+
+
+def _flat(**overrides):
+    base = {"variant": "climbmix_small", "output_dir": "out"}
     base.update(overrides)
     return DataPrepConfig(**base)
 
 
 def test_defaults_and_numpy_dtype():
     cfg = _valid()
-    assert cfg.dataset_repo == "nvidia/Nemotron-ClimbLab"
+    assert cfg.repo == "nvidia/Nemotron-ClimbLab"  # derived from the variant
+    assert cfg.dataset_repo is None  # no explicit override
     assert cfg.token_column == "tokens"
     assert cfg.numpy_dtype is numpy.uint16
     assert _valid(dtype="int32").numpy_dtype is numpy.int32
+
+
+def test_variant_drives_repo_and_layout():
+    assert _valid().layout == "clustered"
+    flat = _flat()
+    assert flat.layout == "flat"
+    assert flat.repo == "nvidia/Nemotron-ClimbMix"
+    assert _flat(dataset_repo="me/fork").repo == "me/fork"  # explicit override wins
+
+
+def test_rejects_unknown_variant():
+    with pytest.raises(ValueError, match="variant must be one of"):
+        DataPrepConfig(variant="bogus", output_dir="out")
+
+
+def test_flat_rejects_cluster_fields():
+    with pytest.raises(ValueError, match="not used for the flat variant"):
+        _flat(clusters=["c0"])
+
+
+def test_flat_rejects_non_positive_max_shards():
+    with pytest.raises(ValueError, match="max_shards must be >= 1"):
+        _flat(max_shards=0)
 
 
 def test_cache_path_defaults_under_output_dir():
@@ -33,6 +63,7 @@ def test_cache_path_uses_explicit_cache_dir():
 def test_from_yaml_roundtrip(tmp_path):
     path = tmp_path / "cfg.yaml"
     path.write_text(
+        "variant: climblab\n"
         "output_dir: out\n"
         "clusters: [a, b]\n"
         "held_out_clusters: [c]\n"
@@ -49,7 +80,7 @@ def test_from_yaml_roundtrip(tmp_path):
 
 def test_from_yaml_rejects_unknown_key(tmp_path):
     path = tmp_path / "cfg.yaml"
-    path.write_text("output_dir: out\nclusters: [a]\nbogus_key: 1\n")
+    path.write_text("variant: climblab\noutput_dir: out\nclusters: [a]\nbogus_key: 1\n")
     with pytest.raises(TypeError, match=re.escape("unexpected keyword argument 'bogus_key'")):
         DataPrepConfig.from_yaml(path)
 
@@ -63,7 +94,7 @@ def test_from_yaml_rejects_non_mapping(tmp_path):
 
 def test_rejects_empty_clusters():
     with pytest.raises(ValueError, match="clusters must be a non-empty list"):
-        DataPrepConfig(output_dir="out", clusters=[])
+        DataPrepConfig(variant="climblab", output_dir="out", clusters=[])
 
 
 def test_rejects_overlapping_train_and_holdout():

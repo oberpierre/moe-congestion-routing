@@ -1,11 +1,20 @@
 import pytest
 
-from moe_congestion_routing.data.climblab import (
+from moe_congestion_routing.data.climb import (
+    ALL,
     ConversionJob,
     _group_parquet_by_cluster,
     plan_conversions,
 )
 from moe_congestion_routing.data.config import DataPrepConfig
+
+
+def _clustered(**kw) -> DataPrepConfig:
+    return DataPrepConfig(variant="climblab", output_dir="out", **kw)
+
+
+def _flat(**kw) -> DataPrepConfig:
+    return DataPrepConfig(variant="climbmix_small", output_dir="out", **kw)
 
 
 def _shards(cluster, n):
@@ -14,8 +23,7 @@ def _shards(cluster, n):
 
 
 def test_plan_splits_train_val_and_holdout_disjointly():
-    cfg = DataPrepConfig(
-        output_dir="out",
+    cfg = _clustered(
         clusters=["c0", "c1"],
         held_out_clusters=["c2"],
         shards_per_cluster=3,
@@ -42,28 +50,56 @@ def test_plan_splits_train_val_and_holdout_disjointly():
 
 
 def test_no_val_shards_emits_only_train_prefixes():
-    cfg = DataPrepConfig(output_dir="out", clusters=["c0"], val_shards_per_cluster=0)
+    cfg = _clustered(clusters=["c0"], val_shards_per_cluster=0)
     jobs = plan_conversions(cfg, {"c0": _shards("c0", 3)})
     assert [j.prefix for j in jobs] == ["c0_train"]
     assert len(jobs[0].shards) == 3
 
 
 def test_no_budget_takes_all_shards_sorted():
-    cfg = DataPrepConfig(output_dir="out", clusters=["c0"], shards_per_cluster=None)
+    cfg = _clustered(clusters=["c0"], shards_per_cluster=None)
     (job,) = plan_conversions(cfg, {"c0": _shards("c0", 4)})
     assert job.shards == tuple(f"c0/shard-{i:04d}.parquet" for i in range(4))
 
 
 def test_missing_cluster_raises():
-    cfg = DataPrepConfig(output_dir="out", clusters=["c0", "foo"])
+    cfg = _clustered(clusters=["c0", "foo"])
     with pytest.raises(KeyError, match="cluster 'foo' not found among available shards"):
         plan_conversions(cfg, {"c0": _shards("c0", 2)})
 
 
 def test_validation_consuming_all_shards_raises():
-    cfg = DataPrepConfig(output_dir="out", clusters=["c0"], val_shards_per_cluster=2)
+    cfg = _clustered(clusters=["c0"], val_shards_per_cluster=2)
     with pytest.raises(ValueError, match="leaves no train shards"):
         plan_conversions(cfg, {"c0": _shards("c0", 2)})
+
+
+def test_flat_plan_single_prefix_over_budgeted_shards():
+    cfg = _flat(max_shards=2)
+    unsorted = [
+        "climbmix_small/shard_2.tokenized.parquet",
+        "climbmix_small/shard_0.tokenized.parquet",
+        "climbmix_small/shard_1.tokenized.parquet",
+    ]
+    (job,) = plan_conversions(cfg, unsorted)
+    assert job.prefix == "climbmix_small"  # single prefix named after the variant
+    assert job.role == ALL and job.cluster == ""  # no train/valid split, no cluster
+    # sorted then budgeted to 2 -> shard_0, shard_1 (Megatron --split does train/valid later)
+    assert job.shards == (
+        "climbmix_small/shard_0.tokenized.parquet",
+        "climbmix_small/shard_1.tokenized.parquet",
+    )
+
+
+def test_flat_plan_no_budget_takes_all_sorted():
+    cfg = _flat(max_shards=None)
+    (job,) = plan_conversions(cfg, ["s/b.parquet", "s/a.parquet"])
+    assert job.shards == ("s/a.parquet", "s/b.parquet")
+
+
+def test_flat_plan_no_shards_raises():
+    with pytest.raises(ValueError, match="yielded no shards"):
+        plan_conversions(_flat(), [])
 
 
 def test_group_parquet_by_cluster_handles_nesting_and_ignores_non_parquet():

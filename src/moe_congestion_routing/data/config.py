@@ -1,4 +1,4 @@
-"""Configuration for ClimbLab data preparation."""
+"""Configuration for Nemotron-Climb data preparation (ClimbLab + ClimbMix variants)."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -6,51 +6,82 @@ from pathlib import Path
 import numpy
 import yaml
 
-# ClimbLab ships pre-tokenized with the GPT-2 tokenizer (vocab 50257).
+# The Climb datasets ship pre-tokenized with the GPT-2 tokenizer (vocab 50257).
 # Fits into uint16 but we support int32 as well.
 _DTYPES: dict[str, type[numpy.number]] = {"uint16": numpy.uint16, "int32": numpy.int32}
+
+
+@dataclass(frozen=True)
+class VariantSpec:
+    """Immutable description of one Nemotron-Climb dataset variant."""
+
+    repo: str
+    """Hugging Face dataset repo id the shards live in."""
+
+    layout: str
+    """``clustered`` (shards grouped by cluster folder, e.g. ClimbLab) or ``flat`` (a single set
+    of shards, e.g. ClimbMix). Drives discovery and split planning in ``climb.py``."""
+
+    shard_prefix: str = ""
+    """Flat variants only: the repo sub-path the shards live under (e.g. ``climbmix_small/``).
+    Empty means the repo root."""
+
+
+# Built-in variants. Each is a concrete (repo, layout, discovery) bundle; the config just names
+# one. Add ClimbMix-full (jsonl) here when needed — it only adds a format axis to the reader.
+VARIANTS: dict[str, VariantSpec] = {
+    "climblab": VariantSpec("nvidia/Nemotron-ClimbLab", "clustered"),
+    "climbmix_small": VariantSpec("nvidia/Nemotron-ClimbMix", "flat", "climbmix_small/"),
+}
 
 
 @dataclass(frozen=True)
 class DataPrepConfig:
     """Everything the preparation + loading pipeline needs, loadable from a yaml file."""
 
+    variant: str
+    """Dataset variant: a key into :data:`VARIANTS` (``climblab`` | ``climbmix_small``). Drives the
+    repo, shard discovery, and split layout (clustered vs flat)."""
+
     output_dir: str
     """Directory the ``.bin``/``.idx`` prefixes are written to."""
 
-    clusters: list[str]
-    """ClimbLab cluster folder names used for training (and for per-cluster validation)."""
+    # --- clustered variants (ClimbLab) only ---
+    clusters: list[str] = field(default_factory=list)
+    """Cluster folders used for training + per-cluster validation. Clustered variants only."""
 
+    held_out_clusters: list[str] = field(default_factory=list)
+    """Clusters reserved entirely as held-out (domain-shift) validation. Clustered variants only."""
+
+    shards_per_cluster: int | None = None
+    """Cap on parquet shards taken per cluster (``None`` = all). Clustered variants only."""
+
+    val_shards_per_cluster: int = 0
+    """Shards per training cluster held out as in-distribution validation (train gets the rest).
+    Clustered variants only."""
+
+    # --- flat variants (ClimbMix) only ---
+    max_shards: int | None = None
+    """Cap on the number of (sorted) shards taken for a flat variant (``None`` = all). The train /
+    valid split is left to Megatron's ``--split`` at train time, so no split is planned here."""
+
+    # --- shared ---
     cache_dir: str | None = None
-    """Directory the downloaded parquet shards are cached in. ``None`` (the default) resolves to
+    """Directory the downloaded shards are cached in. ``None`` resolves to
     ``<output_dir>/_hf_cache`` via :pyattr:`cache_path`."""
 
     download_workers: int = 8
-    """Concurrent *threads* used to download shards. Downloads are I/O-bound HTTPS transfers, so
-    threads (not processes) overlap them; keep modest, as they share the link's bandwidth."""
+    """Concurrent *threads* used to download shards (I/O-bound HTTPS; they share link bandwidth)."""
 
     convert_workers: int | None = None
-    """*Processes* used to convert shards in parallel; conversion is GIL-bound so it needs
-    processes, not threads. ``None`` uses ``os.cpu_count()``, ``1`` runs inline; either way it is
-    bounded by the job count. Each worker holds a whole shard in memory, so watch for OOM."""
+    """*Processes* used to convert shards in parallel (GIL-bound work). ``None`` uses
+    ``os.cpu_count()``, ``1`` runs inline; either way bounded by the job count."""
 
-    dataset_repo: str = "nvidia/Nemotron-ClimbLab"
-    """Hugging Face dataset repo id to pull shards from."""
-
-    held_out_clusters: list[str] = field(default_factory=list)
-    """Clusters reserved entirely as held-out validation."""
-
-    shards_per_cluster: int | None = None
-    """Cap on parquet shards taken per cluster (``None`` = all shards)."""
-
-    val_shards_per_cluster: int = 0
-    """
-    Shards per training cluster held out as (in-distribution) validation.
-    For train = shards_per_cluster - val_shards_per_cluster.
-    """
+    dataset_repo: str | None = None
+    """Override for the repo id; ``None`` uses the variant's (see :pyattr:`repo`)."""
 
     token_column: str = "tokens"
-    """Parquet column holding the pre-tokenized integer token-id sequence per row."""
+    """Column/field holding the pre-tokenized integer token-id sequence per row."""
 
     dtype: str = "uint16"
     """On-disk token dtype; one of ``_DTYPES``."""
@@ -65,13 +96,27 @@ class DataPrepConfig:
     """GPT-2 vocabulary size; used for dtype sanity and the tokenizer shim."""
 
     def __post_init__(self) -> None:
+        if self.variant not in VARIANTS:
+            raise ValueError(f"variant must be one of {sorted(VARIANTS)}, got {self.variant!r}")
+        if self.layout == "clustered":
+            self._validate_clustered()
+        else:
+            self._validate_flat()
+        if self.dtype not in _DTYPES:
+            raise ValueError(f"dtype must be one of {sorted(_DTYPES)}, got {self.dtype!r}")
+        if self.append_eod and not 0 <= self.eod_token_id < self.vocab_size:
+            raise ValueError("eod_token_id must be within [0, vocab_size)")
+        if self.download_workers < 1:
+            raise ValueError("download_workers must be >= 1")
+        if self.convert_workers is not None and self.convert_workers < 1:
+            raise ValueError("convert_workers must be >= 1 (or null for os.cpu_count())")
+
+    def _validate_clustered(self) -> None:
         if not self.clusters:
-            raise ValueError("clusters must be a non-empty list")
+            raise ValueError("clusters must be a non-empty list for a clustered variant")
         overlap = sorted(set(self.clusters) & set(self.held_out_clusters))
         if overlap:
             raise ValueError(f"clusters and held_out_clusters must be disjoint; overlap: {overlap}")
-        if self.dtype not in _DTYPES:
-            raise ValueError(f"dtype must be one of {sorted(_DTYPES)}, got {self.dtype!r}")
         if self.val_shards_per_cluster < 0:
             raise ValueError("val_shards_per_cluster must be >= 0")
         if self.shards_per_cluster is not None:
@@ -81,12 +126,29 @@ class DataPrepConfig:
                 raise ValueError(
                     "val_shards_per_cluster must leave at least one train shard per cluster"
                 )
-        if self.append_eod and not 0 <= self.eod_token_id < self.vocab_size:
-            raise ValueError("eod_token_id must be within [0, vocab_size)")
-        if self.download_workers < 1:
-            raise ValueError("download_workers must be >= 1")
-        if self.convert_workers is not None and self.convert_workers < 1:
-            raise ValueError("convert_workers must be >= 1 (or null for os.cpu_count())")
+
+    def _validate_flat(self) -> None:
+        if self.clusters or self.held_out_clusters:
+            raise ValueError(
+                f"clusters/held_out_clusters are not used for the flat variant {self.variant!r}"
+            )
+        if self.max_shards is not None and self.max_shards < 1:
+            raise ValueError("max_shards must be >= 1 (or null for all shards)")
+
+    @property
+    def spec(self) -> VariantSpec:
+        """The :class:`VariantSpec` for this config's ``variant``."""
+        return VARIANTS[self.variant]
+
+    @property
+    def repo(self) -> str:
+        """Effective HF dataset repo: ``dataset_repo`` if set, else the variant's."""
+        return self.dataset_repo or self.spec.repo
+
+    @property
+    def layout(self) -> str:
+        """The variant's layout: ``clustered`` or ``flat``."""
+        return self.spec.layout
 
     @property
     def numpy_dtype(self) -> type[numpy.number]:

@@ -13,13 +13,14 @@ from types import SimpleNamespace
 import pytest
 
 from moe_congestion_routing.data import prepare_dataset
-from moe_congestion_routing.data.climblab import ConversionJob
+from moe_congestion_routing.data.climb import ConversionJob
 from moe_congestion_routing.data.config import DataPrepConfig
 from moe_congestion_routing.data.convert import ConversionStats
 
 
 def _config(tmp_path, **overrides):
     base = {
+        "variant": "climblab",
         "output_dir": str(tmp_path / "out"),
         "clusters": ["cluster_1", "cluster_2"],
         "held_out_clusters": ["cluster_3"],

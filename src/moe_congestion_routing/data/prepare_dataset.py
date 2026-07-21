@@ -1,4 +1,4 @@
-"""Orchestrate ClimbLab preparation end to end: list shards -> plan splits -> download ->
+"""Orchestrate Nemotron-Climb preparation end to end: list shards -> plan splits -> download ->
 convert -> write a manifest.
 
 The manifest (``<output_dir>/manifest.json``) records the exact config, and for every built
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from itertools import repeat
 from pathlib import Path
 
-from moe_congestion_routing.data.climblab import plan_conversions
+from moe_congestion_routing.data.climb import plan_conversions
 from moe_congestion_routing.data.config import DataPrepConfig
 from moe_congestion_routing.data.convert import ConversionStats, convert_shards, download_shards
 
@@ -74,7 +74,7 @@ def _convert_job(
 
 def run_preparation(
     config: DataPrepConfig,
-    cluster_to_shards: dict[str, list[str]] | None = None,
+    shards: dict[str, list[str]] | list[str] | None = None,
 ) -> list[PreparedPrefix]:
     """Build all planned prefixes and write the manifest.
 
@@ -83,19 +83,20 @@ def run_preparation(
 
     Args:
         config: the preparation config.
-        cluster_to_shards: pre-listed ``{cluster: [shard paths]}``; if ``None`` it is fetched
-            from the HF Hub. Injecting it lets callers (and tests) skip the network listing.
+        shards: pre-listed shards (``{cluster: [paths]}`` for clustered variants, ``[paths]`` if
+            flat); if ``None`` they are fetched from the HF Hub. Injecting lets callers/tests skip
+            the network listing.
     """
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = config.cache_path
-    jobs = plan_conversions(config, cluster_to_shards)
+    jobs = plan_conversions(config, shards)
 
     # Download shards across all jobs in one concurrent batch, so shards from different jobs
     # overlap instead of downloading sequentially.
     all_shards = list(dict.fromkeys(shard for job in jobs for shard in job.shards))
     local_paths = download_shards(
-        config.dataset_repo, all_shards, cache_dir, max_workers=config.download_workers
+        config.repo, all_shards, cache_dir, max_workers=config.download_workers
     )
     shard_to_local = dict(zip(all_shards, local_paths, strict=True))
 

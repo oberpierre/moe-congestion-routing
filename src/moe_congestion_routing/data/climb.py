@@ -1,12 +1,15 @@
-"""Cluster/shard discovery and train/validation split planning for ClimbLab.
+"""Shard discovery and split planning for the Nemotron-Climb datasets.
 
-Two concerns, deliberately separated so the split logic is unit-testable without a network:
+Two layouts, selected by the config's ``variant`` (see ``VARIANTS`` in :mod:`config`):
 
-* `plan_conversions` is pure - given ``{cluster: [shard paths]}`` it returns the list of
-  conversion jobs (one output ``.bin``/``.idx`` prefix per ``(cluster, split)``), applying
-  the per-cluster shard budget and carving disjoint train / held-out-validation shard sets.
-* `list_cluster_shards` / `available_clusters` are thin Hugging Face Hub wrappers that
-  enumerate the parquet shards actually present in the dataset repo.
+* ``clustered`` (ClimbLab): shards are grouped by cluster folder. Planning carves, per cluster,
+  disjoint train / in-distribution-valid shard sets, plus whole held-out clusters for domain
+  shift. This structured split is why ClimbLab does not use Megatron's fractional ``--split``.
+* ``flat`` (ClimbMix): one undifferentiated set of shards -> a single prefix over all (budgeted)
+  shards; the train/valid split is left to Megatron's ``--split`` at train time.
+
+``plan_conversions`` is pure (unit-testable without a network); the ``list_*`` helpers are thin
+Hugging Face Hub wrappers that enumerate the shards actually present in the dataset repo.
 """
 
 from dataclasses import dataclass
@@ -14,11 +17,12 @@ from pathlib import PurePosixPath
 
 from moe_congestion_routing.data.config import DataPrepConfig
 
-# Split roles. "train" and the two validation flavours the experiment needs: per-cluster
-# in-distribution "valid" shards, and whole "holdout" clusters for domain shift (E3).
+# Split roles. Clustered variants emit train/valid/holdout; flat variants emit a single "all"
+# prefix (Megatron's --split does the train/valid carve at training time).
 TRAIN = "train"
 VALID = "valid"
 HOLDOUT = "holdout"
+ALL = "all"
 
 
 @dataclass(frozen=True)
@@ -26,13 +30,13 @@ class ConversionJob:
     """One ``.bin``/``.idx`` prefix to build from a disjoint set of parquet shards."""
 
     prefix: str
-    """Output prefix name (no directory, no extension), e.g. ``cluster_00_train``."""
+    """Output prefix name (no dir/extension), e.g. ``cluster_00_train`` or ``climbmix_small``."""
 
     role: str
-    """One of ``TRAIN`` / ``VALID`` / ``HOLDOUT``."""
+    """One of ``TRAIN`` / ``VALID`` / ``HOLDOUT`` (clustered) or ``ALL`` (flat)."""
 
     cluster: str
-    """Source cluster folder name (kept for analysis, e.g. per-cluster BPB)."""
+    """Source cluster folder name (clustered variants); empty for flat variants."""
 
     shards: tuple[str, ...]
     """Repo-relative parquet paths feeding this prefix."""
@@ -51,14 +55,28 @@ def _budgeted(shards: list[str], cap: int | None) -> list[str]:
 
 def plan_conversions(
     config: DataPrepConfig,
+    shards: dict[str, list[str]] | list[str] | None = None,
+) -> list[ConversionJob]:
+    """Plan the ``.bin``/``.idx`` prefixes to build (pure; no I/O), dispatched by variant layout.
+
+    ``shards`` is the pre-listed shard set (injectable so callers/tests skip the network): a
+    ``{cluster: [paths]}`` mapping for clustered variants, or a flat ``[paths]`` list for flat
+    variants. ``None`` fetches it from the HF Hub.
+    """
+    if config.layout == "clustered":
+        return _plan_clustered(config, shards)
+    return _plan_flat(config, shards)
+
+
+def _plan_clustered(
+    config: DataPrepConfig,
     cluster_to_shards: dict[str, list[str]] | None = None,
 ) -> list[ConversionJob]:
-    """Plan the ``.bin``/``.idx`` prefixes to build (pure; no I/O).
+    """Clustered (ClimbLab) planning: per-cluster train/valid + whole held-out clusters.
 
-    For each training cluster: take up to ``shards_per_cluster`` shards (deterministically),
-    hold out the last ``val_shards_per_cluster`` of them as a ``_valid`` prefix, and emit the
-    rest as a ``_train`` prefix. Each held-out cluster becomes a single ``_holdout`` prefix.
-    Train and validation shard sets are disjoint by construction (no leakage).
+    For each training cluster: take up to ``shards_per_cluster`` shards (deterministically), hold
+    out the last ``val_shards_per_cluster`` of them as a ``_valid`` prefix, and emit the rest as a
+    ``_train`` prefix (disjoint by construction). Each held-out cluster becomes a ``_holdout``.
 
     Raises:
         KeyError: if a requested cluster is absent from ``cluster_to_shards``.
@@ -102,6 +120,26 @@ def plan_conversions(
     return jobs
 
 
+def _plan_flat(
+    config: DataPrepConfig,
+    shards: list[str] | None = None,
+) -> list[ConversionJob]:
+    """Flat (ClimbMix) planning: all (budgeted) shards -> one ``<variant>`` prefix.
+
+    No train/valid split is carved here — Megatron's ``--split`` does that at train time over the
+    single dataset.
+
+    Raises:
+        ValueError: if no shards are available.
+    """
+    if shards is None:
+        shards = list_flat_shards(config)
+    shards = _budgeted(shards, config.max_shards)
+    if not shards:
+        raise ValueError(f"variant {config.variant!r} yielded no shards under {config.repo!r}")
+    return [ConversionJob(config.variant, ALL, "", tuple(shards))]
+
+
 def _group_parquet_by_cluster(files: list[str], clusters: list[str]) -> dict[str, list[str]]:
     """Group repo-relative parquet paths by which requested cluster folder they live under.
 
@@ -126,16 +164,30 @@ def list_cluster_shards(
     from huggingface_hub import HfApi
 
     requested = clusters if clusters is not None else [*config.clusters, *config.held_out_clusters]
-    files = HfApi().list_repo_files(config.dataset_repo, repo_type="dataset")
+    files = HfApi().list_repo_files(config.repo, repo_type="dataset")
     grouped = _group_parquet_by_cluster(files, requested)
 
     missing = sorted(c for c, s in grouped.items() if not s)
     if missing:
         raise ValueError(
-            f"no parquet shards found for cluster(s) {missing} in {config.dataset_repo}; "
+            f"no parquet shards found for cluster(s) {missing} in {config.repo}; "
             f"check names against available_clusters()"
         )
     return {c: sorted(s) for c, s in grouped.items()}
+
+
+def list_flat_shards(config: DataPrepConfig) -> list[str]:
+    """List the parquet shards for a flat variant from the HF dataset repo (network)."""
+    from huggingface_hub import HfApi
+
+    prefix = config.spec.shard_prefix
+    files = HfApi().list_repo_files(config.repo, repo_type="dataset")
+    shards = [f for f in files if f.startswith(prefix) and f.endswith(".parquet")]
+    if not shards:
+        raise ValueError(
+            f"no parquet shards under {prefix!r} in {config.repo} for variant {config.variant!r}"
+        )
+    return sorted(shards)
 
 
 def available_clusters(dataset_repo: str) -> list[str]:

@@ -14,7 +14,7 @@ Requires network + Hugging Face access to nvidia/Nemotron-ClimbLab (CC BY-NC).
 import argparse
 import logging
 
-from moe_congestion_routing.data.climblab import available_clusters, plan_conversions
+from moe_congestion_routing.data.climb import available_clusters, plan_conversions
 from moe_congestion_routing.data.config import DataPrepConfig
 from moe_congestion_routing.data.prepare_dataset import run_preparation
 
