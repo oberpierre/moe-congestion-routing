@@ -17,12 +17,46 @@ import os
 import subprocess
 import sys
 from dataclasses import replace
+from pathlib import Path
 
 from moe_congestion_routing.training.infer_config import (
     MoEInferConfig,
     build_infer_launch_command,
 )
 from moe_congestion_routing.training.megatron_path import megatron_root
+
+
+def _checkpoint_iters(path: Path) -> list[int]:
+    """Iterations saved under a Megatron checkpoint dir (its ``iter_<N>/`` subdirs)."""
+    return sorted(
+        int(p.name[5:]) for p in path.glob("iter_*") if p.is_dir() and p.name[5:].isdigit()
+    )
+
+
+def _validate_checkpoint(
+    load: Path, ckpt_step: int | None, parser: argparse.ArgumentParser
+) -> None:
+    """Fail fast if --load has no loadable checkpoint. Giving a clear error message incl. hints."""
+    if not load.is_dir():
+        parser.error(f"--load {load} is not a directory")
+    iters = _checkpoint_iters(load)
+    # ckpt_step bypasses the tracker and loads iter_<step>/ directly, otherwise retrieved from
+    # latest_checkpointed_iteration.txt.
+    if ckpt_step is not None:
+        if ckpt_step not in iters:
+            parser.error(f"--ckpt-step {ckpt_step} not in {load}; available iterations: {iters}")
+        return
+    if (load / "latest_checkpointed_iteration.txt").is_file():
+        return
+    nested = load / "checkpoints"
+    hint = ""
+    if nested.is_dir() and (nested / "latest_checkpointed_iteration.txt").is_file():
+        hint = f"\n  did you mean the checkpoints subdir? --load {nested}"
+    elif iters:
+        hint = f"\n  found untracked iters {iters} (a crashed save?); pick one with --ckpt-step"
+    parser.error(
+        f"no complete checkpoint under --load {load} (no latest_checkpointed_iteration.txt).{hint}"
+    )
 
 
 def main() -> None:
@@ -52,6 +86,7 @@ def main() -> None:
 
     if not cfg.load:
         parser.error("no checkpoint given: set `load` in the yaml or pass --load <dir>")
+    _validate_checkpoint(Path(cfg.load), cfg.ckpt_step, parser)
 
     infer_script = megatron_dir / "examples" / "inference" / "advanced" / "gpt_static_inference.py"
     cmd = build_infer_launch_command(cfg, infer_script, nproc=args.nproc)
