@@ -45,14 +45,20 @@ def test_build_megatron_args_carries_moe_and_tokenizer():
     assert pairs["--moe-aux-loss-coeff"] == "0.01"
     assert pairs["--tokenizer-type"] == "NullTokenizer"
     assert pairs["--vocab-size"] == "50257"  # NullTokenizer eod = 50256 = <|endoftext|>
-    assert pairs["--transformer-impl"] == "local"
+    assert pairs["--transformer-impl"] == "transformer_engine"
+    assert pairs["--attention-backend"] == "auto"
 
 
-def test_build_megatron_args_disables_fused_kernels_for_local_impl():
-    # local impl + no apex/TE: these fusions must be turned off or the model won't instantiate.
+def test_build_megatron_args_disables_apex_megatron_fusions():
+    # Under TE these apex/Megatron fusion paths stay off (apex absent locally; TE fuses its own).
     args = build_megatron_args(MoEPretrainConfig())
     assert "--no-persist-layer-norm" in args
     assert "--no-gradient-accumulation-fusion" in args
+
+
+def test_build_megatron_args_attention_backend_overridable():
+    args = build_megatron_args(MoEPretrainConfig(attention_backend="unfused"))
+    assert _pairs(args)["--attention-backend"] == "unfused"
 
 
 def test_build_megatron_args_toggles_optional_flags():

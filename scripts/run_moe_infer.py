@@ -23,7 +23,7 @@ from moe_congestion_routing.training.infer_config import (
     MoEInferConfig,
     build_infer_launch_command,
 )
-from moe_congestion_routing.training.megatron_path import megatron_root
+from moe_congestion_routing.training.megatron_path import megatron_root, torch_cuda_lib_dirs
 
 
 def _checkpoint_iters(path: Path) -> list[int]:
@@ -101,6 +101,14 @@ def main() -> None:
     env["PYTHONPATH"] = os.pathsep.join([str(megatron_dir), env.get("PYTHONPATH", "")]).rstrip(
         os.pathsep
     )
+    # Transformer Engine dlopens libnccl/libcudnn at import; with a pip torch these live under
+    # site-packages/nvidia/*/lib, off the loader path. Prepend them (no-op in a system-CUDA
+    # container, where torch_cuda_lib_dirs() returns []).
+    lib_dirs = torch_cuda_lib_dirs()
+    if lib_dirs:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [*lib_dirs, env.get("LD_LIBRARY_PATH", "")]
+        ).rstrip(os.pathsep)
     # Load the vendored gpt2 tokenizer purely from disk — never reach the HF hub (offline cluster).
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("TRANSFORMERS_OFFLINE", "1")

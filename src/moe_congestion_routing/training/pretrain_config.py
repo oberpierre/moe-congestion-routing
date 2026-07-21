@@ -57,10 +57,15 @@ class MoEPretrainConfig:
     load: str | None = None
     ckpt_step: int | None = None
 
-    # runtime
-    transformer_impl: str = "local"  # avoid Transformer Engine (not installed locally)
-    # Fused kernels default ON via argparse but need apex/TE; with transformer_impl=local
-    # they must be disabled (torch LayerNorm rejects persist; grad-accum fusion needs apex).
+    # Use Transformer Engine (its fused attention/LayerNorm/Linear speedup the model).
+    # Training and inference both need to use the same implementation, so a checkpoint never
+    # crosses impls — a `local`-trained checkpoint is NOT loadable into a TE model.
+    transformer_impl: str = "transformer_engine"
+    """Megatron transformer implementation. ``transformer_engine`` uses TE's fused modules."""
+
+    attention_backend: str = "auto"
+    """TE attention backend: flash / fused / unfused / auto / local. ``auto`` lets TE pick."""
+
     persist_layer_norm: bool = False
     gradient_accumulation_fusion: bool = False
     masked_softmax_fusion: bool = False  # needs the scaled_masked_softmax_cuda kernel (unbuilt)
@@ -170,6 +175,8 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         # parallelism / runtime
         "--transformer-impl",
         cfg.transformer_impl,
+        "--attention-backend",
+        cfg.attention_backend,
         "--tensor-model-parallel-size",
         str(cfg.tensor_model_parallel_size),
         "--pipeline-model-parallel-size",

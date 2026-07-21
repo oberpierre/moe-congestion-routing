@@ -69,7 +69,17 @@ def test_build_args_uses_legacy_static_engine_by_default():
     assert "--use-legacy-static-engine" not in off
 
 
-def test_build_args_disables_fused_kernels_for_local_impl():
+def test_build_args_uses_te_with_overridable_attention_backend():
+    default = _pairs(build_infer_megatron_args(MoEInferConfig(load="/x")))
+    assert default["--transformer-impl"] == "transformer_engine"
+    assert default["--attention-backend"] == "auto"  # smoke config overrides to unfused
+    unfused = _pairs(
+        build_infer_megatron_args(MoEInferConfig(load="/x", attention_backend="unfused"))
+    )
+    assert unfused["--attention-backend"] == "unfused"
+
+
+def test_build_args_disables_apex_megatron_fusions():
     args = build_infer_megatron_args(MoEInferConfig(load="/x"))
     for flag in (
         "--no-persist-layer-norm",

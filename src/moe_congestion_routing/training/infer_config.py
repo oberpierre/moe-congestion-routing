@@ -75,21 +75,26 @@ class MoEInferConfig:
     moe_router_topk: int = 2
     """Experts activated per token."""
 
-    # runtime — mirror training so the model instantiates the same way on this machine.
-    transformer_impl: str = "local"
-    """``local`` avoids Transformer Engine (not installed locally)."""
+    # runtime — mirror training so the model instantiates the same way (and the checkpoint, trained
+    # under TE, loads into a matching TE model).
+    transformer_impl: str = "transformer_engine"
+    """Megatron transformer implementation; must match the checkpoint's (we train under TE)."""
+
+    attention_backend: str = "auto"
+    """TE attention backend (flash/fused/unfused/auto/local). Local (Ampere) sets ``unfused`` to
+    dodge the cuDNN fused-attn bug; the cluster (Hopper) can use ``auto``/``fused``."""
 
     persist_layer_norm: bool = False
-    """Fused persistent LayerNorm; off under transformer_impl=local."""
+    """Megatron's non-TE fused LayerNorm; off (TE has its own)."""
 
     gradient_accumulation_fusion: bool = False
-    """Fused gradient accumulation; off (needs apex)."""
+    """apex-fused gradient accumulation; off (inference doesn't backprop anyway)."""
 
     masked_softmax_fusion: bool = False
-    """Fused scaled masked softmax; off (kernel unbuilt)."""
+    """Megatron's fused scaled masked softmax; off (TE fuses attention)."""
 
     bias_gelu_fusion: bool = False
-    """Fused bias+GELU; off (fused act path needs swiglu/quick_gelu under MoE probs)."""
+    """Megatron's fused bias+GELU; off (TE fuses the MLP activation)."""
 
     add_bias_linear: bool = False
     """Linear-layer bias; off (matches training / the reference)."""
@@ -178,6 +183,8 @@ def build_infer_megatron_args(cfg: MoEInferConfig) -> list[str]:
         # parallelism / runtime
         "--transformer-impl",
         cfg.transformer_impl,
+        "--attention-backend",
+        cfg.attention_backend,
         "--tensor-model-parallel-size",
         str(cfg.tensor_model_parallel_size),
         "--pipeline-model-parallel-size",

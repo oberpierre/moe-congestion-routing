@@ -18,7 +18,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from moe_congestion_routing.training.megatron_path import megatron_root
+from moe_congestion_routing.training.megatron_path import megatron_root, torch_cuda_lib_dirs
 from moe_congestion_routing.training.pretrain_config import (
     MoEPretrainConfig,
     build_launch_command,
@@ -72,6 +72,14 @@ def main() -> None:
     env["PYTHONPATH"] = os.pathsep.join([str(megatron_dir), env.get("PYTHONPATH", "")]).rstrip(
         os.pathsep
     )
+    # Transformer Engine dlopens libnccl/libcudnn at import; with a pip torch these are under
+    # site-packages/nvidia/*/lib and not on the loader path. Prepend them (no-op on the cluster's
+    # system-CUDA container, where torch_cuda_lib_dirs() returns []).
+    lib_dirs = torch_cuda_lib_dirs()
+    if lib_dirs:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [*lib_dirs, env.get("LD_LIBRARY_PATH", "")]
+        ).rstrip(os.pathsep)
     # One CUDA work queue per device: Megatron needs this so tensor/sequence-parallel comms
     # overlap compute in a correct, deterministic order (recommended default even at TP=1).
     env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")

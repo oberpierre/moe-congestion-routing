@@ -1,5 +1,26 @@
+import importlib.util
 import sys
 from pathlib import Path
+
+
+def torch_cuda_lib_dirs() -> list[str]:
+    """Directories of torch's bundled NVIDIA libs, for a subprocess's ``LD_LIBRARY_PATH``.
+
+    Transformer Engine ``dlopen``s ``libnccl.so.2`` / ``libcudnn`` at import. When torch is a pip
+    wheel these live under ``site-packages/nvidia/*/lib`` and aren't on the loader path by default,
+    so TE fails to load. We return those dirs (plus ``torch/lib``) to prepend. In a system-CUDA
+    environment (e.g. the cluster's NGC container) they don't exist and we return ``[]``, letting
+    the container's own loader path apply.
+    """
+    spec = importlib.util.find_spec("torch")
+    if not spec or not spec.origin:
+        return []
+    site = Path(spec.origin).parent.parent  # .../site-packages/torch/__init__.py -> site-packages
+    dirs = [str(p) for p in sorted((site / "nvidia").glob("*/lib")) if p.is_dir()]
+    torch_lib = site / "torch" / "lib"
+    if torch_lib.is_dir():
+        dirs.append(str(torch_lib))
+    return dirs
 
 
 class MegatronLMNotVendoredError(RuntimeError):
