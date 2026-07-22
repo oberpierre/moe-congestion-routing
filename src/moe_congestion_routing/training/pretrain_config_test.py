@@ -72,9 +72,36 @@ def test_from_yaml_extends_rejects_cycles(tmp_path):
         MoEPretrainConfig.from_yaml(tmp_path / "x.yaml")
 
 
-def test_build_megatron_args_requires_train_data_path():
-    with pytest.raises(ValueError, match="train_data_path is required"):
-        build_megatron_args(MoEPretrainConfig(train_data_path=None))
+def test_wandb_args_gated_on_project():
+    off = build_megatron_args(_cfg(wandb_project=None, wandb_exp_name="x"))
+    assert "--wandb-project" not in off
+    assert "--wandb-exp-name" not in off  # not emitted without a project
+    on = _pairs(
+        build_megatron_args(
+            _cfg(wandb_project="moe", wandb_exp_name="switch-local", wandb_entity="me")
+        )
+    )
+    assert on["--wandb-project"] == "moe"
+    assert on["--wandb-exp-name"] == "switch-local"
+    assert on["--wandb-entity"] == "me"
+
+
+def test_tensorboard_flags():
+    args = build_megatron_args(_cfg(tensorboard_dir="/run/tb"))
+    assert _pairs(args)["--tensorboard-dir"] == "/run/tb"
+
+
+def test_resolved_absolutises_logging_dirs(tmp_path):
+    r = MoEPretrainConfig(tensorboard_dir="run/tb", wandb_save_dir="run/wandb").resolved(tmp_path)
+    assert r.tensorboard_dir == str(tmp_path / "run/tb")
+    assert r.wandb_save_dir == str(tmp_path / "run/wandb")
+    unset = MoEPretrainConfig().resolved(tmp_path)
+    assert unset.tensorboard_dir is None and unset.wandb_save_dir is None
+
+
+def test_build_megatron_args_requires_a_data_source():
+    with pytest.raises(ValueError, match="a data source is required"):
+        build_megatron_args(MoEPretrainConfig(train_data_path=None, data_path=None))
 
 
 def test_build_megatron_args_valid_data_path_optional():
@@ -82,6 +109,47 @@ def test_build_megatron_args_valid_data_path_optional():
     assert "--valid-data-path" not in build_megatron_args(_cfg(valid_data_path=None))
     on = _pairs(build_megatron_args(_cfg(valid_data_path="/data/valid")))
     assert on["--valid-data-path"] == "/data/valid"
+
+
+def test_single_blob_data_path_emits_data_path_and_split():
+    # ClimbMix mode: one blob carved by --split; no per-split paths.
+    args = build_megatron_args(
+        MoEPretrainConfig(train_data_path=None, data_path="/data/blob", split="99,1,0")
+    )
+    pairs = _pairs(args)
+    assert pairs["--data-path"] == "/data/blob"
+    assert pairs["--split"] == "99,1,0"
+    assert "--train-data-path" not in args
+
+
+def test_data_path_requires_split():
+    # A blob without --split leaves the valid split empty and eval crashes — fail loud instead.
+    with pytest.raises(ValueError, match="split is required with data_path"):
+        build_megatron_args(MoEPretrainConfig(train_data_path=None, data_path="/data/blob"))
+
+
+def test_split_incompatible_with_train_data_path():
+    # Megatron forbids --split alongside per-split paths ("split and blend_per_split incompatible").
+    with pytest.raises(ValueError, match="split is incompatible with train_data_path"):
+        build_megatron_args(_cfg(split="99,1,0"))
+
+
+def test_data_path_and_train_data_path_mutually_exclusive():
+    with pytest.raises(ValueError, match="not both"):
+        build_megatron_args(_cfg(data_path="/data/blob", split="99,1,0"))
+
+
+def test_pre_split_mode_still_works_without_split():
+    # Per-cluster ClimbLab: train/valid prefixes, no --split, no --data-path.
+    args = build_megatron_args(_cfg(valid_data_path="/data/valid"))
+    assert _pairs(args)["--train-data-path"] == "/data/train"
+    assert "--split" not in args
+    assert "--data-path" not in args
+
+
+def test_resolved_absolutises_data_path(tmp_path):
+    r = MoEPretrainConfig(data_path="artifacts/blob", split="99,1,0").resolved(tmp_path)
+    assert r.data_path == str(tmp_path / "artifacts/blob")
 
 
 def test_build_megatron_args_carries_moe_and_tokenizer():

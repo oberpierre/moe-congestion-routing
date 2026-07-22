@@ -76,7 +76,16 @@ class MoEPretrainConfig:
     """``.bin``/``.idx`` prefix for the training split."""
 
     valid_data_path: str | None = None
-    """``.bin``/``.idx`` prefix for the validation split."""
+    """``.bin``/``.idx`` prefix for the validation split (pre-split mode only)."""
+
+    data_path: str | None = None
+    """Single ``.bin``/``.idx`` prefix - ONE blend that Megatron carves into train/valid/test at
+    load time via ``split``. Mutually exclusive with ``train_data_path``."""
+
+    split: str | None = None
+    """Train/valid/test ratios for the ``data_path`` blob, e.g. ``"99,1,0"``. REQUIRED with
+    ``data_path`` and forbidden with ``train_data_path`` (per-split paths are already split).
+    Ensure valid splits are non-empty if you set ``eval_interval`` > 0, else eval crashes."""
 
     tokenizer_type: str = "NullTokenizer"
     """NullTokenizer(vocab_size) sets eod = vocab_size-1 = 50256 = <|endoftext|>, so no
@@ -175,6 +184,23 @@ class MoEPretrainConfig:
     log_interval: int = 1
     """Iterations between training-log lines."""
 
+    tensorboard_dir: str | None = None
+    """TensorBoard log dir. ``None`` => the launcher derives ``<run_dir>/tensorboard``."""
+
+    wandb_project: str | None = None
+    """W&B project. Set => W&B on (logs to wandb.ai using WANDB_API_KEY from the env); unset =>
+    off. The arm base configs set this, so a run logs to W&B with only WANDB_API_KEY in the env."""
+
+    wandb_exp_name: str | None = None
+    """W&B run name. Megatron requires a non-empty name whenever ``wandb_project`` is set; the
+    launcher derives it from the config file stem + run timestamp when left unset."""
+
+    wandb_entity: str | None = None
+    """W&B entity (team/user). Optional; unset uses your default entity."""
+
+    wandb_save_dir: str | None = None
+    """Local dir for W&B run files. ``None`` => the launcher derives ``<run_dir>/wandb``."""
+
     data_cache_path: str | None = None
     """Dataset sample/shuffle index cache. ``None`` => ``<output_dir>/cache`` (derived in the
     launcher). Shared across runs (keyed by seed/seq_length) so the indices build once."""
@@ -209,19 +235,20 @@ class MoEPretrainConfig:
             self,
             train_data_path=absolutise(self.train_data_path) if self.train_data_path else None,
             valid_data_path=absolutise(self.valid_data_path) if self.valid_data_path else None,
+            data_path=absolutise(self.data_path) if self.data_path else None,
             output_dir=output_dir,
             data_cache_path=absolutise(self.data_cache_path)
             if self.data_cache_path
             else str(Path(output_dir) / "cache"),
             save=absolutise(self.save) if self.save else None,
             load=absolutise(self.load) if self.load else None,
+            tensorboard_dir=absolutise(self.tensorboard_dir) if self.tensorboard_dir else None,
+            wandb_save_dir=absolutise(self.wandb_save_dir) if self.wandb_save_dir else None,
         )
 
 
 def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
     """Map the config to a flat Megatron ``pretrain_gpt.py`` CLI arg list (pure)."""
-    if not cfg.train_data_path:
-        raise ValueError("train_data_path is required (set it in the run yaml)")
     args = [
         # model
         "--num-layers",
@@ -250,8 +277,6 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         cfg.tokenizer_type,
         "--vocab-size",
         str(cfg.vocab_size),
-        "--train-data-path",
-        cfg.train_data_path,
         # optimisation / schedule
         "--lr",
         str(cfg.lr),
@@ -291,8 +316,38 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         "--distributed-backend",
         "nccl",
     ]
-    if cfg.valid_data_path:
-        args += ["--valid-data-path", cfg.valid_data_path]
+    if cfg.tensorboard_dir:
+        args += ["--tensorboard-dir", cfg.tensorboard_dir]
+    if cfg.wandb_project:
+        args += ["--wandb-project", cfg.wandb_project]
+        if cfg.wandb_exp_name:
+            args += ["--wandb-exp-name", cfg.wandb_exp_name]
+        if cfg.wandb_entity:
+            args += ["--wandb-entity", cfg.wandb_entity]
+        if cfg.wandb_save_dir:
+            args += ["--wandb-save-dir", cfg.wandb_save_dir]
+    # Data source — two mutually exclusive modes Megatron enforces (blend vs blend_per_split):
+    #   (1) single blob carved by --split into train/valid/test (ClimbMix), or
+    #   (2) pre-split --train-/--valid-data-path prefixes (per-cluster ClimbLab).
+    # Mixing them, or a blob without --split, leaves the valid split empty and eval crashes at
+    # eval_interval — hence the fail-loud checks here.
+    if cfg.data_path and cfg.train_data_path:
+        raise ValueError("set either data_path (single blob + split) or train_data_path, not both")
+    if cfg.data_path:
+        if not cfg.split:
+            raise ValueError("split is required with data_path (e.g. '99,1,0')")
+        args += ["--data-path", cfg.data_path, "--split", cfg.split]
+    elif cfg.train_data_path:
+        if cfg.split:
+            raise ValueError(
+                "split is incompatible with train_data_path (per-split paths are already split); "
+                "use data_path + split for a single blob"
+            )
+        args += ["--train-data-path", cfg.train_data_path]
+        if cfg.valid_data_path:
+            args += ["--valid-data-path", cfg.valid_data_path]
+    else:
+        raise ValueError("a data source is required: set data_path (+ split) or train_data_path")
     if not cfg.persist_layer_norm:
         args += ["--no-persist-layer-norm"]
     if not cfg.gradient_accumulation_fusion:

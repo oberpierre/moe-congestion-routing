@@ -53,6 +53,20 @@ def main() -> None:
     if cfg.save_interval and not cfg.save:
         cfg = replace(cfg, save=str(run_dir / "checkpoints"))
 
+    # Logging sinks default into this run's own dir so every run's TensorBoard/W&B files sit
+    # next to its log and checkpoints. W&B is only wired when a project is configured. Megatron
+    # also requires a non-empty run name, so derive one from the config + timestamp when unset.
+    if not cfg.tensorboard_dir:
+        cfg = replace(cfg, tensorboard_dir=str(run_dir / "tensorboard"))
+    if cfg.wandb_project:
+        updates = {}
+        if not cfg.wandb_save_dir:
+            updates["wandb_save_dir"] = str(run_dir / "wandb")
+        if not cfg.wandb_exp_name:
+            updates["wandb_exp_name"] = f"{Path(args.config).stem}-{run_dir.name}"
+        if updates:
+            cfg = replace(cfg, **updates)
+
     cmd = build_launch_command(cfg, megatron_dir / "pretrain_gpt.py", nproc=args.nproc)
 
     if args.dry_run:

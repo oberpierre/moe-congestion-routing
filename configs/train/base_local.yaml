@@ -1,0 +1,47 @@
+# model (local)
+num_layers: 8
+hidden_size: 512
+num_attention_heads: 8
+ffn_hidden_size: 1024
+seq_length: 1024
+
+# MoE - 8 experts, top-2, dropless (no capacity factor).
+num_experts: 8
+moe_router_topk: 2
+
+# Set the project name and  WANDB_API_KEY in the env (see config.sh.example) to enable W&B logging.
+# WANDB_MODE=offline skips the upload for quick runs.
+wandb_project: moe-congestion-routing-local
+
+# data - Use either data_path with split (required, carves train/valid/test from data at load time)
+# or train_data_path + valid_data_path (pre-split, e.g. for ClimbLab clusters).
+data_path: artifacts/datasets/climbmix_small/climbmix_small
+split: "99,1,0"
+tokenizer_type: NullTokenizer
+vocab_size: 50257
+
+# optimisation / schedule
+lr: 3.0e-4
+min_lr: 3.0e-5
+lr_decay_style: constant
+lr_warmup_iters: 10
+micro_batch_size: 4
+global_batch_size: 16
+train_iters: 500
+seed: 1234
+
+# eval + checkpointing
+eval_interval: 100
+eval_iters: 10
+save_interval: 250
+
+# runtime - Transformer Engine; unfused attention dodges the Ampere cuDNN fused-attn bug locally.
+transformer_impl: transformer_engine
+attention_backend: unfused
+bf16: true
+tensor_model_parallel_size: 1
+pipeline_model_parallel_size: 1
+expert_model_parallel_size: 1
+log_interval: 1
+
+output_dir: artifacts/e1_local
