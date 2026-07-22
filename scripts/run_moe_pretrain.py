@@ -2,8 +2,9 @@
 """Launch a small MoE pretraining run through Megatron's ``pretrain_gpt.py``.
 
 Reads a run-config yaml, builds the Megatron CLI arg list, and execs
-``torchrun pretrain_gpt.py`` on the local GPU(s). We deliberately reuse Megatron's own
-training loop so we get its native logging out of the box.
+``python -m torch.distributed.run pretrain_gpt.py`` across the allocated GPU(s) (single-node
+standalone by default; ``--nnodes``/``--rdzv-endpoint`` switch to a multi-node c10d rendezvous).
+We deliberately reuse Megatron's own training loop so we get its native logging out of the box.
 
 Usage:
     uv run python scripts/run_moe_pretrain.py --config configs/train/climblab_moe_smoke.yaml
@@ -29,6 +30,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="path to a MoEPretrainConfig yaml file")
     parser.add_argument("--nproc", type=int, default=1, help="processes (GPUs) per node")
+    parser.add_argument(
+        "--nnodes", type=int, default=1, help="number of nodes (>1 switches to a c10d rendezvous)"
+    )
+    parser.add_argument(
+        "--rdzv-endpoint",
+        default=None,
+        help="HOST:PORT of node 0 for the multi-node rendezvous (required when --nnodes > 1)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the command and exit")
     parser.add_argument(
         "--no-capture",
@@ -47,7 +56,13 @@ def main() -> None:
     # and checkpoints, so repeated/concurrent runs don't interfere with each other. The dataset
     # cache is deliberately shared at <output_dir>/cache (keyed by seed/seq_length) so the
     # sample/shuffle indices are built once and reused across runs.
-    run_dir = Path(cfg.output_dir) / datetime.now().strftime("%Y%m%d-%H%M%S")
+    #
+    # Multi-node: the launcher runs once per node, so a per-node datetime.now() would give each
+    # node a different run dir -- and since c10d assigns ranks (global rank 0 isn't pinned to a
+    # node), checkpoints would land in an unpredictable node's dir. The sbatch exports one shared
+    # MOE_RUN_TAG so every node agrees on a single run dir; falls back to a timestamp locally.
+    run_tag = os.environ.get("MOE_RUN_TAG") or datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = Path(cfg.output_dir) / run_tag
     # Checkpointing enabled (save_interval set) but no explicit save dir → checkpoint into this
     # run's own dir, keeping each run's weights separate and trivial to locate for inference.
     if cfg.save_interval and not cfg.save:
@@ -67,7 +82,13 @@ def main() -> None:
         if updates:
             cfg = replace(cfg, **updates)
 
-    cmd = build_launch_command(cfg, megatron_dir / "pretrain_gpt.py", nproc=args.nproc)
+    cmd = build_launch_command(
+        cfg,
+        megatron_dir / "pretrain_gpt.py",
+        nproc=args.nproc,
+        nnodes=args.nnodes,
+        rdzv_endpoint=args.rdzv_endpoint,
+    )
 
     if args.dry_run:
         print(" ".join(cmd))

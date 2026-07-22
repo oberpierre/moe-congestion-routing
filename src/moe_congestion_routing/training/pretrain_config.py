@@ -1,5 +1,6 @@
 """Run config for a MoE pretraining run through Megatron's ``pretrain_gpt.py``."""
 
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -410,14 +411,33 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
 
 
 def build_launch_command(
-    cfg: MoEPretrainConfig, megatron_script: str | Path, nproc: int = 1
+    cfg: MoEPretrainConfig,
+    megatron_script: str | Path,
+    nproc: int = 1,
+    *,
+    nnodes: int = 1,
+    rdzv_endpoint: str | None = None,
 ) -> list[str]:
-    """Full ``torchrun`` command: single-node standalone, one process per GPU."""
-    return [
-        "torchrun",
-        "--standalone",
-        "--nproc-per-node",
-        str(nproc),
-        str(megatron_script),
-        *build_megatron_args(cfg),
-    ]
+    """Full torch-elastic launch command, one process per GPU.
+
+    Launched as ``python -m torch.distributed.run`` (not the ``torchrun`` console script) so the
+    workers inherit *this* interpreter via ``sys.executable`` ensuring that venv's own deps
+    and the container's system torch/Transformer Engine are visible.
+    """
+    launch = [sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", str(nproc)]
+    if nnodes > 1 or rdzv_endpoint is not None:
+        if rdzv_endpoint is None:
+            raise ValueError("multi-node launch (nnodes > 1) requires rdzv_endpoint (HOST:PORT)")
+        launch += [
+            "--nnodes",
+            str(nnodes),
+            "--rdzv-backend",
+            "c10d",
+            "--rdzv-endpoint",
+            rdzv_endpoint,
+            "--max-restarts",
+            "0",
+        ]
+    else:
+        launch += ["--standalone"]
+    return [*launch, str(megatron_script), *build_megatron_args(cfg)]

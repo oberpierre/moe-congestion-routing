@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 from moe_congestion_routing.training.pretrain_config import (
@@ -269,14 +271,35 @@ def test_resolved_absolutises_checkpoint_paths(tmp_path):
     assert MoEPretrainConfig().resolved(tmp_path).save is None
 
 
-def test_build_launch_command_wraps_torchrun():
+def test_build_launch_command_wraps_torch_distributed_run():
     cfg = _cfg()
     cmd = build_launch_command(cfg, "/repo/Megatron-LM/pretrain_gpt.py", nproc=1)
-    assert cmd[0] == "torchrun"
-    assert "--standalone" in cmd
+    # Launched via `python -m torch.distributed.run` so workers inherit sys.executable (the venv
+    # python on the cluster), not the torch-shipped `torchrun` script under the system python.
+    assert cmd[:3] == [sys.executable, "-m", "torch.distributed.run"]
+    assert "--standalone" in cmd  # single-node default
+    assert "--rdzv-endpoint" not in cmd
     assert cmd[_pairs_index(cmd, "--nproc-per-node")] == "1"
     assert "/repo/Megatron-LM/pretrain_gpt.py" in cmd
     assert "--num-experts" in cmd  # megatron args appended after the script
+
+
+def test_build_launch_command_multinode_uses_c10d_rendezvous():
+    cfg = _cfg()
+    cmd = build_launch_command(
+        cfg, "/repo/Megatron-LM/pretrain_gpt.py", nproc=4, nnodes=2, rdzv_endpoint="nid001:25678"
+    )
+    assert "--standalone" not in cmd
+    assert cmd[_pairs_index(cmd, "--nnodes")] == "2"
+    assert cmd[_pairs_index(cmd, "--nproc-per-node")] == "4"
+    assert cmd[_pairs_index(cmd, "--rdzv-backend")] == "c10d"
+    assert cmd[_pairs_index(cmd, "--rdzv-endpoint")] == "nid001:25678"
+    assert cmd[_pairs_index(cmd, "--max-restarts")] == "0"
+
+
+def test_build_launch_command_multinode_requires_endpoint():
+    with pytest.raises(ValueError, match="rdzv_endpoint"):
+        build_launch_command(_cfg(), "/repo/Megatron-LM/pretrain_gpt.py", nproc=4, nnodes=2)
 
 
 def _pairs_index(args: list[str], flag: str) -> int:
