@@ -72,6 +72,44 @@ def test_from_yaml_extends_rejects_cycles(tmp_path):
         MoEPretrainConfig.from_yaml(tmp_path / "x.yaml")
 
 
+def test_control_arm_disables_balancing():
+    pairs = _pairs(build_megatron_args(_cfg(moe_router_load_balancing_type="none")))
+    assert pairs["--moe-router-load-balancing-type"] == "none"
+    # control never carries a bias flag
+    assert "--moe-router-enable-expert-bias" not in build_megatron_args(
+        _cfg(moe_router_load_balancing_type="none")
+    )
+
+
+def test_alflb_arm_emits_sigmoid_expert_bias():
+    cfg = _cfg(
+        moe_router_load_balancing_type="none",
+        moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+        moe_router_bias_update_rate=1e-2,
+    )
+    args = build_megatron_args(cfg)
+    pairs = _pairs(args)
+    assert "--moe-router-enable-expert-bias" in args
+    assert pairs["--moe-router-bias-update-rate"] == "0.01"
+    assert pairs["--moe-router-score-function"] == "sigmoid"
+
+
+def test_score_function_defaults_softmax_and_bias_off():
+    args = build_megatron_args(_cfg())
+    assert _pairs(args)["--moe-router-score-function"] == "softmax"
+    assert "--moe-router-enable-expert-bias" not in args
+
+
+def test_z_loss_and_per_layer_logging_optional():
+    on = build_megatron_args(_cfg(moe_z_loss_coeff=1e-3, moe_per_layer_logging=True))
+    assert _pairs(on)["--moe-z-loss-coeff"] == "0.001"
+    assert "--moe-per-layer-logging" in on
+    off = build_megatron_args(_cfg())
+    assert "--moe-z-loss-coeff" not in off
+    assert "--moe-per-layer-logging" not in off
+
+
 def test_wandb_args_gated_on_project():
     off = build_megatron_args(_cfg(wandb_project=None, wandb_exp_name="x"))
     assert "--wandb-project" not in off

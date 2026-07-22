@@ -1,0 +1,101 @@
+# Patch: MoE load-balance metrics battery
+# ==================================
+# Problem: Megatron logs only the aux/z-loss; the load-balance metrics our arms are
+#   compared on is not computed anywhere.
+#
+# What this patch does:
+#   - router.py: TopKRouter.routing() computes the battery (load CV, MaxVio, Hill 0/1/2 D,
+#     ||f-p||_1, dead experts) and records it via the existing MoE metrics tracker.
+#   - training.py: adds those names to track_names so report() logs/clears them each step.
+#
+# Where in the code:
+#   File: megatron/core/transformer/moe/router.py
+#   Function: TopKRouter.routing() / _record_load_balance_metrics()
+#   Location: end of routing(), after expert-bias selection.
+#
+#   File: megatron/training/training.py
+#   Function: training_log()
+#   Location: the MoE track_names block (~line 2549), beside the aux/z-loss names.
+#
+# How to fix if this patch breaks on a future Megatron version:
+#   Search for `_apply_expert_bias` in moe/router.py. Find the invocation and add the call
+#   to `_record_load_balance_metrics` after it, passing the router's logits and routing_map.
+#   Search for `args.moe_z_loss_coeff` in training.py. Add the new metrics to track_names below.
+#
+# Applied to: Megatron-LM core_v0.18.0
+#
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 235a616df..3f8fba427 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -669,8 +669,48 @@ class TopKRouter(Router):
+         # Optionally apply expert bias
+         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+ 
++        # Load-balance metrics battery (moe-congestion-routing patch).
++        self._record_load_balance_metrics(logits, routing_map)
++
+         return probs, routing_map
+ 
++    def _record_load_balance_metrics(self, logits: torch.Tensor, routing_map: torch.Tensor):
++        """Record the per-step load-balance battery via the MoE metrics tracker."""
++        if not (self.training and torch.is_grad_enabled()):
++            return
++        with torch.no_grad():
++            num_experts = routing_map.shape[-1]
++            num_tokens = routing_map.shape[0]
++            if num_tokens == 0:
++                return
++            topk = self.topk
++            balanced_load = num_tokens * topk / num_experts
++
++            tokens_per_expert = routing_map.sum(dim=0).float()  # hard load n_e, [E]
++            share = tokens_per_expert / (num_tokens * topk)  # mu_e, distribution over experts
++            mean_prob = torch.softmax(logits.float(), dim=-1).mean(dim=0)  # soft load p_e
++
++            load_cv = tokens_per_expert.std(unbiased=False) / (tokens_per_expert.mean() + 1e-9)
++            maxvio = (tokens_per_expert.max() - balanced_load) / balanced_load
++            n_eff_0 = (tokens_per_expert > 0).sum().float()
++            safe = share.clamp_min(1e-12)
++            n_eff_1 = (-(safe * safe.log()).sum()).exp()
++            n_eff_2 = 1.0 / (share.pow(2).sum() + 1e-12)
++            frac_gate_l1 = (share - mean_prob).abs().sum()
++            dead_experts = (share < 0.1 / num_experts).sum().float()
++
++        num_layers = self.config.num_layers
++        for name, value in (
++            ("load_cv", load_cv),
++            ("maxvio", maxvio),
++            ("n_eff_0", n_eff_0),
++            ("n_eff_1", n_eff_1),
++            ("n_eff_2", n_eff_2),
++            ("frac_gate_l1", frac_gate_l1),
++            ("dead_experts", dead_experts),
++        ):
++            get_moe_metrics_tracker().record(name, value, self.layer_number, num_layers)
++
+     def reset_global_aux_loss_tracker(self):
+         """Reset the global aux loss tracker."""
+         if self.global_tokens_per_expert is not None:
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 3930cc46a..a80e34359 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -2549,6 +2549,17 @@ def training_log(
+         if args.moe_z_loss_coeff is not None:
+             track_names.append("z_loss")
+ 
++        # Load-balance metrics battery (patch): report/clear each step (else unbounded).
++        track_names += [
++            "load_cv",
++            "maxvio",
++            "n_eff_0",
++            "n_eff_1",
++            "n_eff_2",
++            "frac_gate_l1",
++            "dead_experts",
++        ]
++
+         if is_hybrid_model(args):
+             from operator import itemgetter
+ 

@@ -72,6 +72,24 @@ class MoEPretrainConfig:
     moe_aux_loss_coeff: float = 0.01
     """Aux-loss weight. Megatron's default is 0.0, which makes the aux loss a no-op."""
 
+    moe_router_score_function: str = "softmax"
+    """Router scoring: ``softmax`` or ``sigmoid`` (Deepseek-V3 style). Megatron REQUIRES sigmoid
+    whenever expert bias is on, so ALF-LB must use ``sigmoid`` (or sqrtsoftplus)."""
+
+    moe_router_enable_expert_bias: bool = False
+    """ALF-LB / aux-loss-free load balancing: maintain a per-expert selection bias updated
+    from realized load (Megatron's built-in ``sign(mean_load - load)`` rule). Combine weights
+    stay unbiased. Requires ``moe_router_score_function`` in {sigmoid, sqrtsoftplus}."""
+
+    moe_router_bias_update_rate: float = 1e-3
+    """Step size for the expert-bias update (only used when expert bias is enabled)."""
+
+    moe_z_loss_coeff: float | None = None
+    """Router z-loss coefficient (ST-MoE). ``None`` disables it."""
+
+    moe_per_layer_logging: bool = False
+    """Also log every MoE metric per layer (``moe/<metric>_layer_<i>``), not just the layer-mean."""
+
     train_data_path: str | None = None
     """``.bin``/``.idx`` prefix for the training split."""
 
@@ -272,6 +290,8 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         cfg.moe_router_load_balancing_type,
         "--moe-aux-loss-coeff",
         str(cfg.moe_aux_loss_coeff),
+        "--moe-router-score-function",
+        cfg.moe_router_score_function,
         # tokenizer / data
         "--tokenizer-type",
         cfg.tokenizer_type,
@@ -316,6 +336,16 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         "--distributed-backend",
         "nccl",
     ]
+    if cfg.moe_router_enable_expert_bias:
+        args += [
+            "--moe-router-enable-expert-bias",
+            "--moe-router-bias-update-rate",
+            str(cfg.moe_router_bias_update_rate),
+        ]
+    if cfg.moe_z_loss_coeff is not None:
+        args += ["--moe-z-loss-coeff", str(cfg.moe_z_loss_coeff)]
+    if cfg.moe_per_layer_logging:
+        args += ["--moe-per-layer-logging"]
     if cfg.tensorboard_dir:
         args += ["--tensorboard-dir", cfg.tensorboard_dir]
     if cfg.wandb_project:

@@ -8,7 +8,11 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        # .patch files carry significant whitespace (a blank context line is " "); stripping it
+        # corrupts the diff so `git apply` fails. Never touch the vendored-submodule patches.
+        exclude: ^patches/
       - id: end-of-file-fixer
+        exclude: ^patches/
       - id: check-yaml
       - id: check-toml
       - id: check-added-large-files
