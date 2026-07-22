@@ -202,6 +202,10 @@ class MoEPretrainConfig:
     log_interval: int = 1
     """Iterations between training-log lines."""
 
+    log_throughput: bool = False
+    """Log Megatron's native per-GPU throughput (TFLOP/s/GPU). The tokens/s/GPU patch adds a
+    complementary token-rate line; both are cheap and always worth having."""
+
     tensorboard_dir: str | None = None
     """TensorBoard log dir. ``None`` => the launcher derives ``<run_dir>/tensorboard``."""
 
@@ -346,6 +350,8 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         args += ["--moe-z-loss-coeff", str(cfg.moe_z_loss_coeff)]
     if cfg.moe_per_layer_logging:
         args += ["--moe-per-layer-logging"]
+    if cfg.log_throughput:
+        args += ["--log-throughput"]
     if cfg.tensorboard_dir:
         args += ["--tensorboard-dir", cfg.tensorboard_dir]
     if cfg.wandb_project:

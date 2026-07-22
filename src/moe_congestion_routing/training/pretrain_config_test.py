@@ -124,9 +124,10 @@ def test_wandb_args_gated_on_project():
     assert on["--wandb-entity"] == "me"
 
 
-def test_tensorboard_flags():
-    args = build_megatron_args(_cfg(tensorboard_dir="/run/tb"))
+def test_tensorboard_and_throughput_flags():
+    args = build_megatron_args(_cfg(tensorboard_dir="/run/tb", log_throughput=True))
     assert _pairs(args)["--tensorboard-dir"] == "/run/tb"
+    assert "--log-throughput" in args
 
 
 def test_resolved_absolutises_logging_dirs(tmp_path):

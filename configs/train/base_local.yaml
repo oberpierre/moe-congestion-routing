@@ -13,6 +13,7 @@ moe_z_loss_coeff: 1.0e-3
 
 # metrics: full load-balance battery per layer (patch 0001) + native throughput.
 moe_per_layer_logging: true
+log_throughput: true
 
 # Set the project name and  WANDB_API_KEY in the env (see config.sh.example) to enable W&B logging.
 # WANDB_MODE=offline skips the upload for quick runs.
