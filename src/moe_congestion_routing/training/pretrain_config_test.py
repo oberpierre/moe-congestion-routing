@@ -41,6 +41,37 @@ def test_from_yaml_rejects_unknown_key(tmp_path):
         MoEPretrainConfig.from_yaml(path)
 
 
+def test_from_yaml_extends_merges_base_with_override(tmp_path):
+    (tmp_path / "base.yaml").write_text(
+        "num_experts: 8\nmoe_router_topk: 2\nhidden_size: 512\ntrain_data_path: /data/train\n"
+    )
+    arm = tmp_path / "arm.yaml"
+    arm.write_text("extends: base.yaml\nmoe_router_load_balancing_type: none\nhidden_size: 1024\n")
+    cfg = MoEPretrainConfig.from_yaml(arm)
+    assert cfg.num_experts == 8  # inherited from base
+    assert cfg.moe_router_topk == 2  # inherited from base
+    assert cfg.moe_router_load_balancing_type == "none"  # from arm
+    assert cfg.hidden_size == 1024  # arm overrides base
+    assert cfg.train_data_path == "/data/train"
+
+
+def test_from_yaml_extends_is_recursive_and_ordered(tmp_path):
+    (tmp_path / "a.yaml").write_text("num_layers: 2\nhidden_size: 128\n")
+    (tmp_path / "b.yaml").write_text("extends: a.yaml\nhidden_size: 256\n")
+    (tmp_path / "c.yaml").write_text("extends: b.yaml\nnum_experts: 4\ntrain_data_path: /d\n")
+    cfg = MoEPretrainConfig.from_yaml(tmp_path / "c.yaml")
+    assert cfg.num_layers == 2  # from a (grandparent)
+    assert cfg.hidden_size == 256  # b overrides a
+    assert cfg.num_experts == 4  # from c
+
+
+def test_from_yaml_extends_rejects_cycles(tmp_path):
+    (tmp_path / "x.yaml").write_text("extends: y.yaml\n")
+    (tmp_path / "y.yaml").write_text("extends: x.yaml\n")
+    with pytest.raises(ValueError, match="circular"):
+        MoEPretrainConfig.from_yaml(tmp_path / "x.yaml")
+
+
 def test_build_megatron_args_requires_train_data_path():
     with pytest.raises(ValueError, match="train_data_path is required"):
         build_megatron_args(MoEPretrainConfig(train_data_path=None))
