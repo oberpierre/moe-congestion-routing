@@ -1,0 +1,4 @@
+extends: base_local.yaml
+
+moe_router_load_balancing_type: none
+moe_aux_loss_coeff: 0.0
