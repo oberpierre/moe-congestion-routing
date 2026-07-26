@@ -11,3 +11,11 @@ build/
 # Generated artifacts
 artifacts/
 logs/
+
+# Environment files
+config.sh
+
+# Caches
+hf_cache/
+.triton_cache/
+.inductor_cache/
