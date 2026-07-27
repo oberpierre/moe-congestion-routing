@@ -1,0 +1,13 @@
+# Copy this file to config.sh and fill in your values.
+# config.sh is git-ignored so your personal paths are never committed.
+
+export WORKDIR="/iopsstor/scratch/cscs/your_cscs_account/moe-congestion-routing"
+
+# Persistent Store base for staged datasets (tape-backed, no cleanup). The regenerable HF
+# download cache uses the system-provided $SCRATCH, so it is intentionally not set here.
+export DATA_STORE="/capstor/store/cscs/<customer>/<group_id>"
+
+# Slurm auto-reads SBATCH_ACCOUNT from the environment (so no #SBATCH --account is needed).
+export SBATCH_ACCOUNT="<group_id>"
+
+export WANDB_API_KEY=""

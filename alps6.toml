@@ -1,0 +1,13 @@
+# Copy to ~/.edf/alps6.toml on the cluster; referenced as `srun --environment=alps6`.
+# alps3 is deprecated — see https://docs.cscs.ch/software/alps-extended-images/.
+image = "jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ngc-pytorch:26.02-py3-alps6"
+mounts = ["/capstor:/capstor", "/users:/users", "/iopsstor:/iopsstor"]
+workdir = "/users/your_cscs_account"
+writable = true
+entrypoint = true
+
+[env]
+PMIX_MCA_psec = "native"
+
+[annotations]
+com.hooks.cxi.enabled = "false"

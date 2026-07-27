@@ -1,0 +1,7 @@
+extends: base_local.yaml
+
+moe_router_load_balancing_type: none
+moe_aux_loss_coeff: 0.0
+moe_router_enable_expert_bias: true
+moe_router_score_function: sigmoid
+moe_router_bias_update_rate: 1.0e-3

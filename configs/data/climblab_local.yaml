@@ -1,0 +1,26 @@
+dataset_repo: nvidia/Nemotron-ClimbLab
+output_dir: artifacts/climblab_local
+cache_dir: artifacts/_hf_cache
+
+# Two training clusters, each capped to a few shards; last shard of each held out as
+# in-distribution validation. One entire cluster reserved as a held-out (domain-shift) set.
+clusters:
+  - cluster_1
+  - cluster_2
+held_out_clusters:
+  - cluster_3
+
+shards_per_cluster: 5
+val_shards_per_cluster: 1
+
+# Token/format details. ClimbLab is pre-tokenized GPT-2 ids; uint16 holds the vocab (50257).
+token_column: tokens
+dtype: uint16
+append_eod: false
+eod_token_id: 50256
+vocab_size: 50257
+
+# Worker pool configuration for download and conversion. Note that download_wokers are threaded,
+# while convert_workers are process-based (multiprocessing).
+download_workers: 4
+convert_workers: 2

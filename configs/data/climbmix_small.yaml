@@ -1,0 +1,21 @@
+variant: climbmix_small
+
+# output_dir on Store (persistent, ${DATA_STORE} from config.sh); cache_dir on the
+# system-provided ${SCRATCH} (regenerable download cache).
+output_dir: ${DATA_STORE}/datasets/nvidia/Nemotron-ClimbMix/climbmix_small
+cache_dir: ${SCRATCH}/hf_cache
+
+# climbmix_small has 99 parquet shards (~51 GB) total; null = all shards.
+max_shards: null
+
+# Token/format details. ClimbMix is pre-tokenized GPT-2 ids; uint16 holds the vocab (50257).
+token_column: tokens
+dtype: uint16
+append_eod: false
+eod_token_id: 50256
+vocab_size: 50257
+
+# Worker pools (see DataPrepConfig). download_workers are threads (I/O-bound); convert_workers are
+# spawn processes (CPU-bound) capped by the job count — a flat variant is a single job, so 1.
+download_workers: 8
+convert_workers: 1
