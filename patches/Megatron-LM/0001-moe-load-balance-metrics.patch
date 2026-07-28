@@ -1,16 +1,21 @@
-# Patch: MoE load-balance metrics battery
+# Patch: MoE routing metrics (load-balance battery + SwapGap)
 # ==================================
-# Problem: Megatron logs only the aux/z-loss; the load-balance metrics our arms are
-#   compared on is not computed anywhere.
+# Problem: Megatron logs only the aux/z-loss. We need (a) the load-balance battery our arms are
+#   compared on, and (b) SwapGap, telling us how far the router is from a Nash equilibrium under
+#   congestion pricing (0 <=> one-swap-stable = PNE; no equilibrium solve). Both are functionals 
+#   of the router's logits + routing_map, already available at the end of routing().
 #
 # What this patch does:
-#   - router.py: TopKRouter.routing() computes the battery (load CV, MaxVio, Hill 0/1/2 D,
-#     ||f-p||_1, dead experts) and records it via the existing MoE metrics tracker.
+#   - router.py: TopKRouter.routing() records, via the existing MoE metrics tracker,
+#       _record_load_balance_metrics(): load CV, MaxVio, Hill 0/1/2 D, ||f-p||_1, dead experts.
+#       _record_swapgap(): per-layer SwapGap for each congestion cost (linear/quadratic/zero on raw
+#         hard counts, lambda=1), computed by moe_congestion_routing.metrics.swapgap.
 #   - training.py: adds those names to track_names so report() logs/clears them each step.
+#   Both ride the --moe-per-layer-logging lever (layer-mean always; per-layer only when set).
 #
 # Where in the code:
 #   File: megatron/core/transformer/moe/router.py
-#   Function: TopKRouter.routing() / _record_load_balance_metrics()
+#   Function: TopKRouter.routing() / _record_load_balance_metrics() / _record_swapgap()
 #   Location: end of routing(), after expert-bias selection.
 #
 #   File: megatron/training/training.py
@@ -18,22 +23,25 @@
 #   Location: the MoE track_names block (~line 2549), beside the aux/z-loss names.
 #
 # How to fix if this patch breaks on a future Megatron version:
-#   Search for `_apply_expert_bias` in moe/router.py. Find the invocation and add the call
-#   to `_record_load_balance_metrics` after it, passing the router's logits and routing_map.
-#   Search for `args.moe_z_loss_coeff` in training.py. Add the new metrics to track_names below.
+#   Search for `_apply_expert_bias` in moe/router.py; add the two record calls + methods after it,
+#   passing the router's logits and routing_map. Search for `args.moe_z_loss_coeff` in training.py;
+#   add the new metric names to track_names below.
 #
 # Applied to: Megatron-LM core_v0.18.0
 #
 diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
-index 235a616df..3f8fba427 100644
+index 235a616df..7971d6687 100644
 --- a/megatron/core/transformer/moe/router.py
 +++ b/megatron/core/transformer/moe/router.py
-@@ -669,8 +669,48 @@ class TopKRouter(Router):
+@@ -669,8 +669,75 @@ class TopKRouter(Router):
          # Optionally apply expert bias
          self._apply_expert_bias(routing_map, padding_mask=padding_mask)
  
 +        # Load-balance metrics battery (moe-congestion-routing patch).
 +        self._record_load_balance_metrics(logits, routing_map)
++
++        # SwapGap equilibrium-gap battery (moe-congestion-routing patch).
++        self._record_swapgap(logits, routing_map)
 +
          return probs, routing_map
  
@@ -74,14 +82,38 @@ index 235a616df..3f8fba427 100644
 +        ):
 +            get_moe_metrics_tracker().record(name, value, self.layer_number, num_layers)
 +
++    def _record_swapgap(self, logits: torch.Tensor, routing_map: torch.Tensor):
++        """Record per-layer SwapGap (equilibrium gap) for each measurement price via the tracker.
++
++        SwapGap is a functional of the affinities (unbiased logits) + the realized assignment,
++        using congestion cost is on normalized load (n_e / L) with L = N*k/E (perfect balance)
++        and lambda=1: ``linear`` c(n)=n, ``quadratic`` c(n)=n^2, and ``zero`` (no congestion;
++        nonzero only for bias arms measuring the assignment's distance from affinity-greedy).
++        Recorded per layer, using --moe-per-layer-logging lever like the load-balance battery.
++        """
++        if not (self.training and torch.is_grad_enabled()):
++            return
++        if routing_map.shape[0] == 0:
++            return
++        # Local import: keep the vendored router free of an import-time dependency on our package.
++        from moe_congestion_routing.metrics.swapgap import SWAPGAP_COSTS, swapgap
++
++        num_layers = self.config.num_layers
++        with torch.no_grad():
++            for cost in SWAPGAP_COSTS:
++                value = swapgap(logits, routing_map, cost, lam=1.0)
++                get_moe_metrics_tracker().record(
++                    f"swapgap_{cost}", value, self.layer_number, num_layers
++                )
++
      def reset_global_aux_loss_tracker(self):
          """Reset the global aux loss tracker."""
          if self.global_tokens_per_expert is not None:
 diff --git a/megatron/training/training.py b/megatron/training/training.py
-index 3930cc46a..a80e34359 100644
+index 3930cc46a..562da352b 100644
 --- a/megatron/training/training.py
 +++ b/megatron/training/training.py
-@@ -2549,6 +2549,17 @@ def training_log(
+@@ -2549,6 +2549,24 @@ def training_log(
          if args.moe_z_loss_coeff is not None:
              track_names.append("z_loss")
  
@@ -94,6 +126,13 @@ index 3930cc46a..a80e34359 100644
 +            "n_eff_2",
 +            "frac_gate_l1",
 +            "dead_experts",
++        ]
++
++        # SwapGap equilibrium-gap battery (patch): one scalar per congestion cost.
++        track_names += [
++            "swapgap_linear",
++            "swapgap_quadratic",
++            "swapgap_zero",
 +        ]
 +
          if is_hybrid_model(args):
