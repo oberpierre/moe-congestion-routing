@@ -6,6 +6,8 @@ from pathlib import Path
 
 import yaml
 
+from ..paths import expand_path
+
 # Key a config file uses to name its base config(s). Consumed by the loader (never a
 # MoEPretrainConfig field), so it is stripped before the dataclass is constructed.
 _EXTENDS_KEY = "extends"
@@ -264,7 +266,9 @@ class MoEPretrainConfig:
         """Absolutise all paths against ``repo_root`` and derive the data cache dir if unset."""
 
         def absolutise(p: str) -> str:
-            path = Path(p)
+            # Expand ${VAR}/~ first (so committed configs can reference ${DATA_STORE}/${SCRATCH}
+            # instead of a personal path; fails loud on an unset var), then anchor to repo_root.
+            path = Path(expand_path(p))
             return str(path if path.is_absolute() else repo_root / path)
 
         output_dir = absolutise(self.output_dir)

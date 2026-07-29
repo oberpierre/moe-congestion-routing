@@ -1,11 +1,12 @@
 """Configuration for Nemotron-Climb data preparation (ClimbLab + ClimbMix variants)."""
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy
 import yaml
+
+from ..paths import expand_path
 
 # The Climb datasets ship pre-tokenized with the GPT-2 tokenizer (vocab 50257).
 # Fits into uint16 but we support int32 as well.
@@ -34,22 +35,6 @@ VARIANTS: dict[str, VariantSpec] = {
     "climblab": VariantSpec("nvidia/Nemotron-ClimbLab", "clustered"),
     "climbmix_small": VariantSpec("nvidia/Nemotron-ClimbMix", "flat", "climbmix_small/"),
 }
-
-
-def _expand_path(value: str) -> str:
-    """Expand ``$VAR``/``${VAR}`` and ``~`` in a path, failing loud if any var is unresolved.
-
-    Lets committed configs reference e.g. ``${DATA_STORE}`` (set in the git-ignored
-    ``config.sh``) so a personal cluster path never enters version control. An unset variable
-    is left literal by ``expandvars``, so a lingering ``$`` means "resolve this first".
-    """
-    expanded = os.path.expanduser(os.path.expandvars(value))
-    if "$" in expanded:
-        raise ValueError(
-            f"unresolved environment variable in path {value!r} (expanded to {expanded!r}); "
-            f"set it (e.g. in config.sh) before loading the config"
-        )
-    return expanded
 
 
 @dataclass(frozen=True)
@@ -189,5 +174,5 @@ class DataPrepConfig:
             raise ValueError(f"{path} must contain a valid yaml mapping, got {type(data).__name__}")
         for key in ("output_dir", "cache_dir"):
             if data.get(key) is not None:
-                data[key] = _expand_path(data[key])
+                data[key] = expand_path(data[key])
         return cls(**data)

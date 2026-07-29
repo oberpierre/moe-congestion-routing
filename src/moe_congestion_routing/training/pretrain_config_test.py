@@ -150,6 +150,17 @@ def test_exit_on_missing_checkpoint_flag():
     assert "--exit-on-missing-checkpoint" not in build_megatron_args(_cfg())
 
 
+def test_resolved_expands_env_vars_in_paths(tmp_path, monkeypatch):
+    # Committed configs reference ${DATA_STORE}; resolved() must expand it (else Megatron gets a
+    # literal "${DATA_STORE}" path). Unset var => fail loud, not a silent bad path.
+    monkeypatch.setenv("DATA_STORE", "/store")
+    r = MoEPretrainConfig(data_path="${DATA_STORE}/climbmix/climbmix").resolved(tmp_path)
+    assert r.data_path == "/store/climbmix/climbmix"
+    monkeypatch.delenv("DATA_STORE")
+    with pytest.raises(ValueError, match="unresolved environment variable"):
+        MoEPretrainConfig(data_path="${DATA_STORE}/x").resolved(tmp_path)
+
+
 def test_resolved_absolutises_logging_dirs(tmp_path):
     r = MoEPretrainConfig(tensorboard_dir="run/tb", wandb_save_dir="run/wandb").resolved(tmp_path)
     assert r.tensorboard_dir == str(tmp_path / "run/tb")
