@@ -132,6 +132,24 @@ def test_tensorboard_and_throughput_flags():
     assert "--log-throughput" in args
 
 
+def test_exit_interval_emitted_only_when_set():
+    # Sliced training: --exit-interval present when set, absent (run straight to train_iters) by
+    # default. train_iters is unaffected, so the LR-schedule horizon stays the full budget.
+    sliced = build_megatron_args(_cfg(exit_interval=5000, train_iters=20000))
+    assert _pairs(sliced)["--exit-interval"] == "5000"
+    assert _pairs(sliced)["--train-iters"] == "20000"
+    assert "--exit-interval" not in build_megatron_args(_cfg())
+
+
+def test_exit_on_missing_checkpoint_flag():
+    # Set by the launcher whenever a load dir is given: an explicit resume that finds no checkpoint
+    # should fail loud, not silently start from random. Bare flag, only when True.
+    assert "--exit-on-missing-checkpoint" in build_megatron_args(
+        _cfg(load="/run/checkpoints", exit_on_missing_checkpoint=True)
+    )
+    assert "--exit-on-missing-checkpoint" not in build_megatron_args(_cfg())
+
+
 def test_resolved_absolutises_logging_dirs(tmp_path):
     r = MoEPretrainConfig(tensorboard_dir="run/tb", wandb_save_dir="run/wandb").resolved(tmp_path)
     assert r.tensorboard_dir == str(tmp_path / "run/tb")

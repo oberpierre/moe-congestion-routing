@@ -38,6 +38,13 @@ def main() -> None:
         default=None,
         help="HOST:PORT of node 0 for the multi-node rendezvous (required when --nnodes > 1)",
     )
+    parser.add_argument(
+        "--load",
+        default=None,
+        help="checkpoints DIR to resume from, e.g. artifacts/<run>/checkpoints. The run "
+        "continues in that dir and fails loud if it holds no checkpoint. Omit => fresh timestamped "
+        "run dir. Overrides the config's load.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the command and exit")
     parser.add_argument(
         "--no-capture",
@@ -52,21 +59,36 @@ def main() -> None:
 
     cfg = MoEPretrainConfig.from_yaml(args.config).resolved(repo_root)
 
-    # Each invocation gets its own <output_dir>/<timestamp>/ for the log, the frozen command,
-    # and checkpoints, so repeated/concurrent runs don't interfere with each other. The dataset
-    # cache is deliberately shared at <output_dir>/cache (keyed by seed/seq_length) so the
-    # sample/shuffle indices are built once and reused across runs.
+    # The run dir holds the log, the frozen command, TensorBoard/W&B, and checkpoints.
     #
-    # Multi-node: the launcher runs once per node, so a per-node datetime.now() would give each
-    # node a different run dir -- and since c10d assigns ranks (global rank 0 isn't pinned to a
-    # node), checkpoints would land in an unpredictable node's dir. The sbatch exports one shared
-    # MOE_RUN_TAG so every node agrees on a single run dir; falls back to a timestamp locally.
-    run_tag = os.environ.get("MOE_RUN_TAG") or datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = Path(cfg.output_dir) / run_tag
+    # RESUME is EXPLICIT: pass --load <run>/checkpoints (or set `load` in the config). We then
+    # continue IN THAT run's own dir (run_dir = the load dir's parent), so a sliced/interrupted run
+    # picks up exactly where it left off, and we set --exit-on-missing-checkpoint so a wrong/empty
+    # path FAILS LOUD immediately instead of silently restarting from random.
+    #
+    # FRESH run (no --load): a new <output_dir>/<timestamp>/ dir, isolated from other runs. Multi-
+    # node needs every node to agree on that dir, so the sbatch exports one shared MOE_RUN_TAG
+    # (c10d assigns ranks, so rank 0 isn't pinned to a node); locally it falls back to a timestamp.
+    load = args.load or cfg.load
+    if load:
+        load_path = Path(load).resolve()
+        run_dir = load_path.parent
+        cfg = replace(cfg, load=str(load_path), exit_on_missing_checkpoint=True)
+    else:
+        run_tag = os.environ.get("MOE_RUN_TAG") or datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_dir = Path(cfg.output_dir) / run_tag
     # Checkpointing enabled (save_interval set) but no explicit save dir → checkpoint into this
     # run's own dir, keeping each run's weights separate and trivial to locate for inference.
     if cfg.save_interval and not cfg.save:
         cfg = replace(cfg, save=str(run_dir / "checkpoints"))
+    if cfg.exit_interval and not cfg.save:
+        # exit_interval only checkpoints when --save is set (Megatron); with no save dir the job
+        # exits with nothing to resume from -- slicing would silently lose all progress.
+        print(
+            "[run_moe_pretrain] WARNING: exit_interval is set but no checkpoint dir is configured "
+            "(set save_interval or save) -- the run will exit without saving and cannot resume.",
+            flush=True,
+        )
 
     # Logging sinks default into this run's own dir so every run's TensorBoard/W&B files sit
     # next to its log and checkpoints. W&B is only wired when a project is configured. Megatron
@@ -99,8 +121,11 @@ def main() -> None:
     if cfg.save:
         Path(cfg.save).mkdir(parents=True, exist_ok=True)
 
-    # Provenance (the launch.sh "frozen script" equivalent): dump the exact command.
-    (run_dir / "launch_command.txt").write_text(" ".join(cmd) + "\n")
+    # Provenance (the launch.sh "frozen script" equivalent): APPEND the exact command (node 0 only)
+    # so a resumed slice preserves earlier slices' commands instead of clobbering them.
+    if os.environ.get("SLURM_NODEID", "0") == "0":
+        with open(run_dir / "launch_command.txt", "a") as f:
+            f.write(f"# {datetime.now():%Y-%m-%d %H:%M:%S}\n{' '.join(cmd)}\n\n")
 
     # pretrain_gpt.py imports `megatron` in the subprocess, so Megatron must be on its PYTHONPATH
     env = os.environ.copy()
@@ -132,7 +157,7 @@ def main() -> None:
     # Tee stdout+stderr to the terminal and <output_dir>/train.log. Capturing turns the child's
     # stdout into a pipe, so tqdm bars won't be live (cosmetic) — use --no-capture if you want them.
     log_path = run_dir / "train.log"
-    with open(log_path, "w") as logf:
+    with open(log_path, "a") as logf:  # append: a resumed slice keeps earlier slices' log
         proc = subprocess.Popen(
             cmd,
             env=env,

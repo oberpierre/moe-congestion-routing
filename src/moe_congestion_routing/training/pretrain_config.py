@@ -134,7 +134,15 @@ class MoEPretrainConfig:
     """Samples per optimizer step (across gradient accumulation / data parallelism)."""
 
     train_iters: int = 30
-    """Total training iterations (optimizer steps)."""
+    """Total training iterations (optimizer steps) -- also fixes the LR-schedule horizon, so keep it
+    constant across resumed slices (see ``exit_interval``)."""
+
+    exit_interval: int | None = None
+    """Exit cleanly (after a checkpoint) whenever the GLOBAL iteration is a multiple of this. Lets a
+    run be trained in slices: keep ``train_iters`` at the full budget so the LR schedule is
+    unchanged, set e.g. ``5000`` to stop every quarter of a 20000-iter run. ``None`` runs straight
+    to ``train_iters``. To resume a slice, relaunch with ``run_moe_pretrain.py --load
+    <run>/checkpoints`` (needs ``save``/``save_interval`` so the slice actually checkpointed)."""
 
     seed: int = 1234
     """RNG seed; also part of the dataset index cache key."""
@@ -156,7 +164,13 @@ class MoEPretrainConfig:
     """Iterations between saves and this harness's on-switch, unsetting it means no checkpoints."""
 
     load: str | None = None
-    """Checkpoint DIRECTORY to resume/infer from; loads the newest ``iter_<N>/`` per the tracker."""
+    """Checkpoint DIRECTORY to resume/infer from; loads the newest ``iter_<N>/`` per the tracker.
+    Usually set via ``run_moe_pretrain.py --load`` (autocompletes; also drives the run dir)."""
+
+    exit_on_missing_checkpoint: bool = False
+    """Fail loud+fast if ``load`` holds no checkpoint, instead of silently starting from random. The
+    launcher sets this whenever a ``load`` is given as an explicit resume that finds nothing is a
+    mistake to surface, not paper over."""
 
     ckpt_step: int | None = None
     """Load this iteration from ``load`` instead of the newest (200 => ``iter_0000200/``)."""
@@ -407,6 +421,10 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         args += ["--load", cfg.load]
     if cfg.ckpt_step:
         args += ["--ckpt-step", str(cfg.ckpt_step)]
+    if cfg.exit_on_missing_checkpoint:
+        args += ["--exit-on-missing-checkpoint"]
+    if cfg.exit_interval:
+        args += ["--exit-interval", str(cfg.exit_interval)]
     return args
 
 
