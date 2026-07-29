@@ -1,0 +1,68 @@
+# PARAM COUNTS (non-gated FFN, biases off, tied embeddings; d=hidden=1024, L=layers=9, E=experts=64,
+# k=topk=8, f=ffn_hidden_size=1024, V=vocab=50257):
+#   always-active (dense) = embed V*d + L*(attn 4*d^2 + router d*E)
+#                         = 51.5M + 9*(4.19M + 0.07M)                     ~= 0.09B
+#   experts (sparse)      = L * E * (2*d*f) = 9 * 64 * 2*1024*1024        ~= 1.21B   (only k/E per token)
+#   TOTAL (passive)       = 0.09B + 1.21B                                 ~= 1.30B
+#   ACTIVE / token        = 0.09B + (k/E)*1.21B = 0.09B + (8/64)*1.21B    ~= 0.24B
+
+# NOTE: Do NOT change train_iters upon resuming a run as it fixed the LR schedule horizon.
+# Use exit_interval to slice a run into multiple jobs and resume from there.
+# Also ensure seed, seq_length, micro_batch_size, global_batch_size, and lr_warmup_iters are unchanged
+# when resuming from a checkpoint.
+
+# model
+num_layers: 9
+hidden_size: 1024
+num_attention_heads: 16
+# MoE - 64 experts / top-8 / dropless / NO shared experts
+ffn_hidden_size: 1024
+num_experts: 64
+moe_router_topk: 8
+moe_router_score_function: softmax
+moe_z_loss_coeff: 1.0e-3
+
+# metrics + throughput (patches 0001/0002 + native metrics)
+moe_per_layer_logging: true
+log_throughput: true
+
+# Set the project name and WANDB_API_KEY in the env (see config.sh.example) to enable W&B logging.
+# WANDB_MODE=offline skips the upload for quick runs.
+wandb_project: moe-congestion-routing
+
+# data
+# Trains on ClimbMix small (premixed 35.5B subset) via the single-blob `--split` method
+# (mutually exclusive with train_/valid_data_path). `split` carves a DETERMINISTIC, train-disjoint
+# held-out tail (train = 99%, valid = last 1% of documents).
+data_path: ${DATA_STORE}/datasets/nvidia/Nemotron-ClimbMix/climbmix_small/climbmix_small
+split: "99,1,0"
+tokenizer_type: NullTokenizer
+vocab_size: 50257
+
+# optimisation / schedule.
+lr: 3.0e-4
+min_lr: 3.0e-5
+lr_decay_style: cosine
+lr_warmup_iters: 200
+micro_batch_size: 4
+global_batch_size: 512
+seq_length: 2048
+train_iters: 20000  # ~21B tokens = 512 (global_batch_size) x 2048 (seq_length) x 20000 (train_iters)
+exit_interval: 5000  # ~5.2B tokens = 512 (global_batch_size) x 2048 (seq_length) x 5000 (exit_interval)
+seed: 1234
+
+# eval + checkpointing. save_interval sets the granularity of the DEFERRED probe-tier metrics
+eval_interval: 500
+eval_iters: 20
+save_interval: 1000
+
+# runtime - TE with auto attention (Hopper cuDNN fused attention works)
+transformer_impl: transformer_engine
+attention_backend: auto
+bf16: true
+tensor_model_parallel_size: 1
+pipeline_model_parallel_size: 1
+expert_model_parallel_size: 1
+log_interval: 10
+
+output_dir: artifacts/e1_cluster
