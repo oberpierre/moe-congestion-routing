@@ -147,6 +147,14 @@ def main() -> None:
     # would otherwise block-buffer (~8 KB) — making output laggy and truncating the log's tail
     # on a crash. Forcing per-write flushes keeps the teed log real-time and complete.
     env["PYTHONUNBUFFERED"] = "1"
+    # W&B: pin a stable run id = the run dir name (constant across slices, since a resume reuses the
+    # same run dir) with resume="allow", so sliced/resumed training CONTINUES ONE W&B run -- an
+    # unbroken curve -- instead of a fresh run per slice. Megatron's wandb.init() passes no
+    # id/resume, so these env vars drive it (a user-set value still wins via setdefault); "allow"
+    # creates the run on slice 1 and resumes it thereafter.
+    if cfg.wandb_project:
+        env.setdefault("WANDB_RUN_ID", run_dir.name)
+        env.setdefault("WANDB_RESUME", "allow")
 
     print(f"[run_moe_pretrain] launching:\n  {' '.join(cmd)}\n", flush=True)
 
