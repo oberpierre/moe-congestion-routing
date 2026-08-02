@@ -58,16 +58,77 @@ class MoEPretrainConfig:
     """Number of attention heads."""
 
     ffn_hidden_size: int = 512
-    """Inner dimension of each expert's MLP."""
+    """Inner dimension of a DENSE layer's MLP. Only live when ``moe_layer_freq`` leaves some layer
+    dense; otherwise its sole effect is seeding ``moe_ffn_hidden_size`` when that is unset. Set both
+    explicitly -- the two are unrelated widths as soon as a dense layer exists."""
 
     seq_length: int = 512
     """Training sequence length (also used for max position embeddings)."""
+
+    position_embedding_type: str = "learned_absolute"
+    """``learned_absolute`` (Megatron's default: an extra ``seq_length * hidden_size`` parameter
+    table) or ``rope`` (no parameters, what every modern reference uses). ARCHITECTURAL: a
+    checkpoint cannot be loaded under a different value, so ``infer_config`` mirrors it."""
+
+    normalization: str = "LayerNorm"
+    """``LayerNorm`` (Megatron's default; has a bias) or ``RMSNorm`` (scale only). ARCHITECTURAL."""
+
+    untie_embeddings_and_output_weights: bool = False
+    """Give the output head its own ``vocab x hidden`` matrix instead of reusing the input
+    embedding's. Megatron's default TIES them (one tensor serving both roles). Untying costs a
+    second ``V_pad * d`` tensor and zero FLOPs -- the head matmul is the same shape either way.
+    Small models tie (the saving outweighs the constraint), large ones untie (the two roles want
+    different geometry). ARCHITECTURAL: adds ``output_layer.weight`` to the state dict."""
+
+    norm_epsilon: float = 1.0e-5
+    """Epsilon inside LayerNorm/RMSNorm. Megatron's default is 1e-5 and the FLAME reference does not
+    override it, so parity means leaving this alone -- exposed for deliberate deviations only."""
+
+    swiglu: bool = False
+    """Gated SiLU MLP instead of the default non-gated GELU. ARCHITECTURAL: ``linear_fc1`` emits
+    ``2 * ffn_hidden_size``, so a gated FFN costs ``3 * d * f`` against a non-gated ``2 * d * f`` --
+    shrink the widths to ~2/3 to hold cost fixed. Also redirects Megatron's activation fusion
+    from ``bias_gelu_fusion`` to ``bias_swiglu_fusion``, which is a pure-torch jit path (no apex),
+    so it stays on and the ``bias_gelu_fusion`` field below becomes inert."""
 
     num_experts: int = 8
     """Number of routed experts."""
 
     moe_router_topk: int = 2
     """Experts activated per token."""
+
+    moe_ffn_hidden_size: int | None = None
+    """Inner dimension of each ROUTED expert's MLP. ``None`` silently inherits ``ffn_hidden_size``
+    (Megatron warns and assigns), which is ambiguous once a dense layer exists -- set it
+    explicitly on any real run."""
+
+    moe_shared_expert_intermediate_size: int | None = None
+    """TOTAL width of the always-on shared expert(s), i.e. ``num_shared * width_each``, run for
+    every token in addition to the top-k routed experts. ``None`` = no shared expert, our
+    deliberate deviation from both baselines. NOTE: shared experts bypass the router entirely, so
+    the patched load-balance/SwapGap metrics never see that capacity."""
+
+    moe_layer_freq: str | int | None = None
+    """Which layers are MoE. ``None`` leaves Megatron's default (every layer). An int ``N`` means
+    one MoE layer per ``N``; a string python list expression gives an explicit pattern, e.g.
+    ``"[0]*1+[1]*8"`` for one dense layer followed by 8 MoE layers. The pattern length must equal
+    ``num_layers``. Dense layers use ``ffn_hidden_size``, MoE layers ``moe_ffn_hidden_size``."""
+
+    moe_router_pre_softmax: bool = False
+    """Softmax over ALL experts before top-k (gates sum to <1 and vary with routing confidence)
+    instead of Megatron's default softmax over only the k selected logits (gates sum to 1). Affects
+    the combine weights ONLY: the aux loss recomputes its own full-softmax scores, and the patched
+    metrics read raw logits + routing_map, so neither changes."""
+
+    moe_router_dtype: str | None = None
+    """Upcast router logits / expert-output weighting to ``fp32`` (or ``fp64``). ``None`` keeps
+    them in bf16. Recommended at large expert counts, where bf16 logit drift can reorder top-k."""
+
+    moe_grouped_gemm: bool = False
+    """Batch the per-expert GEMMs into one grouped kernel instead of looping over experts
+    sequentially. Big throughput win at high expert counts; falls back to the sequential path when
+    Transformer Engine is too old to provide GroupedLinear. ARCHITECTURAL: changes the expert module
+    (``TEGroupedMLP`` vs ``SequentialMLP``) and so the checkpoint's parameter names."""
 
     moe_router_load_balancing_type: str = "aux_loss"
     """Load-balancing strategy; ``aux_loss`` is the vanilla Switch auxiliary loss."""
@@ -122,8 +183,31 @@ class MoEPretrainConfig:
     min_lr: float = 3.0e-5
     """Floor learning rate for the decay schedule."""
 
-    lr_decay_style: str = "constant"
-    """Learning-rate decay schedule."""
+    lr_decay_style: str = "WSDß"
+    """Learning-rate decay schedule: ``constant``/``linear``/``cosine``/``inverse-square-root``/
+    ``WSD``. ``WSD`` holds ``lr`` flat until ``lr_decay_iters - lr_wsd_decay_iters``, then anneals
+    to ``min_lr``, which makes ANY stable-phase checkpoint branch-annealable into a finished model
+    (see ``configs/train/anneal_short_cluster.yaml``)."""
+
+    lr_decay_iters: int | None = None
+    """Horizon the decay curve is sized for. ``None`` => ``train_iters``. Only set it apart from
+    ``train_iters`` for a branch anneal, where the run stops at the end of a shortened curve."""
+
+    lr_wsd_decay_iters: int | None = None
+    """Length of WSD's annealing phase, in iterations. REQUIRED by Megatron when
+    ``lr_decay_style: WSD`` (it asserts, so a missing value fails loud). ~10% of the horizon is the
+    usual choice. The anneal occupies the LAST ``lr_wsd_decay_iters`` of ``lr_decay_iters``."""
+
+    lr_wsd_decay_style: str = "exponential"
+    """Shape of WSD's annealing phase: ``exponential`` (Megatron's default), ``linear``,
+    ``cosine`` or ``minus_sqrt``."""
+
+    override_opt_param_scheduler: bool = False
+    """Rebuild the LR schedule from THIS config instead of the checkpoint's. Megatron otherwise
+    asserts that lr / min_lr / warmup / horizon / decay style all match the checkpoint, so an
+    ordinary resumed slice must leave them alone -- that assert is a feature. Set this ONLY for a
+    branch anneal, which deliberately swaps in a shorter horizon. The iteration counter is still
+    restored from the checkpoint, so the anneal starts where the trunk left off."""
 
     lr_warmup_iters: int = 5
     """Linear warmup iterations before the decay schedule applies."""
@@ -198,7 +282,8 @@ class MoEPretrainConfig:
     """Megatron's fused scaled masked softmax; off (kernel unbuilt; TE fuses attention)."""
 
     bias_gelu_fusion: bool = False
-    """Megatron's fused bias+GELU; off (TE fuses the MLP activation)."""
+    """Megatron's fused bias+GELU; off (TE fuses the MLP activation). Inert under ``swiglu``, which
+    routes the activation fusion through ``bias_swiglu_fusion`` instead."""
 
     add_bias_linear: bool = False
     """Linear-layer bias. Off (modern default + what the reference uses); also sidesteps a Megatron
@@ -215,6 +300,12 @@ class MoEPretrainConfig:
 
     expert_model_parallel_size: int = 1
     """Expert-parallel world size (MoE experts sharded across ranks)."""
+
+    use_distributed_optimizer: bool = False
+    """Shard optimizer state (fp32 master weights + Adam moments) across the data-parallel ranks
+    instead of replicating it on every rank. Pure memory win, no change to the math or to the
+    routing -- unlike expert parallelism, which we keep at 1 so every rank sees every expert (no
+    all-to-all, exact per-expert logging)."""
 
     log_interval: int = 1
     """Iterations between training-log lines."""
@@ -304,6 +395,14 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         str(cfg.seq_length),
         "--max-position-embeddings",
         str(cfg.seq_length),
+        # Architecture. Emitted unconditionally even at Megatron's own defaults: these define the
+        # network a checkpoint loads into, so the frozen launch_command.txt must record them.
+        "--position-embedding-type",
+        cfg.position_embedding_type,
+        "--normalization",
+        cfg.normalization,
+        "--norm-epsilon",
+        str(cfg.norm_epsilon),
         # MoE
         "--num-experts",
         str(cfg.num_experts),
@@ -359,6 +458,40 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         "--distributed-backend",
         "nccl",
     ]
+    if cfg.untie_embeddings_and_output_weights:
+        args += ["--untie-embeddings-and-output-weights"]
+    if cfg.swiglu:
+        args += ["--swiglu"]
+    if cfg.lr_decay_iters is not None:
+        args += ["--lr-decay-iters", str(cfg.lr_decay_iters)]
+    if cfg.lr_decay_style == "WSD" and cfg.lr_wsd_decay_iters is None:
+        raise ValueError("lr_decay_style: WSD requires lr_wsd_decay_iters (Megatron asserts on it)")
+    if cfg.lr_wsd_decay_iters is not None:
+        args += [
+            "--lr-wsd-decay-iters",
+            str(cfg.lr_wsd_decay_iters),
+            "--lr-wsd-decay-style",
+            cfg.lr_wsd_decay_style,
+        ]
+    if cfg.override_opt_param_scheduler:
+        args += ["--override-opt-param-scheduler"]
+    if cfg.moe_ffn_hidden_size is not None:
+        args += ["--moe-ffn-hidden-size", str(cfg.moe_ffn_hidden_size)]
+    if cfg.moe_shared_expert_intermediate_size is not None:
+        args += [
+            "--moe-shared-expert-intermediate-size",
+            str(cfg.moe_shared_expert_intermediate_size),
+        ]
+    if cfg.moe_layer_freq is not None:
+        args += ["--moe-layer-freq", str(cfg.moe_layer_freq)]
+    if cfg.moe_router_pre_softmax:
+        args += ["--moe-router-pre-softmax"]
+    if cfg.moe_router_dtype is not None:
+        args += ["--moe-router-dtype", cfg.moe_router_dtype]
+    if cfg.moe_grouped_gemm:
+        args += ["--moe-grouped-gemm"]
+    if cfg.use_distributed_optimizer:
+        args += ["--use-distributed-optimizer"]
     if cfg.moe_router_enable_expert_bias:
         args += [
             "--moe-router-enable-expert-bias",
