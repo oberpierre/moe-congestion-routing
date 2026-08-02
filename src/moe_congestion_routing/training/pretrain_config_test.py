@@ -427,16 +427,32 @@ def test_arm_configs_inherit_the_base_cluster_architecture():
     assert arm.moe_router_load_balancing_type == "global_aux_loss"  # the arm's own delta
 
 
-def test_local_configs_keep_megatron_defaults():
-    # The new fields must not have silently changed the local smoke configs: their existing
-    # checkpoints stay loadable and local runs stay a like-for-like of what they were.
-    cfg = MoEPretrainConfig.from_yaml(_CONFIGS / "base_local.yaml")
-    assert cfg.position_embedding_type == "learned_absolute"
-    assert cfg.normalization == "LayerNorm"
-    assert cfg.moe_ffn_hidden_size is None
-    assert not cfg.moe_router_pre_softmax
-    assert not cfg.moe_grouped_gemm
-    assert not cfg.use_distributed_optimizer
+def test_local_config_mirrors_the_cluster_architecture():
+    # The local smoke config earns its keep only if it exercises the CLUSTER run's code paths at a
+    # size that fits one dev GPU. Scale (hidden_size, experts, topk, batch, horizon) is free to
+    # differ; the architectural switches that select code paths are not -- if they drift, a green
+    # local run stops being evidence about the cluster run.
+    local = MoEPretrainConfig.from_yaml(_CONFIGS / "base_local.yaml")
+    cluster = MoEPretrainConfig.from_yaml(_CONFIGS / "base_cluster.yaml")
+    for field in (
+        "position_embedding_type",
+        "normalization",
+        "swiglu",
+        "untie_embeddings_and_output_weights",
+        "moe_layer_freq",
+        "moe_router_pre_softmax",
+        "moe_router_dtype",
+        "moe_grouped_gemm",
+        "moe_router_score_function",
+        "lr_decay_style",
+        "use_distributed_optimizer",
+        "transformer_impl",
+    ):
+        assert getattr(local, field) == getattr(cluster, field), field
+    # Its own (much shorter) horizon still has to be internally consistent.
+    assert local.lr_wsd_decay_iters is not None  # WSD without it trips Megatron's assert
+    assert local.train_iters % local.save_interval == 0  # else no final annealed checkpoint
+    assert local.moe_layer_freq is None or local.num_layers == 9  # pattern length == num_layers
 
 
 def test_build_megatron_args_disables_apex_megatron_fusions():

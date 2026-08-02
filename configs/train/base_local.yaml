@@ -1,15 +1,23 @@
 # model (local)
-num_layers: 8
+num_layers: 9
 hidden_size: 512
 num_attention_heads: 8
-ffn_hidden_size: 1024
-seq_length: 1024
+position_embedding_type: rope
+normalization: RMSNorm
+swiglu: true
+untie_embeddings_and_output_weights: true
+moe_layer_freq: "[0]*1+[1]*8"
+ffn_hidden_size: 5472
 
 # MoE - 8 experts, top-2, dropless (no capacity factor).
+moe_ffn_hidden_size: 704
 num_experts: 8
 moe_router_topk: 2
 moe_router_score_function: softmax
 moe_z_loss_coeff: 1.0e-3
+moe_router_pre_softmax: false
+moe_router_dtype: fp32
+moe_grouped_gemm: true
 
 # metrics: full load-balance battery per layer (patch 0001) + native throughput.
 moe_per_layer_logging: true
@@ -29,17 +37,19 @@ vocab_size: 50257
 # optimisation / schedule
 lr: 3.0e-4
 min_lr: 3.0e-5
-lr_decay_style: constant
-lr_warmup_iters: 10
+lr_decay_style: WSD
+lr_wsd_decay_iters: 50
+lr_warmup_iters: 5
 micro_batch_size: 4
 global_batch_size: 16
+seq_length: 1024
 train_iters: 500
 seed: 1234
 
 # eval + checkpointing
-eval_interval: 100
+eval_interval: 250
 eval_iters: 10
-save_interval: 250
+save_interval: 500
 
 # runtime - Transformer Engine; unfused attention dodges the Ampere cuDNN fused-attn bug locally.
 transformer_impl: transformer_engine
@@ -48,6 +58,7 @@ bf16: true
 tensor_model_parallel_size: 1
 pipeline_model_parallel_size: 1
 expert_model_parallel_size: 1
-log_interval: 1
+use_distributed_optimizer: true
+log_interval: 10
 
 output_dir: artifacts/e1_local
