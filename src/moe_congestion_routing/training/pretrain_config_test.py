@@ -7,6 +7,7 @@ from moe_congestion_routing.training.pretrain_config import (
     MoEPretrainConfig,
     build_launch_command,
     build_megatron_args,
+    resolve_run_dir,
 )
 
 _CONFIGS = Path(__file__).resolve().parents[3] / "configs" / "train"
@@ -518,6 +519,129 @@ def test_resolved_absolutises_checkpoint_paths(tmp_path):
     assert r.load == str(tmp_path / "ckpt/in")
     # unset stays None (launcher derives the per-run save dir when save_interval is on)
     assert MoEPretrainConfig().resolved(tmp_path).save is None
+
+
+def test_resolve_run_dir_fresh_run_uses_the_tag():
+    assert resolve_run_dir("/art/e1", run_tag="trunk") == Path("/art/e1/trunk")
+    with pytest.raises(ValueError, match="run_tag"):
+        resolve_run_dir("/art/e1")
+
+
+def test_resolve_run_dir_plain_resume_continues_in_place(tmp_path):
+    # A sliced run is the SAME model continuing, so it writes back into its own dir: one train.log,
+    # one checkpoints dir, and (via run_dir.name -> WANDB_RUN_ID) one unbroken W&B curve.
+    trunk = tmp_path / "trunk"
+    (trunk / "checkpoints").mkdir(parents=True)
+    assert resolve_run_dir(tmp_path, load=str(trunk / "checkpoints")) == trunk
+
+
+def test_resolve_run_dir_branch_gets_its_own_dir(tmp_path):
+    # A WSD branch reads the trunk's checkpoints but is a DIFFERENT lineage, so it must not land in
+    # the trunk's dir -- it would own the same W&B step numbers with different weights.
+    trunk = tmp_path / "trunk"
+    (trunk / "checkpoints").mkdir(parents=True)
+    branch = resolve_run_dir(
+        tmp_path,
+        run_dir="flame-budget",
+        load=str(trunk / "checkpoints"),
+        is_branch=True,
+    )
+    assert branch == tmp_path / "flame-budget"
+    assert branch.name != trunk.name  # distinct WANDB_RUN_ID
+
+
+def test_resolve_run_dir_rejects_a_branch_writing_into_its_parent(tmp_path):
+    # Forgetting --run-dir on a branch would move the trunk's latest_checkpointed_iteration.txt onto
+    # annealed (dead-end) weights, so the next trunk resume silently continues from cooled weights.
+    # Fail loud instead.
+    trunk = tmp_path / "trunk"
+    (trunk / "checkpoints").mkdir(parents=True)
+    with pytest.raises(ValueError, match="branched from"):
+        resolve_run_dir(tmp_path, load=str(trunk / "checkpoints"), is_branch=True)
+    # ...but pointing it somewhere else is fine, including via an absolute path.
+    out = resolve_run_dir(
+        tmp_path,
+        run_dir=str(tmp_path / "elsewhere"),
+        load=str(trunk / "checkpoints"),
+        is_branch=True,
+    )
+    assert out == tmp_path / "elsewhere"
+
+
+def test_resolve_run_dir_expands_env_vars(tmp_path, monkeypatch):
+    # Same contract as config-file paths: ${VAR}/~ expand, and an UNSET var fails loud. Without
+    # this a literal "${SCRATCH}" is a legal directory name, so the run would create it and write a
+    # whole training run to the wrong filesystem -- silently, since nothing errors.
+    monkeypatch.setenv("SCRATCH", str(tmp_path / "scratch"))
+    out = resolve_run_dir("/art/e1", run_dir="${SCRATCH}/myrun")
+    assert out == tmp_path / "scratch/myrun"
+    assert "$" not in str(out)
+
+    trunk = tmp_path / "scratch" / "trunk"
+    (trunk / "checkpoints").mkdir(parents=True)
+    assert resolve_run_dir("/art/e1", load="${SCRATCH}/trunk/checkpoints") == trunk
+
+    monkeypatch.delenv("SCRATCH")
+    with pytest.raises(ValueError, match="unresolved environment variable"):
+        resolve_run_dir("/art/e1", run_dir="${SCRATCH}/myrun")
+    with pytest.raises(ValueError, match="unresolved environment variable"):
+        resolve_run_dir("/art/e1", load="${SCRATCH}/trunk/checkpoints")
+
+
+def test_resolve_run_dir_expansion_is_idempotent(tmp_path, monkeypatch):
+    # The launcher expands --load before passing it, so resolve_run_dir sees an already-expanded
+    # path; expanding again must be a no-op rather than a second round of substitution.
+    monkeypatch.setenv("SCRATCH", str(tmp_path))
+    once = resolve_run_dir("/art/e1", run_dir="${SCRATCH}/myrun")
+    assert resolve_run_dir("/art/e1", run_dir=str(once)) == once
+
+
+def test_resolve_run_dir_names_a_fresh_run_without_a_load():
+    # --run-dir also replaces the timestamp on a fresh run, which is how the trunk gets a stable
+    # name for later --load paths to point at.
+    assert resolve_run_dir("/art/e1", run_dir="trunk", run_tag="20260101-000000") == Path(
+        "/art/e1/trunk"
+    )
+
+
+def test_extended_budget_arm_resumes_the_base_stable_phase():
+    base = MoEPretrainConfig.from_yaml(_CONFIGS / "base_cluster.yaml")
+    arm = MoEPretrainConfig.from_yaml(_CONFIGS / "extended_budget_cluster.yaml")
+
+    # The anneal is carved OUT of the arm's budget, not added on top of it.
+    assert arm.train_iters == arm.lr_decay_iters == 10000
+    assert arm.lr_decay_iters - arm.lr_wsd_decay_iters == 9000
+    assert arm.train_iters * arm.global_batch_size * arm.seq_length == 20_971_520_000  # ~21B
+    # The branch point must be a checkpoint base_cluster actually wrote...
+    assert arm.ckpt_step % base.save_interval == 0
+    # ...and must be its LAST STABLE one. base_cluster's final checkpoint is annealed: resuming it
+    # would mean re-raising the lr, re-heating the model and undoing the anneal. Leaves are leaves.
+    assert arm.ckpt_step == base.train_iters - base.lr_wsd_decay_iters
+    # The new horizon must actually extend the old one, and keep its anneal ahead of the branch.
+    assert arm.train_iters > base.train_iters
+    assert arm.lr_decay_iters - arm.lr_wsd_decay_iters > arm.ckpt_step
+    assert arm.train_iters % arm.save_interval == 0  # final annealed checkpoint gets written
+    # Shared prefix means the architecture must be identical; only the horizon differs.
+    for field in (
+        "hidden_size",
+        "num_layers",
+        "num_experts",
+        "moe_router_topk",
+        "swiglu",
+        "moe_ffn_hidden_size",
+        "lr",
+        "min_lr",
+        "lr_warmup_iters",
+        "seed",
+        "lr_decay_style",
+        "global_batch_size",
+        "seq_length",
+    ):
+        assert getattr(arm, field) == getattr(base, field), field
+    assert arm.override_opt_param_scheduler and not base.override_opt_param_scheduler
+    assert arm.exit_interval == base.exit_interval  # long enough to still need SLURM slicing
+    # Same output_dir as base => same default W&B group => the two overlay on one chart.
+    assert arm.output_dir == base.output_dir
 
 
 def test_build_launch_command_wraps_torch_distributed_run():

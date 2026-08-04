@@ -19,10 +19,12 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
+from moe_congestion_routing.paths import expand_path
 from moe_congestion_routing.training.megatron_path import megatron_root, torch_cuda_lib_dirs
 from moe_congestion_routing.training.pretrain_config import (
     MoEPretrainConfig,
     build_launch_command,
+    resolve_run_dir,
 )
 
 
@@ -45,6 +47,15 @@ def main() -> None:
         "continues in that dir and fails loud if it holds no checkpoint. Omit => fresh timestamped "
         "run dir. Overrides the config's load.",
     )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help="name (or path) for THIS run's artifact dir, relative to the config's output_dir. "
+        "Gives a fresh run a stable name instead of a timestamp, and is REQUIRED for a WSD branch: "
+        "with --load alone the run writes into the dir it loaded from, which is right for a "
+        "resumed slice (one log, one W&B curve) but wrong for a branch, which is a separate "
+        "lineage. e.g. --run-dir flame-budget --load artifacts/e1_cluster/trunk/checkpoints",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the command and exit")
     parser.add_argument(
         "--no-capture",
@@ -66,17 +77,27 @@ def main() -> None:
     # picks up exactly where it left off, and we set --exit-on-missing-checkpoint so a wrong/empty
     # path FAILS LOUD immediately instead of silently restarting from random.
     #
+    # BRANCH (WSD): --run-dir <name> alongside --load reads the trunk's checkpoints but writes
+    # everything else to its own dir, giving it a distinct W&B run id. See resolve_run_dir.
+    #
     # FRESH run (no --load): a new <output_dir>/<timestamp>/ dir, isolated from other runs. Multi-
     # node needs every node to agree on that dir, so the sbatch exports one shared MOE_RUN_TAG
     # (c10d assigns ranks, so rank 0 isn't pinned to a node); locally it falls back to a timestamp.
+    # Expand ${VAR}/~ once, here, so both consumers below see the same path. cfg.load already went
+    # through resolved(); an --load off the command line has not, and a literal "${SCRATCH}" is a
+    # legal directory name that would otherwise be taken at face value.
     load = args.load or cfg.load
     if load:
-        load_path = Path(load).resolve()
-        run_dir = load_path.parent
-        cfg = replace(cfg, load=str(load_path), exit_on_missing_checkpoint=True)
-    else:
-        run_tag = os.environ.get("MOE_RUN_TAG") or datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_dir = Path(cfg.output_dir) / run_tag
+        load = expand_path(load)
+    run_dir = resolve_run_dir(
+        cfg.output_dir,
+        run_dir=args.run_dir,
+        load=load,
+        run_tag=os.environ.get("MOE_RUN_TAG") or datetime.now().strftime("%Y%m%d-%H%M%S"),
+        is_branch=cfg.override_opt_param_scheduler,
+    )
+    if load:
+        cfg = replace(cfg, load=str(Path(load).resolve()), exit_on_missing_checkpoint=True)
     # Checkpointing enabled (save_interval set) but no explicit save dir → checkpoint into this
     # run's own dir, keeping each run's weights separate and trivial to locate for inference.
     if cfg.save_interval and not cfg.save:
@@ -150,11 +171,18 @@ def main() -> None:
     # W&B: pin a stable run id = the run dir name (constant across slices, since a resume reuses the
     # same run dir) with resume="allow", so sliced/resumed training CONTINUES ONE W&B run -- an
     # unbroken curve -- instead of a fresh run per slice. Megatron's wandb.init() passes no
-    # id/resume, so these env vars drive it (a user-set value still wins via setdefault); "allow"
-    # creates the run on slice 1 and resumes it thereafter.
+    # id/resume/group, so these env vars drive it (a user-set value still wins via setdefault);
+    # "allow" creates the run on slice 1 and resumes it thereafter.
+    #
+    # ONE RUN ID PER MODEL LINEAGE, not per job. A resumed slice is the same lineage => same id =>
+    # one continuous curve. A WSD branch is a DIFFERENT lineage that happens to share a prefix, so
+    # --run-dir gives it its own id; sharing the trunk's would write two different models to the
+    # same step numbers. The group ties them back together in the UI: Megatron logs against the
+    # global iteration, so overlaying a branch on its trunk lines the curves up at the branch point.
     if cfg.wandb_project:
         env.setdefault("WANDB_RUN_ID", run_dir.name)
         env.setdefault("WANDB_RESUME", "allow")
+        env.setdefault("WANDB_RUN_GROUP", cfg.wandb_group or Path(cfg.output_dir).name)
 
     print(f"[run_moe_pretrain] launching:\n  {' '.join(cmd)}\n", flush=True)
 

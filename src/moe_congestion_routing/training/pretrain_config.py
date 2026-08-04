@@ -328,6 +328,13 @@ class MoEPretrainConfig:
     wandb_entity: str | None = None
     """W&B entity (team/user). Optional; unset uses your default entity."""
 
+    wandb_group: str | None = None
+    """W&B group tying related runs together in the UI, e.g. a WSD trunk and the arms branched off
+    it, or the two sides of an A/B. ``None`` => the launcher derives it from ``output_dir``'s name,
+    so runs sharing an output_dir group automatically. Exported as ``WANDB_RUN_GROUP`` rather than
+    passed as a Megatron flag -- Megatron's ``wandb.init()`` sets only dir/name/project/config, so
+    the env var is what reaches W&B."""
+
     wandb_save_dir: str | None = None
     """Local dir for W&B run files. ``None`` => the launcher derives ``<run_dir>/wandb``."""
 
@@ -377,6 +384,61 @@ class MoEPretrainConfig:
             tensorboard_dir=absolutise(self.tensorboard_dir) if self.tensorboard_dir else None,
             wandb_save_dir=absolutise(self.wandb_save_dir) if self.wandb_save_dir else None,
         )
+
+
+def resolve_run_dir(
+    output_dir: str | Path,
+    *,
+    run_dir: str | None = None,
+    load: str | None = None,
+    run_tag: str | None = None,
+    is_branch: bool = False,
+) -> Path:
+    """Directory this run writes its OWN artifacts to (train.log, checkpoints, tensorboard, W&B).
+
+    Three cases:
+      * ``run_dir`` given: use it, relative names resolving under ``output_dir``. This is how a
+        WSD branch reads one run's checkpoints while writing its own, and how a fresh run takes a
+        stable name instead of a timestamp.
+      * ``load`` only: continue IN the loaded run's dir, so a sliced run appends to one log and
+        one W&B curve. This is the plain resume, and the default.
+      * neither: a fresh ``<output_dir>/<run_tag>``.
+
+    ``run_dir`` and ``load`` are expanded through ``expand_path`` (``${VAR}``/``~``) exactly as
+    config-file paths are, so an unset variable fails loud here instead of being taken literally.
+    That matters most for ``run_dir``: a literal ``${SCRATCH}`` is a legal directory name, so
+    without this the run would happily create it and write a whole training run to the wrong
+    filesystem. Idempotent, so callers that already expanded may pass either form.
+
+    ``is_branch`` (the config's ``override_opt_param_scheduler``) marks a run that deliberately
+    re-sizes the LR schedule. Such a run must NOT write into the run it branched from: its
+    checkpoints would move that run's ``latest_checkpointed_iteration.txt`` onto a model trained
+    under a different schedule -- and, since an annealed model is a dead end, the next resume of the
+    trunk would silently continue from cooled weights. Its metrics would also splice into the
+    parent's curve at step numbers the parent already owns.
+    """
+    output_dir = Path(output_dir)
+    run_dir = expand_path(run_dir) if run_dir is not None else None
+    load = expand_path(load) if load is not None else None
+    if run_dir is not None:
+        resolved = Path(run_dir)
+        if not resolved.is_absolute():
+            resolved = output_dir / resolved
+    elif load is not None:
+        resolved = Path(load).resolve().parent
+    elif run_tag is not None:
+        resolved = output_dir / run_tag
+    else:
+        raise ValueError("a fresh run needs a run_tag (or an explicit run_dir)")
+
+    if is_branch and load is not None and resolved.resolve() == Path(load).resolve().parent:
+        raise ValueError(
+            f"this run re-sizes the LR schedule (override_opt_param_scheduler) but would write "
+            f"into the run it branched from ({resolved}) -- its checkpoints would move that run's "
+            f"latest_checkpointed_iteration.txt onto differently-scheduled weights. Pass "
+            f"--run-dir <name> so the branch gets its own directory."
+        )
+    return resolved
 
 
 def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:

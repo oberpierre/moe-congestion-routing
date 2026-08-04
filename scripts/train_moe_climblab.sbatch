@@ -24,6 +24,13 @@ CONFIG="${1:-configs/train/switch_local.yaml}"
 # Given => the run continues in that dir and fails loud if it holds no checkpoint. Omitted => fresh
 # run in a new timestamped dir. Shell autocomplete works on the path.
 LOAD="${2:-}"
+# Optional 3rd arg: a name for THIS run's artifact dir under the config's output_dir. Gives a fresh
+# run a stable name (e.g. "trunk") instead of a timestamp, and is REQUIRED alongside LOAD for a WSD
+# branch, which reads the trunk's checkpoints but is its own run:
+#   sbatch train_moe_climblab.sbatch configs/train/base_cluster.yaml "" trunk
+#   sbatch train_moe_climblab.sbatch configs/train/flame_budget_cluster.yaml \
+#          artifacts/e1_cluster/trunk/checkpoints flame-budget
+RUN_DIR="${3:-}"
 
 # Multi-node only: point every node's torch-elastic at a c10d rendezvous on node 0 of the
 # allocation; ranks are assigned by the rendezvous. Single-node leaves DIST_ARGS empty, so the
@@ -95,7 +102,7 @@ srun -l --mpi=pmix --wait 60 \
   echo \"=== \$NPROC GPU(s) x \${SLURM_NNODES:-1} node(s) ${DIST_ARGS:+| $DIST_ARGS} ===\"
 
   numactl --membind=0-3 python scripts/run_moe_pretrain.py --config $CONFIG \
-    --nproc \$NPROC $DIST_ARGS ${LOAD:+--load $LOAD} \
+    --nproc \$NPROC $DIST_ARGS ${LOAD:+--load $LOAD} ${RUN_DIR:+--run-dir $RUN_DIR} \
     --no-capture
 
   echo \"=== done | \$(date) ===\"
