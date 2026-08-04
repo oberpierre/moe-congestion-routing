@@ -107,5 +107,3 @@ pipeline_model_parallel_size: 1
 expert_model_parallel_size: 1
 use_distributed_optimizer: true
 log_interval: 10
-
-output_dir: artifacts/e1_cluster

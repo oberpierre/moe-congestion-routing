@@ -2,3 +2,5 @@ extends: base_cluster.yaml
 
 moe_router_load_balancing_type: aux_loss
 moe_aux_loss_coeff: 0.01
+
+output_dir: artifacts/exp1/switch
