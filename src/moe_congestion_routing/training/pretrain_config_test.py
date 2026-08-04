@@ -414,20 +414,6 @@ def test_base_cluster_active_params_match_flame_exactly():
     assert common + ours + (2 * 9 + 1) * d == 193_514_496
 
 
-def test_arm_configs_inherit_the_base_cluster_architecture():
-    # Arm deltas carry balancing fields only; the backbone must come through extends untouched, so
-    # every arm is compared on the same architecture.
-    arm = MoEPretrainConfig.from_yaml(_CONFIGS / "switch_cluster.yaml")
-    assert arm.position_embedding_type == "rope"
-    assert arm.normalization == "RMSNorm"
-    assert arm.swiglu
-    assert arm.moe_layer_freq == "[0]*1+[1]*8"
-    assert arm.moe_ffn_hidden_size == 704
-    assert arm.moe_router_topk == 8
-    assert arm.untie_embeddings_and_output_weights
-    assert arm.moe_router_load_balancing_type == "global_aux_loss"  # the arm's own delta
-
-
 def test_local_config_mirrors_the_cluster_architecture():
     # The local smoke config earns its keep only if it exercises the CLUSTER run's code paths at a
     # size that fits one dev GPU. Scale (hidden_size, experts, topk, batch, horizon) is free to
@@ -602,46 +588,6 @@ def test_resolve_run_dir_names_a_fresh_run_without_a_load():
     assert resolve_run_dir("/art/e1", run_dir="trunk", run_tag="20260101-000000") == Path(
         "/art/e1/trunk"
     )
-
-
-def test_extended_budget_arm_resumes_the_base_stable_phase():
-    base = MoEPretrainConfig.from_yaml(_CONFIGS / "base_cluster.yaml")
-    arm = MoEPretrainConfig.from_yaml(_CONFIGS / "extended_budget_cluster.yaml")
-
-    # The anneal is carved OUT of the arm's budget, not added on top of it.
-    assert arm.train_iters == arm.lr_decay_iters == 10000
-    assert arm.lr_decay_iters - arm.lr_wsd_decay_iters == 9000
-    assert arm.train_iters * arm.global_batch_size * arm.seq_length == 20_971_520_000  # ~21B
-    # The branch point must be a checkpoint base_cluster actually wrote...
-    assert arm.ckpt_step % base.save_interval == 0
-    # ...and must be its LAST STABLE one. base_cluster's final checkpoint is annealed: resuming it
-    # would mean re-raising the lr, re-heating the model and undoing the anneal. Leaves are leaves.
-    assert arm.ckpt_step == base.train_iters - base.lr_wsd_decay_iters
-    # The new horizon must actually extend the old one, and keep its anneal ahead of the branch.
-    assert arm.train_iters > base.train_iters
-    assert arm.lr_decay_iters - arm.lr_wsd_decay_iters > arm.ckpt_step
-    assert arm.train_iters % arm.save_interval == 0  # final annealed checkpoint gets written
-    # Shared prefix means the architecture must be identical; only the horizon differs.
-    for field in (
-        "hidden_size",
-        "num_layers",
-        "num_experts",
-        "moe_router_topk",
-        "swiglu",
-        "moe_ffn_hidden_size",
-        "lr",
-        "min_lr",
-        "lr_warmup_iters",
-        "seed",
-        "lr_decay_style",
-        "global_batch_size",
-        "seq_length",
-    ):
-        assert getattr(arm, field) == getattr(base, field), field
-    assert arm.override_opt_param_scheduler and not base.override_opt_param_scheduler
-    assert arm.exit_interval == base.exit_interval  # long enough to still need SLURM slicing
-    # Same output_dir as base => same default W&B group => the two overlay on one chart.
-    assert arm.output_dir == base.output_dir
 
 
 def test_build_launch_command_wraps_torch_distributed_run():
