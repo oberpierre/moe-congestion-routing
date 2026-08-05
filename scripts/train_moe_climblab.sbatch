@@ -1,13 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=moe-train
 #SBATCH --partition=normal
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
 #SBATCH --time=12:00:00
 #SBATCH --no-requeue
+# Match the container's FI_CXI_RDZV_PROTO=alt_read: disable Slingshot rendezvous GET at the
+# ALLOCATION level (a step-level srun --network is read too late and leaves the CXI warning).
+#SBATCH --network=disable_rdzv_get
 #SBATCH --output=logs/moe_train_%j.log
 #SBATCH --error=logs/moe_train_%j.log
 
@@ -17,6 +20,17 @@ mkdir -p logs
 : "${WORKDIR:?set WORKDIR in config.sh and source it before sbatch}"
 
 CONFIG="${1:-configs/train/switch_local.yaml}"
+# Optional 2nd arg: a checkpoints DIR to RESUME from (e.g. artifacts/<run>/checkpoints).
+# Given => the run continues in that dir and fails loud if it holds no checkpoint. Omitted => fresh
+# run in a new timestamped dir. Shell autocomplete works on the path.
+LOAD="${2:-}"
+# Optional 3rd arg: a name for THIS run's artifact dir under the config's output_dir. Gives a fresh
+# run a stable name (e.g. "trunk") instead of a timestamp, and is REQUIRED alongside LOAD for a WSD
+# branch, which reads the trunk's checkpoints but is its own run:
+#   sbatch train_moe_climblab.sbatch configs/train/base_cluster.yaml "" trunk
+#   sbatch train_moe_climblab.sbatch configs/train/flame_budget_cluster.yaml \
+#          artifacts/e1_cluster/trunk/checkpoints flame-budget
+RUN_DIR="${3:-}"
 
 # Multi-node only: point every node's torch-elastic at a c10d rendezvous on node 0 of the
 # allocation; ranks are assigned by the rendezvous. Single-node leaves DIST_ARGS empty, so the
@@ -27,8 +41,11 @@ if [ "${SLURM_NNODES:-1}" -gt 1 ]; then
     DIST_ARGS="--nnodes $SLURM_NNODES --rdzv-endpoint $MASTER_ADDR:25678"
 fi
 
-# One shared run tag so all nodes write to the SAME <output_dir>/<tag> dir (see run_moe_pretrain).
-RUN_TAG="$(date +%Y%m%d-%H%M%S)"
+# A FRESH run gets its own timestamped <output_dir>/<tag> dir; the shared tag lets every node agree
+# on it (multi-node: c10d assigns ranks, so rank 0 isn't pinned to a node). On RESUME the launcher
+# derives the run dir from --load instead, so this tag only names fresh runs. Export MOE_RUN_TAG to
+# override the timestamp with a memorable name.
+RUN_TAG="${MOE_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 
 DATA_ENV_EXPORT=""
 [ -n "${DATA_STORE:-}" ] && DATA_ENV_EXPORT+="export DATA_STORE=$DATA_STORE; "
@@ -66,7 +83,7 @@ srun --nodes=1 --ntasks=1 --environment=alps6 bash -c "
 # Launch the training script on every node, one task per node. The launcher runs once per node and
 # run_moe_pretrain.py launches via `python -m torch.distributed.run`, so the workers inherit the
 # venv interpreter (sys.executable) and see the venv's own deps alongside the system torch/TE deps.
-srun -l --mpi=pmix --network=disable_rdzv_get --wait 60 \
+srun -l --mpi=pmix --wait 60 \
      --ntasks-per-node=1 --environment=alps6 --cpus-per-task "$SLURM_CPUS_PER_TASK" bash -c "
   set -euo pipefail
   echo \"=== node \$(hostname) | \$(date) ===\"
@@ -85,7 +102,7 @@ srun -l --mpi=pmix --network=disable_rdzv_get --wait 60 \
   echo \"=== \$NPROC GPU(s) x \${SLURM_NNODES:-1} node(s) ${DIST_ARGS:+| $DIST_ARGS} ===\"
 
   numactl --membind=0-3 python scripts/run_moe_pretrain.py --config $CONFIG \
-    --nproc \$NPROC $DIST_ARGS \
+    --nproc \$NPROC $DIST_ARGS ${LOAD:+--load $LOAD} ${RUN_DIR:+--run-dir $RUN_DIR} \
     --no-capture
 
   echo \"=== done | \$(date) ===\"

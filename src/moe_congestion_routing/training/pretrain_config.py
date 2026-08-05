@@ -6,6 +6,8 @@ from pathlib import Path
 
 import yaml
 
+from ..paths import expand_path
+
 # Key a config file uses to name its base config(s). Consumed by the loader (never a
 # MoEPretrainConfig field), so it is stripped before the dataclass is constructed.
 _EXTENDS_KEY = "extends"
@@ -56,16 +58,77 @@ class MoEPretrainConfig:
     """Number of attention heads."""
 
     ffn_hidden_size: int = 512
-    """Inner dimension of each expert's MLP."""
+    """Inner dimension of a DENSE layer's MLP. Only live when ``moe_layer_freq`` leaves some layer
+    dense; otherwise its sole effect is seeding ``moe_ffn_hidden_size`` when that is unset. Set both
+    explicitly -- the two are unrelated widths as soon as a dense layer exists."""
 
     seq_length: int = 512
     """Training sequence length (also used for max position embeddings)."""
+
+    position_embedding_type: str = "learned_absolute"
+    """``learned_absolute`` (Megatron's default: an extra ``seq_length * hidden_size`` parameter
+    table) or ``rope`` (no parameters, what every modern reference uses). ARCHITECTURAL: a
+    checkpoint cannot be loaded under a different value, so ``infer_config`` mirrors it."""
+
+    normalization: str = "LayerNorm"
+    """``LayerNorm`` (Megatron's default; has a bias) or ``RMSNorm`` (scale only). ARCHITECTURAL."""
+
+    untie_embeddings_and_output_weights: bool = False
+    """Give the output head its own ``vocab x hidden`` matrix instead of reusing the input
+    embedding's. Megatron's default TIES them (one tensor serving both roles). Untying costs a
+    second ``V_pad * d`` tensor and zero FLOPs -- the head matmul is the same shape either way.
+    Small models tie (the saving outweighs the constraint), large ones untie (the two roles want
+    different geometry). ARCHITECTURAL: adds ``output_layer.weight`` to the state dict."""
+
+    norm_epsilon: float = 1.0e-5
+    """Epsilon inside LayerNorm/RMSNorm. Megatron's default is 1e-5 and the FLAME reference does not
+    override it, so parity means leaving this alone -- exposed for deliberate deviations only."""
+
+    swiglu: bool = False
+    """Gated SiLU MLP instead of the default non-gated GELU. ARCHITECTURAL: ``linear_fc1`` emits
+    ``2 * ffn_hidden_size``, so a gated FFN costs ``3 * d * f`` against a non-gated ``2 * d * f`` --
+    shrink the widths to ~2/3 to hold cost fixed. Also redirects Megatron's activation fusion
+    from ``bias_gelu_fusion`` to ``bias_swiglu_fusion``, which is a pure-torch jit path (no apex),
+    so it stays on and the ``bias_gelu_fusion`` field below becomes inert."""
 
     num_experts: int = 8
     """Number of routed experts."""
 
     moe_router_topk: int = 2
     """Experts activated per token."""
+
+    moe_ffn_hidden_size: int | None = None
+    """Inner dimension of each ROUTED expert's MLP. ``None`` silently inherits ``ffn_hidden_size``
+    (Megatron warns and assigns), which is ambiguous once a dense layer exists -- set it
+    explicitly on any real run."""
+
+    moe_shared_expert_intermediate_size: int | None = None
+    """TOTAL width of the always-on shared expert(s), i.e. ``num_shared * width_each``, run for
+    every token in addition to the top-k routed experts. ``None`` = no shared expert, our
+    deliberate deviation from both baselines. NOTE: shared experts bypass the router entirely, so
+    the patched load-balance/SwapGap metrics never see that capacity."""
+
+    moe_layer_freq: str | int | None = None
+    """Which layers are MoE. ``None`` leaves Megatron's default (every layer). An int ``N`` means
+    one MoE layer per ``N``; a string python list expression gives an explicit pattern, e.g.
+    ``"[0]*1+[1]*8"`` for one dense layer followed by 8 MoE layers. The pattern length must equal
+    ``num_layers``. Dense layers use ``ffn_hidden_size``, MoE layers ``moe_ffn_hidden_size``."""
+
+    moe_router_pre_softmax: bool = False
+    """Softmax over ALL experts before top-k (gates sum to <1 and vary with routing confidence)
+    instead of Megatron's default softmax over only the k selected logits (gates sum to 1). Affects
+    the combine weights ONLY: the aux loss recomputes its own full-softmax scores, and the patched
+    metrics read raw logits + routing_map, so neither changes."""
+
+    moe_router_dtype: str | None = None
+    """Upcast router logits / expert-output weighting to ``fp32`` (or ``fp64``). ``None`` keeps
+    them in bf16. Recommended at large expert counts, where bf16 logit drift can reorder top-k."""
+
+    moe_grouped_gemm: bool = False
+    """Batch the per-expert GEMMs into one grouped kernel instead of looping over experts
+    sequentially. Big throughput win at high expert counts; falls back to the sequential path when
+    Transformer Engine is too old to provide GroupedLinear. ARCHITECTURAL: changes the expert module
+    (``TEGroupedMLP`` vs ``SequentialMLP``) and so the checkpoint's parameter names."""
 
     moe_router_load_balancing_type: str = "aux_loss"
     """Load-balancing strategy; ``aux_loss`` is the vanilla Switch auxiliary loss."""
@@ -120,8 +183,31 @@ class MoEPretrainConfig:
     min_lr: float = 3.0e-5
     """Floor learning rate for the decay schedule."""
 
-    lr_decay_style: str = "constant"
-    """Learning-rate decay schedule."""
+    lr_decay_style: str = "WSDß"
+    """Learning-rate decay schedule: ``constant``/``linear``/``cosine``/``inverse-square-root``/
+    ``WSD``. ``WSD`` holds ``lr`` flat until ``lr_decay_iters - lr_wsd_decay_iters``, then anneals
+    to ``min_lr``, which makes ANY stable-phase checkpoint branch-annealable into a finished model
+    (see ``configs/train/anneal_short_cluster.yaml``)."""
+
+    lr_decay_iters: int | None = None
+    """Horizon the decay curve is sized for. ``None`` => ``train_iters``. Only set it apart from
+    ``train_iters`` for a branch anneal, where the run stops at the end of a shortened curve."""
+
+    lr_wsd_decay_iters: int | None = None
+    """Length of WSD's annealing phase, in iterations. REQUIRED by Megatron when
+    ``lr_decay_style: WSD`` (it asserts, so a missing value fails loud). ~10% of the horizon is the
+    usual choice. The anneal occupies the LAST ``lr_wsd_decay_iters`` of ``lr_decay_iters``."""
+
+    lr_wsd_decay_style: str = "exponential"
+    """Shape of WSD's annealing phase: ``exponential`` (Megatron's default), ``linear``,
+    ``cosine`` or ``minus_sqrt``."""
+
+    override_opt_param_scheduler: bool = False
+    """Rebuild the LR schedule from THIS config instead of the checkpoint's. Megatron otherwise
+    asserts that lr / min_lr / warmup / horizon / decay style all match the checkpoint, so an
+    ordinary resumed slice must leave them alone -- that assert is a feature. Set this ONLY for a
+    branch anneal, which deliberately swaps in a shorter horizon. The iteration counter is still
+    restored from the checkpoint, so the anneal starts where the trunk left off."""
 
     lr_warmup_iters: int = 5
     """Linear warmup iterations before the decay schedule applies."""
@@ -134,7 +220,15 @@ class MoEPretrainConfig:
     """Samples per optimizer step (across gradient accumulation / data parallelism)."""
 
     train_iters: int = 30
-    """Total training iterations (optimizer steps)."""
+    """Total training iterations (optimizer steps) -- also fixes the LR-schedule horizon, so keep it
+    constant across resumed slices (see ``exit_interval``)."""
+
+    exit_interval: int | None = None
+    """Exit cleanly (after a checkpoint) whenever the GLOBAL iteration is a multiple of this. Lets a
+    run be trained in slices: keep ``train_iters`` at the full budget so the LR schedule is
+    unchanged, set e.g. ``5000`` to stop every quarter of a 20000-iter run. ``None`` runs straight
+    to ``train_iters``. To resume a slice, relaunch with ``run_moe_pretrain.py --load
+    <run>/checkpoints`` (needs ``save``/``save_interval`` so the slice actually checkpointed)."""
 
     seed: int = 1234
     """RNG seed; also part of the dataset index cache key."""
@@ -156,7 +250,13 @@ class MoEPretrainConfig:
     """Iterations between saves and this harness's on-switch, unsetting it means no checkpoints."""
 
     load: str | None = None
-    """Checkpoint DIRECTORY to resume/infer from; loads the newest ``iter_<N>/`` per the tracker."""
+    """Checkpoint DIRECTORY to resume/infer from; loads the newest ``iter_<N>/`` per the tracker.
+    Usually set via ``run_moe_pretrain.py --load`` (autocompletes; also drives the run dir)."""
+
+    exit_on_missing_checkpoint: bool = False
+    """Fail loud+fast if ``load`` holds no checkpoint, instead of silently starting from random. The
+    launcher sets this whenever a ``load`` is given as an explicit resume that finds nothing is a
+    mistake to surface, not paper over."""
 
     ckpt_step: int | None = None
     """Load this iteration from ``load`` instead of the newest (200 => ``iter_0000200/``)."""
@@ -182,7 +282,8 @@ class MoEPretrainConfig:
     """Megatron's fused scaled masked softmax; off (kernel unbuilt; TE fuses attention)."""
 
     bias_gelu_fusion: bool = False
-    """Megatron's fused bias+GELU; off (TE fuses the MLP activation)."""
+    """Megatron's fused bias+GELU; off (TE fuses the MLP activation). Inert under ``swiglu``, which
+    routes the activation fusion through ``bias_swiglu_fusion`` instead."""
 
     add_bias_linear: bool = False
     """Linear-layer bias. Off (modern default + what the reference uses); also sidesteps a Megatron
@@ -199,6 +300,12 @@ class MoEPretrainConfig:
 
     expert_model_parallel_size: int = 1
     """Expert-parallel world size (MoE experts sharded across ranks)."""
+
+    use_distributed_optimizer: bool = False
+    """Shard optimizer state (fp32 master weights + Adam moments) across the data-parallel ranks
+    instead of replicating it on every rank. Pure memory win, no change to the math or to the
+    routing -- unlike expert parallelism, which we keep at 1 so every rank sees every expert (no
+    all-to-all, exact per-expert logging)."""
 
     log_interval: int = 1
     """Iterations between training-log lines."""
@@ -220,6 +327,13 @@ class MoEPretrainConfig:
 
     wandb_entity: str | None = None
     """W&B entity (team/user). Optional; unset uses your default entity."""
+
+    wandb_group: str | None = None
+    """W&B group tying related runs together in the UI, e.g. a WSD trunk and the arms branched off
+    it, or the two sides of an A/B. ``None`` => the launcher derives it from ``output_dir``'s name,
+    so runs sharing an output_dir group automatically. Exported as ``WANDB_RUN_GROUP`` rather than
+    passed as a Megatron flag -- Megatron's ``wandb.init()`` sets only dir/name/project/config, so
+    the env var is what reaches W&B."""
 
     wandb_save_dir: str | None = None
     """Local dir for W&B run files. ``None`` => the launcher derives ``<run_dir>/wandb``."""
@@ -250,7 +364,9 @@ class MoEPretrainConfig:
         """Absolutise all paths against ``repo_root`` and derive the data cache dir if unset."""
 
         def absolutise(p: str) -> str:
-            path = Path(p)
+            # Expand ${VAR}/~ first (so committed configs can reference ${DATA_STORE}/${SCRATCH}
+            # instead of a personal path; fails loud on an unset var), then anchor to repo_root.
+            path = Path(expand_path(p))
             return str(path if path.is_absolute() else repo_root / path)
 
         output_dir = absolutise(self.output_dir)
@@ -270,6 +386,61 @@ class MoEPretrainConfig:
         )
 
 
+def resolve_run_dir(
+    output_dir: str | Path,
+    *,
+    run_dir: str | None = None,
+    load: str | None = None,
+    run_tag: str | None = None,
+    is_branch: bool = False,
+) -> Path:
+    """Directory this run writes its OWN artifacts to (train.log, checkpoints, tensorboard, W&B).
+
+    Three cases:
+      * ``run_dir`` given: use it, relative names resolving under ``output_dir``. This is how a
+        WSD branch reads one run's checkpoints while writing its own, and how a fresh run takes a
+        stable name instead of a timestamp.
+      * ``load`` only: continue IN the loaded run's dir, so a sliced run appends to one log and
+        one W&B curve. This is the plain resume, and the default.
+      * neither: a fresh ``<output_dir>/<run_tag>``.
+
+    ``run_dir`` and ``load`` are expanded through ``expand_path`` (``${VAR}``/``~``) exactly as
+    config-file paths are, so an unset variable fails loud here instead of being taken literally.
+    That matters most for ``run_dir``: a literal ``${SCRATCH}`` is a legal directory name, so
+    without this the run would happily create it and write a whole training run to the wrong
+    filesystem. Idempotent, so callers that already expanded may pass either form.
+
+    ``is_branch`` (the config's ``override_opt_param_scheduler``) marks a run that deliberately
+    re-sizes the LR schedule. Such a run must NOT write into the run it branched from: its
+    checkpoints would move that run's ``latest_checkpointed_iteration.txt`` onto a model trained
+    under a different schedule -- and, since an annealed model is a dead end, the next resume of the
+    trunk would silently continue from cooled weights. Its metrics would also splice into the
+    parent's curve at step numbers the parent already owns.
+    """
+    output_dir = Path(output_dir)
+    run_dir = expand_path(run_dir) if run_dir is not None else None
+    load = expand_path(load) if load is not None else None
+    if run_dir is not None:
+        resolved = Path(run_dir)
+        if not resolved.is_absolute():
+            resolved = output_dir / resolved
+    elif load is not None:
+        resolved = Path(load).resolve().parent
+    elif run_tag is not None:
+        resolved = output_dir / run_tag
+    else:
+        raise ValueError("a fresh run needs a run_tag (or an explicit run_dir)")
+
+    if is_branch and load is not None and resolved.resolve() == Path(load).resolve().parent:
+        raise ValueError(
+            f"this run re-sizes the LR schedule (override_opt_param_scheduler) but would write "
+            f"into the run it branched from ({resolved}) -- its checkpoints would move that run's "
+            f"latest_checkpointed_iteration.txt onto differently-scheduled weights. Pass "
+            f"--run-dir <name> so the branch gets its own directory."
+        )
+    return resolved
+
+
 def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
     """Map the config to a flat Megatron ``pretrain_gpt.py`` CLI arg list (pure)."""
     args = [
@@ -286,6 +457,14 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         str(cfg.seq_length),
         "--max-position-embeddings",
         str(cfg.seq_length),
+        # Architecture. Emitted unconditionally even at Megatron's own defaults: these define the
+        # network a checkpoint loads into, so the frozen launch_command.txt must record them.
+        "--position-embedding-type",
+        cfg.position_embedding_type,
+        "--normalization",
+        cfg.normalization,
+        "--norm-epsilon",
+        str(cfg.norm_epsilon),
         # MoE
         "--num-experts",
         str(cfg.num_experts),
@@ -341,6 +520,40 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         "--distributed-backend",
         "nccl",
     ]
+    if cfg.untie_embeddings_and_output_weights:
+        args += ["--untie-embeddings-and-output-weights"]
+    if cfg.swiglu:
+        args += ["--swiglu"]
+    if cfg.lr_decay_iters is not None:
+        args += ["--lr-decay-iters", str(cfg.lr_decay_iters)]
+    if cfg.lr_decay_style == "WSD" and cfg.lr_wsd_decay_iters is None:
+        raise ValueError("lr_decay_style: WSD requires lr_wsd_decay_iters (Megatron asserts on it)")
+    if cfg.lr_wsd_decay_iters is not None:
+        args += [
+            "--lr-wsd-decay-iters",
+            str(cfg.lr_wsd_decay_iters),
+            "--lr-wsd-decay-style",
+            cfg.lr_wsd_decay_style,
+        ]
+    if cfg.override_opt_param_scheduler:
+        args += ["--override-opt-param-scheduler"]
+    if cfg.moe_ffn_hidden_size is not None:
+        args += ["--moe-ffn-hidden-size", str(cfg.moe_ffn_hidden_size)]
+    if cfg.moe_shared_expert_intermediate_size is not None:
+        args += [
+            "--moe-shared-expert-intermediate-size",
+            str(cfg.moe_shared_expert_intermediate_size),
+        ]
+    if cfg.moe_layer_freq is not None:
+        args += ["--moe-layer-freq", str(cfg.moe_layer_freq)]
+    if cfg.moe_router_pre_softmax:
+        args += ["--moe-router-pre-softmax"]
+    if cfg.moe_router_dtype is not None:
+        args += ["--moe-router-dtype", cfg.moe_router_dtype]
+    if cfg.moe_grouped_gemm:
+        args += ["--moe-grouped-gemm"]
+    if cfg.use_distributed_optimizer:
+        args += ["--use-distributed-optimizer"]
     if cfg.moe_router_enable_expert_bias:
         args += [
             "--moe-router-enable-expert-bias",
@@ -407,6 +620,10 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         args += ["--load", cfg.load]
     if cfg.ckpt_step:
         args += ["--ckpt-step", str(cfg.ckpt_step)]
+    if cfg.exit_on_missing_checkpoint:
+        args += ["--exit-on-missing-checkpoint"]
+    if cfg.exit_interval:
+        args += ["--exit-interval", str(cfg.exit_interval)]
     return args
 
 

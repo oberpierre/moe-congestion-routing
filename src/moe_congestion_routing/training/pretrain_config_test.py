@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -6,7 +7,10 @@ from moe_congestion_routing.training.pretrain_config import (
     MoEPretrainConfig,
     build_launch_command,
     build_megatron_args,
+    resolve_run_dir,
 )
+
+_CONFIGS = Path(__file__).resolve().parents[3] / "configs" / "train"
 
 
 def _pairs(args: list[str]) -> dict[str, str]:
@@ -132,6 +136,35 @@ def test_tensorboard_and_throughput_flags():
     assert "--log-throughput" in args
 
 
+def test_exit_interval_emitted_only_when_set():
+    # Sliced training: --exit-interval present when set, absent (run straight to train_iters) by
+    # default. train_iters is unaffected, so the LR-schedule horizon stays the full budget.
+    sliced = build_megatron_args(_cfg(exit_interval=5000, train_iters=20000))
+    assert _pairs(sliced)["--exit-interval"] == "5000"
+    assert _pairs(sliced)["--train-iters"] == "20000"
+    assert "--exit-interval" not in build_megatron_args(_cfg())
+
+
+def test_exit_on_missing_checkpoint_flag():
+    # Set by the launcher whenever a load dir is given: an explicit resume that finds no checkpoint
+    # should fail loud, not silently start from random. Bare flag, only when True.
+    assert "--exit-on-missing-checkpoint" in build_megatron_args(
+        _cfg(load="/run/checkpoints", exit_on_missing_checkpoint=True)
+    )
+    assert "--exit-on-missing-checkpoint" not in build_megatron_args(_cfg())
+
+
+def test_resolved_expands_env_vars_in_paths(tmp_path, monkeypatch):
+    # Committed configs reference ${DATA_STORE}; resolved() must expand it (else Megatron gets a
+    # literal "${DATA_STORE}" path). Unset var => fail loud, not a silent bad path.
+    monkeypatch.setenv("DATA_STORE", "/store")
+    r = MoEPretrainConfig(data_path="${DATA_STORE}/climbmix/climbmix").resolved(tmp_path)
+    assert r.data_path == "/store/climbmix/climbmix"
+    monkeypatch.delenv("DATA_STORE")
+    with pytest.raises(ValueError, match="unresolved environment variable"):
+        MoEPretrainConfig(data_path="${DATA_STORE}/x").resolved(tmp_path)
+
+
 def test_resolved_absolutises_logging_dirs(tmp_path):
     r = MoEPretrainConfig(tensorboard_dir="run/tb", wandb_save_dir="run/wandb").resolved(tmp_path)
     assert r.tensorboard_dir == str(tmp_path / "run/tb")
@@ -206,6 +239,209 @@ def test_build_megatron_args_carries_moe_and_tokenizer():
     assert pairs["--attention-backend"] == "auto"
 
 
+def test_architecture_flags_always_emitted_at_megatron_defaults():
+    # These define the network a checkpoint loads into, so they belong in the frozen launch command
+    # even when they match Megatron's own defaults -- an omitted flag is an undocumented default.
+    pairs = _pairs(build_megatron_args(_cfg()))
+    assert pairs["--position-embedding-type"] == "learned_absolute"
+    assert pairs["--normalization"] == "LayerNorm"
+    assert pairs["--norm-epsilon"] == "1e-05"
+
+
+def test_architecture_flags_carry_the_reference_architecture():
+    # base_cluster.yaml's parity setting: RoPE (no learned position table) + RMSNorm (no bias).
+    # norm_epsilon stays at Megatron's 1e-5 -- FLAME does not override it, so neither do we.
+    cfg = _cfg(position_embedding_type="rope", normalization="RMSNorm")
+    pairs = _pairs(build_megatron_args(cfg))
+    assert pairs["--position-embedding-type"] == "rope"
+    assert pairs["--normalization"] == "RMSNorm"
+    assert pairs["--norm-epsilon"] == "1e-05"
+    assert _pairs(build_megatron_args(_cfg(norm_epsilon=1e-6)))["--norm-epsilon"] == "1e-06"
+
+
+def test_moe_ffn_hidden_size_emitted_only_when_set():
+    # Unset, Megatron silently inherits ffn_hidden_size (with a warning) -- ambiguous for repro once
+    # a dense layer exists, so real runs set it explicitly.
+    assert "--moe-ffn-hidden-size" not in build_megatron_args(_cfg())
+    on = build_megatron_args(_cfg(moe_ffn_hidden_size=1024))
+    assert _pairs(on)["--moe-ffn-hidden-size"] == "1024"
+
+
+def test_shared_experts_and_dense_layer_off_by_default():
+    # Nothing architectural may leak into the args unless a config asks for it.
+    off = build_megatron_args(_cfg())
+    assert "--moe-shared-expert-intermediate-size" not in off
+    assert "--moe-layer-freq" not in off
+    assert "--swiglu" not in off
+
+
+def test_shared_experts_dense_layer_and_swiglu_route_through_when_set():
+    # The documented full-FLAME 64/6/2 arm: 2 shared experts expressed as one 2x-wide expert.
+    cfg = _cfg(
+        moe_router_topk=6,
+        moe_shared_expert_intermediate_size=1408,
+        moe_layer_freq="[0]*1+[1]*8",
+        swiglu=True,
+    )
+    args = build_megatron_args(cfg)
+    pairs = _pairs(args)
+    assert pairs["--moe-router-topk"] == "6"
+    assert pairs["--moe-shared-expert-intermediate-size"] == "1408"
+    assert pairs["--moe-layer-freq"] == "[0]*1+[1]*8"
+    assert "--swiglu" in args
+
+
+def test_untie_embeddings_opt_in():
+    # Tied is Megatron's default and stays the default here; untying adds a second V_pad x d tensor.
+    assert "--untie-embeddings-and-output-weights" not in build_megatron_args(_cfg())
+    on = build_megatron_args(_cfg(untie_embeddings_and_output_weights=True))
+    assert "--untie-embeddings-and-output-weights" in on
+
+
+def test_wsd_schedule_flags_emitted_together():
+    cfg = _cfg(lr_decay_style="WSD", lr_wsd_decay_iters=2000, train_iters=20000)
+    pairs = _pairs(build_megatron_args(cfg))
+    assert pairs["--lr-decay-style"] == "WSD"
+    assert pairs["--lr-wsd-decay-iters"] == "2000"
+    assert pairs["--lr-wsd-decay-style"] == "exponential"  # Megatron's default shape
+    # lr_decay_iters unset => Megatron defaults it to train_iters, so we must not emit it.
+    assert "--lr-decay-iters" not in build_megatron_args(cfg)
+
+
+def test_wsd_without_decay_iters_fails_loud():
+    # Megatron asserts deep inside the scheduler build; catch it here instead, at config time.
+    with pytest.raises(ValueError, match="lr_wsd_decay_iters"):
+        build_megatron_args(_cfg(lr_decay_style="WSD", lr_wsd_decay_iters=None))
+
+
+def test_branch_anneal_flags():
+    # A branch anneal is the one case that legitimately re-sizes the schedule on resume: shorter
+    # horizon than the trunk, and the override that lets Megatron accept it.
+    cfg = _cfg(
+        load="/trunk/checkpoints",
+        train_iters=5500,
+        lr_decay_iters=5500,
+        lr_decay_style="WSD",
+        lr_wsd_decay_iters=500,
+        override_opt_param_scheduler=True,
+    )
+    args = build_megatron_args(cfg)
+    pairs = _pairs(args)
+    assert pairs["--lr-decay-iters"] == "5500"
+    assert pairs["--lr-wsd-decay-iters"] == "500"
+    assert "--override-opt-param-scheduler" in args
+    # anneal begins at lr_decay_iters - lr_wsd_decay_iters, i.e. exactly the trunk checkpoint
+    assert cfg.lr_decay_iters - cfg.lr_wsd_decay_iters == 5000
+    assert "--override-opt-param-scheduler" not in build_megatron_args(_cfg())
+
+
+def test_router_pre_softmax_and_dtype_opt_in():
+    off = build_megatron_args(_cfg())
+    assert "--moe-router-pre-softmax" not in off
+    assert "--moe-router-dtype" not in off
+    on = build_megatron_args(_cfg(moe_router_pre_softmax=True, moe_router_dtype="fp32"))
+    assert "--moe-router-pre-softmax" in on
+    assert _pairs(on)["--moe-router-dtype"] == "fp32"
+
+
+def test_grouped_gemm_and_distributed_optimizer_opt_in():
+    # Both are pure throughput/memory levers -- no effect on routing or loss -- but grouped GEMM
+    # swaps the expert module, so it must be recorded in the launch command.
+    off = build_megatron_args(_cfg())
+    assert "--moe-grouped-gemm" not in off
+    assert "--use-distributed-optimizer" not in off
+    on = build_megatron_args(_cfg(moe_grouped_gemm=True, use_distributed_optimizer=True))
+    assert "--moe-grouped-gemm" in on
+    assert "--use-distributed-optimizer" in on
+
+
+def test_base_cluster_config_pins_the_reference_architecture():
+    # Guards the committed cluster config, not just the plumbing: silently reverting any of these
+    # to a Megatron default changes the model (or its parameter count) without changing the arms.
+    cfg = MoEPretrainConfig.from_yaml(_CONFIGS / "base_cluster.yaml")
+    assert cfg.position_embedding_type == "rope"  # else +2.10M learned position table
+    assert cfg.normalization == "RMSNorm"
+    assert cfg.norm_epsilon == 1.0e-5  # FLAME does not override it, so parity = Megatron's default
+    assert not cfg.add_bias_linear  # else +1.22M linear biases
+    assert cfg.swiglu
+    assert cfg.moe_layer_freq == "[0]*1+[1]*8"  # 1 dense + 8 MoE, FLAME's own pattern
+    # The two FFN widths are unrelated once layer 0 is dense: 5472 is that layer, 704 the experts.
+    # Left unset, moe_ffn_hidden_size would silently inherit 5472 and blow every expert up 7.8x.
+    assert cfg.ffn_hidden_size == 5472
+    assert cfg.moe_ffn_hidden_size == 704
+    assert cfg.untie_embeddings_and_output_weights
+    # Renormalised combine weights (Megatron's default), matching OLMoE -- which Exp 2's N5
+    # combine-weight ablation runs on -- so the thesis carries ONE convention throughout.
+    assert not cfg.moe_router_pre_softmax
+    assert cfg.moe_router_dtype == "fp32"
+    assert cfg.moe_grouped_gemm
+    assert cfg.use_distributed_optimizer
+    # WSD, so a longer horizon can pick this run's stable phase back up (extended_budget_cluster).
+    assert cfg.lr_decay_style == "WSD"
+    assert cfg.lr_wsd_decay_iters == 500
+    assert cfg.lr_decay_iters is None  # defaults to train_iters; only a re-horizoned run overrides
+    assert not cfg.override_opt_param_scheduler  # the primary run never re-sizes its own schedule
+    # FLAME's token budget: 5500 * 1024 * 2048 = 11.53B, against their 11.4B.
+    assert cfg.train_iters * cfg.global_batch_size * cfg.seq_length == 11_534_336_000
+    assert cfg.global_batch_size == 1024  # FLAME's, reached by grad accumulation (not extra memory)
+    # Megatron has no unconditional end-of-training save, so this is what guarantees the final
+    # annealed checkpoint exists -- and that the branch point extended_budget resumes from does too.
+    assert cfg.train_iters % cfg.save_interval == 0
+    assert (cfg.train_iters - cfg.lr_wsd_decay_iters) % cfg.save_interval == 0
+    # Grad accumulation must come out whole: global / (micro * data-parallel ranks).
+    assert cfg.global_batch_size % (cfg.micro_batch_size * 4) == 0
+    # S=0 is the one remaining deviation, and top-8 is what pays for it.
+    assert cfg.moe_shared_expert_intermediate_size is None
+    assert cfg.moe_router_topk == 8
+    # EP=1: every rank holds every expert, so per-expert load logging stays exact.
+    assert cfg.expert_model_parallel_size == 1
+
+
+def test_base_cluster_active_params_match_flame_exactly():
+    # The reason topk is 8 rather than FLAME's 6: dropping their 2 shared experts and spending that
+    # capacity on 2 more ROUTED experts is compute-neutral, so S=0 is a pure change of routing
+    # structure. If someone retunes a width or topk without the other, this catches the drift.
+    cfg = MoEPretrainConfig.from_yaml(_CONFIGS / "base_cluster.yaml")
+    d, num_moe_layers = cfg.hidden_size, 8
+    gated_ffn = 3 * d * cfg.moe_ffn_hidden_size  # fc1 d->2f plus fc2 f->d
+
+    ours = num_moe_layers * cfg.moe_router_topk * gated_ffn
+    flame = num_moe_layers * (6 * gated_ffn + 3 * d * 1408)  # 6 routed + one 2x-wide shared
+    assert ours == flame
+
+    # Full active-minus-embedding count, which is the number to quote against their 290M.
+    common = 9 * 4 * d * d + 3 * d * cfg.ffn_hidden_size + num_moe_layers * d * cfg.num_experts
+    assert common + ours + (2 * 9 + 1) * d == 193_514_496
+
+
+def test_local_config_mirrors_the_cluster_architecture():
+    # The local smoke config earns its keep only if it exercises the CLUSTER run's code paths at a
+    # size that fits one dev GPU. Scale (hidden_size, experts, topk, batch, horizon) is free to
+    # differ; the architectural switches that select code paths are not -- if they drift, a green
+    # local run stops being evidence about the cluster run.
+    local = MoEPretrainConfig.from_yaml(_CONFIGS / "base_local.yaml")
+    cluster = MoEPretrainConfig.from_yaml(_CONFIGS / "base_cluster.yaml")
+    for field in (
+        "position_embedding_type",
+        "normalization",
+        "swiglu",
+        "untie_embeddings_and_output_weights",
+        "moe_layer_freq",
+        "moe_router_pre_softmax",
+        "moe_router_dtype",
+        "moe_grouped_gemm",
+        "moe_router_score_function",
+        "lr_decay_style",
+        "use_distributed_optimizer",
+        "transformer_impl",
+    ):
+        assert getattr(local, field) == getattr(cluster, field), field
+    # Its own (much shorter) horizon still has to be internally consistent.
+    assert local.lr_wsd_decay_iters is not None  # WSD without it trips Megatron's assert
+    assert local.train_iters % local.save_interval == 0  # else no final annealed checkpoint
+    assert local.moe_layer_freq is None or local.num_layers == 9  # pattern length == num_layers
+
+
 def test_build_megatron_args_disables_apex_megatron_fusions():
     # Under TE these apex/Megatron fusion paths stay off; TE fuses its own.
     args = build_megatron_args(_cfg())
@@ -269,6 +505,89 @@ def test_resolved_absolutises_checkpoint_paths(tmp_path):
     assert r.load == str(tmp_path / "ckpt/in")
     # unset stays None (launcher derives the per-run save dir when save_interval is on)
     assert MoEPretrainConfig().resolved(tmp_path).save is None
+
+
+def test_resolve_run_dir_fresh_run_uses_the_tag():
+    assert resolve_run_dir("/art/e1", run_tag="trunk") == Path("/art/e1/trunk")
+    with pytest.raises(ValueError, match="run_tag"):
+        resolve_run_dir("/art/e1")
+
+
+def test_resolve_run_dir_plain_resume_continues_in_place(tmp_path):
+    # A sliced run is the SAME model continuing, so it writes back into its own dir: one train.log,
+    # one checkpoints dir, and (via run_dir.name -> WANDB_RUN_ID) one unbroken W&B curve.
+    trunk = tmp_path / "trunk"
+    (trunk / "checkpoints").mkdir(parents=True)
+    assert resolve_run_dir(tmp_path, load=str(trunk / "checkpoints")) == trunk
+
+
+def test_resolve_run_dir_branch_gets_its_own_dir(tmp_path):
+    # A WSD branch reads the trunk's checkpoints but is a DIFFERENT lineage, so it must not land in
+    # the trunk's dir -- it would own the same W&B step numbers with different weights.
+    trunk = tmp_path / "trunk"
+    (trunk / "checkpoints").mkdir(parents=True)
+    branch = resolve_run_dir(
+        tmp_path,
+        run_dir="flame-budget",
+        load=str(trunk / "checkpoints"),
+        is_branch=True,
+    )
+    assert branch == tmp_path / "flame-budget"
+    assert branch.name != trunk.name  # distinct WANDB_RUN_ID
+
+
+def test_resolve_run_dir_rejects_a_branch_writing_into_its_parent(tmp_path):
+    # Forgetting --run-dir on a branch would move the trunk's latest_checkpointed_iteration.txt onto
+    # annealed (dead-end) weights, so the next trunk resume silently continues from cooled weights.
+    # Fail loud instead.
+    trunk = tmp_path / "trunk"
+    (trunk / "checkpoints").mkdir(parents=True)
+    with pytest.raises(ValueError, match="branched from"):
+        resolve_run_dir(tmp_path, load=str(trunk / "checkpoints"), is_branch=True)
+    # ...but pointing it somewhere else is fine, including via an absolute path.
+    out = resolve_run_dir(
+        tmp_path,
+        run_dir=str(tmp_path / "elsewhere"),
+        load=str(trunk / "checkpoints"),
+        is_branch=True,
+    )
+    assert out == tmp_path / "elsewhere"
+
+
+def test_resolve_run_dir_expands_env_vars(tmp_path, monkeypatch):
+    # Same contract as config-file paths: ${VAR}/~ expand, and an UNSET var fails loud. Without
+    # this a literal "${SCRATCH}" is a legal directory name, so the run would create it and write a
+    # whole training run to the wrong filesystem -- silently, since nothing errors.
+    monkeypatch.setenv("SCRATCH", str(tmp_path / "scratch"))
+    out = resolve_run_dir("/art/e1", run_dir="${SCRATCH}/myrun")
+    assert out == tmp_path / "scratch/myrun"
+    assert "$" not in str(out)
+
+    trunk = tmp_path / "scratch" / "trunk"
+    (trunk / "checkpoints").mkdir(parents=True)
+    assert resolve_run_dir("/art/e1", load="${SCRATCH}/trunk/checkpoints") == trunk
+
+    monkeypatch.delenv("SCRATCH")
+    with pytest.raises(ValueError, match="unresolved environment variable"):
+        resolve_run_dir("/art/e1", run_dir="${SCRATCH}/myrun")
+    with pytest.raises(ValueError, match="unresolved environment variable"):
+        resolve_run_dir("/art/e1", load="${SCRATCH}/trunk/checkpoints")
+
+
+def test_resolve_run_dir_expansion_is_idempotent(tmp_path, monkeypatch):
+    # The launcher expands --load before passing it, so resolve_run_dir sees an already-expanded
+    # path; expanding again must be a no-op rather than a second round of substitution.
+    monkeypatch.setenv("SCRATCH", str(tmp_path))
+    once = resolve_run_dir("/art/e1", run_dir="${SCRATCH}/myrun")
+    assert resolve_run_dir("/art/e1", run_dir=str(once)) == once
+
+
+def test_resolve_run_dir_names_a_fresh_run_without_a_load():
+    # --run-dir also replaces the timestamp on a fresh run, which is how the trunk gets a stable
+    # name for later --load paths to point at.
+    assert resolve_run_dir("/art/e1", run_dir="trunk", run_tag="20260101-000000") == Path(
+        "/art/e1/trunk"
+    )
 
 
 def test_build_launch_command_wraps_torch_distributed_run():

@@ -19,10 +19,12 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
+from moe_congestion_routing.paths import expand_path
 from moe_congestion_routing.training.megatron_path import megatron_root, torch_cuda_lib_dirs
 from moe_congestion_routing.training.pretrain_config import (
     MoEPretrainConfig,
     build_launch_command,
+    resolve_run_dir,
 )
 
 
@@ -38,6 +40,22 @@ def main() -> None:
         default=None,
         help="HOST:PORT of node 0 for the multi-node rendezvous (required when --nnodes > 1)",
     )
+    parser.add_argument(
+        "--load",
+        default=None,
+        help="checkpoints DIR to resume from, e.g. artifacts/<run>/checkpoints. The run "
+        "continues in that dir and fails loud if it holds no checkpoint. Omit => fresh timestamped "
+        "run dir. Overrides the config's load.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help="name (or path) for THIS run's artifact dir, relative to the config's output_dir. "
+        "Gives a fresh run a stable name instead of a timestamp, and is REQUIRED for a WSD branch: "
+        "with --load alone the run writes into the dir it loaded from, which is right for a "
+        "resumed slice (one log, one W&B curve) but wrong for a branch, which is a separate "
+        "lineage. e.g. --run-dir flame-budget --load artifacts/e1_cluster/trunk/checkpoints",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the command and exit")
     parser.add_argument(
         "--no-capture",
@@ -52,21 +70,46 @@ def main() -> None:
 
     cfg = MoEPretrainConfig.from_yaml(args.config).resolved(repo_root)
 
-    # Each invocation gets its own <output_dir>/<timestamp>/ for the log, the frozen command,
-    # and checkpoints, so repeated/concurrent runs don't interfere with each other. The dataset
-    # cache is deliberately shared at <output_dir>/cache (keyed by seed/seq_length) so the
-    # sample/shuffle indices are built once and reused across runs.
+    # The run dir holds the log, the frozen command, TensorBoard/W&B, and checkpoints.
     #
-    # Multi-node: the launcher runs once per node, so a per-node datetime.now() would give each
-    # node a different run dir -- and since c10d assigns ranks (global rank 0 isn't pinned to a
-    # node), checkpoints would land in an unpredictable node's dir. The sbatch exports one shared
-    # MOE_RUN_TAG so every node agrees on a single run dir; falls back to a timestamp locally.
-    run_tag = os.environ.get("MOE_RUN_TAG") or datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = Path(cfg.output_dir) / run_tag
+    # RESUME is EXPLICIT: pass --load <run>/checkpoints (or set `load` in the config). We then
+    # continue IN THAT run's own dir (run_dir = the load dir's parent), so a sliced/interrupted run
+    # picks up exactly where it left off, and we set --exit-on-missing-checkpoint so a wrong/empty
+    # path FAILS LOUD immediately instead of silently restarting from random.
+    #
+    # BRANCH (WSD): --run-dir <name> alongside --load reads the trunk's checkpoints but writes
+    # everything else to its own dir, giving it a distinct W&B run id. See resolve_run_dir.
+    #
+    # FRESH run (no --load): a new <output_dir>/<timestamp>/ dir, isolated from other runs. Multi-
+    # node needs every node to agree on that dir, so the sbatch exports one shared MOE_RUN_TAG
+    # (c10d assigns ranks, so rank 0 isn't pinned to a node); locally it falls back to a timestamp.
+    # Expand ${VAR}/~ once, here, so both consumers below see the same path. cfg.load already went
+    # through resolved(); an --load off the command line has not, and a literal "${SCRATCH}" is a
+    # legal directory name that would otherwise be taken at face value.
+    load = args.load or cfg.load
+    if load:
+        load = expand_path(load)
+    run_dir = resolve_run_dir(
+        cfg.output_dir,
+        run_dir=args.run_dir,
+        load=load,
+        run_tag=os.environ.get("MOE_RUN_TAG") or datetime.now().strftime("%Y%m%d-%H%M%S"),
+        is_branch=cfg.override_opt_param_scheduler,
+    )
+    if load:
+        cfg = replace(cfg, load=str(Path(load).resolve()), exit_on_missing_checkpoint=True)
     # Checkpointing enabled (save_interval set) but no explicit save dir → checkpoint into this
     # run's own dir, keeping each run's weights separate and trivial to locate for inference.
     if cfg.save_interval and not cfg.save:
         cfg = replace(cfg, save=str(run_dir / "checkpoints"))
+    if cfg.exit_interval and not cfg.save:
+        # exit_interval only checkpoints when --save is set (Megatron); with no save dir the job
+        # exits with nothing to resume from -- slicing would silently lose all progress.
+        print(
+            "[run_moe_pretrain] WARNING: exit_interval is set but no checkpoint dir is configured "
+            "(set save_interval or save) -- the run will exit without saving and cannot resume.",
+            flush=True,
+        )
 
     # Logging sinks default into this run's own dir so every run's TensorBoard/W&B files sit
     # next to its log and checkpoints. W&B is only wired when a project is configured. Megatron
@@ -99,8 +142,11 @@ def main() -> None:
     if cfg.save:
         Path(cfg.save).mkdir(parents=True, exist_ok=True)
 
-    # Provenance (the launch.sh "frozen script" equivalent): dump the exact command.
-    (run_dir / "launch_command.txt").write_text(" ".join(cmd) + "\n")
+    # Provenance (the launch.sh "frozen script" equivalent): APPEND the exact command (node 0 only)
+    # so a resumed slice preserves earlier slices' commands instead of clobbering them.
+    if os.environ.get("SLURM_NODEID", "0") == "0":
+        with open(run_dir / "launch_command.txt", "a") as f:
+            f.write(f"# {datetime.now():%Y-%m-%d %H:%M:%S}\n{' '.join(cmd)}\n\n")
 
     # pretrain_gpt.py imports `megatron` in the subprocess, so Megatron must be on its PYTHONPATH
     env = os.environ.copy()
@@ -122,6 +168,21 @@ def main() -> None:
     # would otherwise block-buffer (~8 KB) — making output laggy and truncating the log's tail
     # on a crash. Forcing per-write flushes keeps the teed log real-time and complete.
     env["PYTHONUNBUFFERED"] = "1"
+    # W&B: pin a stable run id = the run dir name (constant across slices, since a resume reuses the
+    # same run dir) with resume="allow", so sliced/resumed training CONTINUES ONE W&B run -- an
+    # unbroken curve -- instead of a fresh run per slice. Megatron's wandb.init() passes no
+    # id/resume/group, so these env vars drive it (a user-set value still wins via setdefault);
+    # "allow" creates the run on slice 1 and resumes it thereafter.
+    #
+    # ONE RUN ID PER MODEL LINEAGE, not per job. A resumed slice is the same lineage => same id =>
+    # one continuous curve. A WSD branch is a DIFFERENT lineage that happens to share a prefix, so
+    # --run-dir gives it its own id; sharing the trunk's would write two different models to the
+    # same step numbers. The group ties them back together in the UI: Megatron logs against the
+    # global iteration, so overlaying a branch on its trunk lines the curves up at the branch point.
+    if cfg.wandb_project:
+        env.setdefault("WANDB_RUN_ID", run_dir.name)
+        env.setdefault("WANDB_RESUME", "allow")
+        env.setdefault("WANDB_RUN_GROUP", cfg.wandb_group or Path(cfg.output_dir).name)
 
     print(f"[run_moe_pretrain] launching:\n  {' '.join(cmd)}\n", flush=True)
 
@@ -132,7 +193,7 @@ def main() -> None:
     # Tee stdout+stderr to the terminal and <output_dir>/train.log. Capturing turns the child's
     # stdout into a pipe, so tqdm bars won't be live (cosmetic) — use --no-capture if you want them.
     log_path = run_dir / "train.log"
-    with open(log_path, "w") as logf:
+    with open(log_path, "a") as logf:  # append: a resumed slice keeps earlier slices' log
         proc = subprocess.Popen(
             cmd,
             env=env,

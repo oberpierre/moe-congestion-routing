@@ -1,0 +1,109 @@
+# 296.5M active / 1.265B total. PARAM COUNTS (SwiGLU, biases off, RoPE, RMSNorm, UNTIED
+# embeddings; d=hidden=1024, L=layers=9 as 1 dense + 8 MoE, E=experts=64, k=topk=8,
+# f=moe_ffn_hidden_size=704, f_dense=ffn_hidden_size=5472, V=50257 -> padded 50304 by
+# --make-vocab-size-divisible-by 128).
+# A gated FFN is THREE matrices (fc1 d->2f, fc2 f->d), hence 3*d*f, not 2*d*f:
+#   embedding             = V_pad*d = 50304*1024                             ~=  51.51M
+#   output head           = V_pad*d (its own tensor; see untie below)        ~=  51.51M
+#   attention             = L * 4*d^2 = 9 * 4.19M                            ~=  37.75M
+#   dense layer 0 FFN     = 3*d*f_dense = 3*1024*5472                        ~=  16.81M
+#   routers + norms       = 8*d*E + (2L+1)*d = 8*65536 + 19*1024             ~=   0.54M
+#   experts (sparse)      = 8 * E * (3*d*f) = 8 * 64 * 3*1024*704            ~=   1.11B  (only k/E per token)
+#   TOTAL (passive)       = 103.02M + 37.75M + 16.81M + 0.54M + 1.11B        ~=   1.265B
+#   ACTIVE / token        = 103.02M + 37.75M + 16.81M + 0.54M + (8/64)*1.11B ~= 296.5M
+#   ACTIVE ex. embeddings = 296.5M - 103.02M                                 ~= 193.5M
+#
+# Against FLAME-290M-1.3B: 296,537,088 active params, EXACTLY theirs, and 193,514,496 ex-embeddings,
+# also exactly theirs. The only remaining architectural difference is shared experts (below), which
+# is why our total is 1.265B against their 1.300B, that 34.6M gap is their 65th, always-on expert.
+
+# NOTE: Do NOT change train_iters upon resuming a run as it fixed the LR schedule horizon.
+# Use exit_interval to slice a run into multiple jobs and resume from there.
+# Also ensure seed, seq_length, micro_batch_size, global_batch_size, and lr_warmup_iters are unchanged
+# when resuming from a checkpoint.
+
+num_layers: 9
+hidden_size: 1024
+num_attention_heads: 16
+position_embedding_type: rope
+normalization: RMSNorm
+swiglu: true
+untie_embeddings_and_output_weights: true
+# Matching FLAME and DeepSeek 1B, which both use a dense first layer. So 1 dense + 8 MoE layers.
+moe_layer_freq: "[0]*1+[1]*8"
+
+# MoE - 64 experts / top-8 / dropless / NO shared experts.
+ffn_hidden_size: 5472
+moe_ffn_hidden_size: 704
+num_experts: 64
+moe_router_topk: 8
+moe_router_score_function: softmax
+moe_z_loss_coeff: 1.0e-3
+# Combine weights renormalised over the selected experts, so they sum to 1 (Megatron's default)
+# `moe_router_pre_softmax: true` would be softmax over all 64 experts with NO renormalisation,
+# FLAME uses true => we deviate intentionally
+moe_router_pre_softmax: false
+moe_router_dtype: fp32
+moe_grouped_gemm: true
+
+# NOTE: Deviation from FLAME-MoE and DeepSeek 1B which use 64/6/2 (experts/topk/shared):
+#     moe_router_topk: 6                          # give the capacity back to the shared expert
+#     moe_shared_expert_intermediate_size: 1408   # FLAME implements "2 shared experts as 1 expert
+#                                                 # of 2x the routed width
+# Compute is unchanged (6*704 + 1408 == 8*704), but always-on capacity would absorbs the common tokens
+# that would otherwise collapse onto a few routed experts which we want to study.
+
+# metrics + throughput (patches 0001/0002 + native metrics)
+moe_per_layer_logging: true
+log_throughput: true
+
+# Set the project name and WANDB_API_KEY in the env (see config.sh.example) to enable W&B logging.
+# WANDB_MODE=offline skips the upload for quick runs.
+wandb_project: moe-congestion-routing
+
+# data
+# Trains on ClimbMix small (premixed 35.5B subset) via the single-blob `--split` method
+# (mutually exclusive with train_/valid_data_path). `split` carves a DETERMINISTIC, train-disjoint
+# held-out tail (train = 99%, valid = last 1% of documents).
+data_path: ${DATA_STORE}/datasets/nvidia/Nemotron-ClimbMix/climbmix_small/climbmix_small
+split: "99,1,0"
+tokenizer_type: NullTokenizer
+vocab_size: 50257
+
+# optimisation / schedule.
+# WSD (warmup-stable-decay), as FLAME uses: lr is held FLAT at 3e-4 until train_iters - lr_wsd_decay_iters
+# then annealed to min_lr over the lr_wsd_decay_iters (~10% of the horizon, the usual choice).
+# An annealed checkpoint is a LEAF, never a branch point. Continuing from one
+# means re-raising the lr, which re-heats the model and undoes the annealing. Always branch or
+# resume from a STABLE-phase checkpoint.
+lr: 3.0e-4
+min_lr: 3.0e-5
+lr_decay_style: WSD
+lr_wsd_decay_iters: 500  # anneal after train_iters - lr_wsd_decay_iters to train_iters
+lr_warmup_iters: 55  # 1% of the horizon, matching FLAME's lr_warmup_fraction 0.01
+micro_batch_size: 4
+global_batch_size: 1024
+seq_length: 2048
+train_iters: 5500  # 11.53B tokens = 1024 x 2048 x 5500 (FLAME's budget is 11.4B; +1.2% is noise)
+seed: 1234
+eval_interval: 500
+eval_iters: 10  # 10 x 1024 x 2048 = 21M eval tokens against the 355M held-out tail
+# eval + checkpointing. save_interval sets the granularity of the DEFERRED probe-tier metrics.
+# save_interval MUST divide train_iters: Megatron saves on save_interval multiples and on
+# exit_interval, but has no unconditional end-of-training save, so train_iters % save_interval == 0 is what
+# guarantees the final annealed checkpoint exists at all. It also has to divide the branch point
+# before annealing starts: train_iters - lr_wsd_decay_iters
+save_interval: 500
+exit_interval: 2500
+
+# runtime - TE with auto attention (Hopper cuDNN fused attention works)
+transformer_impl: transformer_engine
+attention_backend: auto
+bf16: true
+tensor_model_parallel_size: 1
+pipeline_model_parallel_size: 1
+# EP stays 1 on purpose: every rank holds every expert, so there is no all-to-all and per-expert
+# load logging is exact
+expert_model_parallel_size: 1
+use_distributed_optimizer: true
+log_interval: 10
