@@ -31,49 +31,76 @@ from collections.abc import Callable
 
 import torch
 
-
-def _linear(load: torch.Tensor, lam: float) -> torch.Tensor:
-    return lam * load
-
-
-def _quadratic(load: torch.Tensor, lam: float) -> torch.Tensor:
-    return lam * load**2
+from moe_congestion_routing.losses.rosenthal import COST_FAMILIES, cost
 
 
 def _zero(load: torch.Tensor, lam: float) -> torch.Tensor:
-    # Sanity baseline: with no congestion cost, SwapGap of a top-k-on-affinity routing is 0 by
-    # construction; for a bias arm it measures the assignment's distance from affinity-greedy.
+    # Not a congestion cost anyone trains against: a measurement baseline. With no congestion
+    # cost, SwapGap of a top-k-on-affinity routing is 0 by construction; for a bias arm it
+    # measures the assignment's distance from affinity-greedy.
     return torch.zeros_like(load)
 
 
-SWAPGAP_COSTS: dict[str, Callable[[torch.Tensor, float], torch.Tensor]] = {
-    "linear": _linear,
-    "quadratic": _quadratic,
-    "zero": _zero,
+# The probe's SPAN and its SPACING are separately load-bearing. Span: E/k = 8 is the
+# largest relative load any arm here reaches, so 128 leaves wide margin. Spacing: 0.1
+# resolves structure at the scale of one relative-load unit. So a wide-but-coarse probe
+# admits a price that oscillates inside [0, 8].
+_ADMISSIBILITY_PROBE_MAX_RELATIVE_LOAD = 128.0
+_ADMISSIBILITY_PROBE_STEPS = 1281
+
+
+def _is_admissible_price(price_fn: Callable[[torch.Tensor, float], torch.Tensor]) -> bool:
+    """Whether ``price_fn`` may be used as a SwapGap measurement price.
+
+    A cost an arm may be *trained* against is not automatically a valid *measurement* price.
+    Must be a finite and strictly increasing function across the probed range of relative loads.
+    A hard barrier sends the sitting term to ``-inf``, so the gap goes to ``+inf`` and because
+    the tracker reduces to a per-layer mean, that poisons every ``swapgap_*`` series in the run,
+    for every arm, not only the one training against the barrier.
+    """
+    load = torch.linspace(0.0, _ADMISSIBILITY_PROBE_MAX_RELATIVE_LOAD, _ADMISSIBILITY_PROBE_STEPS)
+    value = price_fn(load, 1.0)
+    if not torch.isfinite(value).all():
+        return False
+    return bool((value[1:] > value[:-1]).all())
+
+
+# Candidate prices come from the same registry a Rosenthal arm may train against, but training and
+# measurement are different questions: a candidate is admitted as a SwapGap measurement price only
+# if it passes _is_admissible_price. "zero" is added unconditionally as a measurement baseline, as
+# it is constant by design and would fail the admissibility probe.
+_candidate_prices: dict[str, Callable[[torch.Tensor, float], torch.Tensor]] = {
+    family: (lambda load, lam, family=family: cost(load, family, lam)) for family in COST_FAMILIES
 }
+SWAPGAP_COSTS: dict[str, Callable[[torch.Tensor, float], torch.Tensor]] = {
+    family: fn for family, fn in _candidate_prices.items() if _is_admissible_price(fn)
+}
+SWAPGAP_COSTS["zero"] = _zero
 
 
 def swapgap(
     logits: torch.Tensor,
     routing_map: torch.Tensor,
-    cost: str,
+    cost_family: str,
     *,
     lam: float = 1.0,
 ) -> torch.Tensor:
-    """Per-token-mean SwapGap for one MoE layer under congestion cost ``cost`` on hard counts.
+    """Per-token-mean SwapGap for one MoE layer under congestion cost ``cost_family``, hard counts.
 
     Args:
         logits: ``[T, E]`` raw router logits = affinities ``a = sg(z)`` (unbiased). For bias arms,
             the pre-bias logits.
         routing_map: ``[T, E]`` bool, the realized top-k assignment (biased for bias arms).
-        cost: a key in :data:`SWAPGAP_COSTS`.
+        cost_family: a key in :data:`SWAPGAP_COSTS`.
         lam: congestion strength ``lambda`` (dimensionless price on the normalized load).
 
     Returns:
         Scalar tensor in ``[0, inf)``; 0 iff no token has a profitable single swap.
     """
-    if cost not in SWAPGAP_COSTS:
-        raise ValueError(f"unknown SwapGap cost {cost!r}; expected one of {sorted(SWAPGAP_COSTS)}")
+    if cost_family not in SWAPGAP_COSTS:
+        raise ValueError(
+            f"unknown SwapGap cost {cost_family!r}; expected one of {sorted(SWAPGAP_COSTS)}"
+        )
 
     num_tokens = logits.shape[0]
     if num_tokens == 0:
@@ -84,7 +111,7 @@ def swapgap(
     load = selected.sum(dim=0).float()  # [E] hard load n_e
     lbar = load.mean()  # balanced load L = T*k/E; normalize so the cost is scale-free
 
-    cost_fn = SWAPGAP_COSTS[cost]
+    cost_fn = SWAPGAP_COSTS[cost_family]
     cost_stay = cost_fn(load / lbar, lam)  # [E] c_e(n_e / L): sit on a selected expert
     cost_join = cost_fn((load + 1.0) / lbar, lam)  # [E] c_e((n_e + 1) / L): join a new expert
 
