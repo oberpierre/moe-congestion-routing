@@ -157,13 +157,13 @@ def relative_loads(
 def _assert_conserves_global_mass(u_glob: torch.Tensor, num_experts: int) -> None:
     """Cheap invariant check on an explicitly supplied ``global_prob_sum``.
 
-    Per-token softmax mass sums to 1, so ``sum_e u_glob`` must equal E regardless of how the
-    reduce group was formed. A mismatch means ``global_prob_sum`` was reduced over the wrong group.
+    Per-token softmax mass sums to 1, so ``sum_e u_glob`` must equal E however the reduce group
+    was formed. A mismatch means ``global_prob_sum`` was reduced over the wrong group.
     """
     total = u_glob.sum()
     expected = torch.tensor(float(num_experts), dtype=total.dtype)
     assert torch.allclose(total, expected, rtol=1e-3, atol=1e-3), (
-        f"sum_e u_glob = {total.item():.4f} != E = {num_experts} (0015 conservation invariant); "
+        f"sum_e u_glob = {total.item():.4f} != E = {num_experts} (conservation invariant); "
         "check global_prob_sum was reduced over the same group as the counts, on the same "
         "pre-drop token set"
     )

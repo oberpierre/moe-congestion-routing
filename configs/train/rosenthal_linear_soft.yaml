@@ -1,0 +1,10 @@
+extends: base_cluster.yaml
+
+moe_router_load_balancing_type: rosenthal
+moe_rosenthal_variant: soft
+moe_rosenthal_cost: linear
+# moe_rosenthal_lambda omitted: inherits linear's slope-matched default (1.0) from
+# DEFAULT_LAMBDA in src/moe_congestion_routing/losses/cost_families.py.
+moe_aux_loss_coeff: 0.01
+
+output_dir: artifacts/exp1/rosenthal_linear_soft

@@ -1,0 +1,566 @@
+# Patch: Rosenthal congestion loss as a Megatron router load-balancing type
+# ==================================
+# Problem: Megatron ships aux_loss / global_aux_loss (linear-in-load, Switch-style) and sinkhorn.
+#   The Exp 3 arms need two more balancing types, "rosenthal" and "global_rosenthal", which price
+#   relative expert load through a congestion cost family instead of the fixed linear form, at
+#   micro-batch and global-batch level respectively. "hard" + "linear" + lambda=1 must reduce
+#   exactly to switch_load_balancing_loss_func for every topk, so the congestion loss is a strict
+#   generalization of the existing Switch arm rather than a parallel implementation of it.
+#
+# What this patch does:
+#   - transformer_config.py: declares moe_rosenthal_variant, moe_rosenthal_cost,
+#     moe_rosenthal_lambda and moe_rosenthal_log_grad_ratio (the last is unread until patch 0004,
+#     declared here so that patch touches neither this file nor training.py). Extends the
+#     moe_router_load_balancing_type docstring and the two moe_expert_capacity_factor allow-lists.
+#     Validates rules 1-4 and 8 of the shared config contract whenever a rosenthal type is
+#     selected, plus that at most one of the two is selected at a time; rule 7 sits outside that
+#     guard because it constrains every OTHER balancing type. Rules 5 and 6 are RETIRED, not
+#     renumbered -- 0017's construction made 'soft' correct at any reduce-group size, and the
+#     numbers stay retired because they are pinned into test names elsewhere.
+#   - arguments.py: adds the two names to --moe-router-load-balancing-type's choices. This is the
+#     only hand-written argparse edit needed; every moe_rosenthal_* flag is auto-generated from the
+#     TransformerConfig fields above by ArgumentGroupFactory.
+#   - router.py: is_aux_loss_enabled() also matches the two new types. Without that the router
+#     never computes scores_for_aux_loss and the run trains with NO balancing while the config says
+#     otherwise, with no error. TopKRouter._apply_rosenthal_loss() is added beside
+#     _apply_global_aux_loss and called from the same gate in routing().
+#     reset_global_aux_loss_tracker() resets the three rosenthal_* attributes under their own
+#     condition, separate from global_aux_loss's: a global_rosenthal-only run never allocates
+#     global_tokens_per_expert, so reusing that condition would skip the reset every global batch.
+#     TopKRouter.__init__ gains a comment only -- see it for why the accumulators are not buffers.
+#   - finalize_model_grads.py: reset_model_temporary_tensors's string match also matches
+#     "global_rosenthal". Missing this dispatch is the most expensive silent failure in the change:
+#     no error, the loss just prices a stale running average.
+#   This patch adds no math and no metric names of its own. Every formula lives in
+#   moe_congestion_routing.losses.rosenthal, imported function-locally as patch 0001 already does.
+#   rosenthal_loss and rosenthal_pressure_max reach the log through moe_track_names, which has been
+#   data-driven since patch 0001.
+#
+# Where in the code:
+#   File: megatron/core/transformer/transformer_config.py
+#   Location: the moe_router_load_balancing_type docstring (~line 662); the field block after
+#     moe_aux_loss_coeff (~line 776); the MoE validation block beside the existing
+#     moe_expert_capacity_factor checks (~line 1483).
+#
+#   File: megatron/training/arguments.py
+#   Function: _add_moe_args()
+#   Location: the --moe-router-load-balancing-type choices list (~line 3136).
+#
+#   File: megatron/core/transformer/moe/router.py
+#   Function: is_aux_loss_enabled() / _apply_rosenthal_loss() / reset_global_aux_loss_tracker() /
+#     routing()
+#   Location: the is_aux_loss_enabled() loop (~line 279); a new method beside
+#     _apply_global_aux_loss (~line 425); the aux-loss block in routing(), immediately after the
+#     _apply_global_aux_loss call (~line 665); the reset block appended to
+#     reset_global_aux_loss_tracker() (~line 859).
+#
+#   File: megatron/core/distributed/finalize_model_grads.py
+#   Function: reset_model_temporary_tensors()
+#   Location: the "global_aux_loss" string match (~line 324).
+#
+# How to fix if this patch breaks on a future Megatron version:
+#   Search for "global_aux_loss" in transformer_config.py, router.py and finalize_model_grads.py
+#   and add the rosenthal equivalent beside each hit; extend --moe-router-load-balancing-type's
+#   choices in arguments.py. Two of those hits are upstream helpers this patch RE-IMPLEMENTS
+#   rather than calls, because _apply_rosenthal_loss fuses two collectives into one and neither
+#   helper supports that: moe_utils.py's get_tokens_per_expert_and_token_count (its
+#   with_padding_mask branch and its total_num_tokens line) and _apply_global_aux_loss's
+#   accumulate-then-divide-by-ga_steps protocol. A bump that changes either moves
+#   aux_loss/seq_aux_loss/global_aux_loss and leaves rosenthal on the old definition -- a different
+#   N in the denominator of u, or a different averaging window -- with no error. Re-derive both
+#   copies from the new upstream shape rather than renaming fields.
+#
+# Known limitations:
+#   - The distributed path has never actually run distributed. Every verification of this patch ran
+#     at DP = CP = TP = 1, where each reduce group has size one and the fused all-reduce is a no-op.
+#     Before any multi-GPU run, watch sum_e u_glob: it reads E when the reduce group is right, and
+#     E * (ranks the numerator covers) / (ranks the denominator assumes) when it is not.
+#   - Semi-gradient staleness under global_rosenthal: within a grad-accumulation window the loss
+#     prices against the running average of the micro-batches seen so far, exactly as
+#     global_aux_loss already does. Both variants inherit it; it is not introduced here.
+#   - Megatron's OWN global_aux_loss still accumulates its counts and its step counter in
+#     register_buffer, which Float16Module casts to bf16. This patch deliberately does not fix
+#     that, because it would change global_aux_loss's numerics for every arm using it. No arm in
+#     docs/plan.md trains with global_aux_loss today; if one ever does, its f_e carries up to ~1%
+#     quantization at 256 grad-accumulation steps and its ga_steps saturates at 256.0, past which
+#     the divisor freezes while the numerator keeps growing.
+#   - This patch's routing() hunk does not carry patch 0001's added lines as context, even though
+#     it lands two lines above them: _apply_expert_bias sits between the two insertion points in
+#     the original file, widening the gap past the three lines git apply matches on. Confirmed by
+#     grep, not predicted from line numbers. So 0001 may be amended without regenerating this one.
+#
+# Applied to: Megatron-LM core_v0.18.0
+#
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 95150103f..18e09caa3 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -667,6 +667,12 @@ class TransformerConfig(ModelParallelConfig):
+     - "seq_aux_loss": Load balancing loss used in DeepSeekV2 and DeepSeekV3, computes loss
+     for each individual sample.
+     - "global_aux_loss": Load balancing loss calculated at global batch level.
++    - "rosenthal": Rosenthal congestion loss (moe_congestion_routing patch), calculated at
++    micro-batch level like "aux_loss" -- prices relative expert load through the congestion cost
++    family named by moe_rosenthal_cost instead of the Switch linear-in-load form. See
++    moe_rosenthal_variant, moe_rosenthal_cost and moe_rosenthal_lambda below.
++    - "global_rosenthal": Rosenthal congestion loss calculated at global batch level, mirroring
++    "global_aux_loss".
+     - "sinkhorn": Balancing algorithm used in S-BASE.
+     - "none": No load balancing.
+     A list of strings can be provided to combine multiple aux-loss load balancing types.
+@@ -778,6 +784,32 @@ class TransformerConfig(ModelParallelConfig):
+     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
+     a corresponding list of coefficients should be provided here."""
+ 
++    moe_rosenthal_variant: str = "hard"
++    """Rosenthal congestion loss variant (moe_congestion_routing patch), only meaningful when
++    moe_router_load_balancing_type is "rosenthal" or "global_rosenthal". "hard" prices the
++    router's mass against the marginal cost at the realized, detached assignment. "soft" prices
++    it against the cost at the router's own expected load. Both are valid with either balancing
++    type and at any parallel size; see moe_congestion_routing.losses.rosenthal for the two
++    formulas and why neither needs cross-rank autograd."""
++
++    moe_rosenthal_cost: str = "linear"
++    """Congestion cost family for the Rosenthal loss (moe_congestion_routing patch): "linear"
++    (reduces to switch_load_balancing_loss_func exactly when moe_rosenthal_variant is "hard" and
++    moe_rosenthal_lambda is 1.0) or "quadratic"."""
++
++    moe_rosenthal_lambda: float = 1.0
++    """Scale of the congestion cost family for the Rosenthal loss (moe_congestion_routing patch).
++    This default is family-independent. Our own launcher resolves an omitted lambda through
++    DEFAULT_LAMBDA before building the command line, so a direct-Megatron launch that omits
++    --moe-rosenthal-lambda gets 1.0 here rather than the family's slope-matched default."""
++
++    moe_rosenthal_log_grad_ratio: bool = False
++    """Log the logit-space gradient norm the Rosenthal congestion loss injects, for later
++    comparison against the task loss's own logit-space gradient norm (moe_congestion_routing
++    patch). Requires moe_router_load_balancing_type to be "rosenthal" or "global_rosenthal".
++    Declared here (rather than beside the patch that reads it) so that patch does not need to
++    touch this file."""
++
+     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
+     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
+ 
+@@ -1481,6 +1513,10 @@ class TransformerConfig(ModelParallelConfig):
+             )
+ 
+         if self.moe_expert_capacity_factor is not None:
++            # Local import, gated so that other Megatron config constructions stay free of a
++            # dependency on our package. cost_families.py imports no torch.
++            from moe_congestion_routing.losses.cost_families import ROSENTHAL_TYPES
++
+             if self.moe_expert_capacity_factor < 0:
+                 self.moe_expert_capacity_factor = None
+             if isinstance(self.moe_router_load_balancing_type, list):
+@@ -1489,21 +1525,158 @@ class TransformerConfig(ModelParallelConfig):
+                         "aux_loss",
+                         "seq_aux_loss",
+                         "global_aux_loss",
++                        *ROSENTHAL_TYPES,
+                         "none",
+                     ]:
+                         raise ValueError(
+                             "moe_expert_capacity_factor only works with aux_loss, "
+-                            "seq_aux_loss, global_aux_loss or none load balancing"
++                            "seq_aux_loss, global_aux_loss, rosenthal, global_rosenthal or none "
++                            "load balancing"
+                         )
+             elif self.moe_router_load_balancing_type not in [
+                 "aux_loss",
+                 "seq_aux_loss",
+                 "global_aux_loss",
++                *ROSENTHAL_TYPES,
+                 "none",
+             ]:
+                 raise ValueError(
+                     "moe_expert_capacity_factor only works with aux_loss, "
+-                    "seq_aux_loss, global_aux_loss or none load balancing"
++                    "seq_aux_loss, global_aux_loss, rosenthal, global_rosenthal or none load "
++                    "balancing"
++                )
++
++        # Rosenthal congestion loss validation (moe_congestion_routing patch). Deliberately
++        # duplicated in pretrain_config.py's build_megatron_args, which fails at --dry-run and so
++        # saves cluster queue time. This copy is the one no launch path can bypass.
++        #
++        # moe_router_load_balancing_type is a string or a list of strings, since Megatron supports
++        # combining balancing losses, so a bare equality check would let a list selecting rosenthal
++        # alongside another type skip every rule below. Rule 4 in particular has no other backstop.
++        if self.num_moe_experts is not None:
++            # Local import, gated so a dense-only config construction stays free of a dependency
++            # on our package. selected_rosenthal_types owns the scalar/list normalization, so this
++            # file does not repeat it.
++            from moe_congestion_routing.metrics.track_names import selected_rosenthal_types
++
++            _rosenthal_types_selected = selected_rosenthal_types(self)
++        else:
++            _rosenthal_types_selected = []
++
++        if len(_rosenthal_types_selected) > 1:
++            # _apply_rosenthal_loss resolves the two by which coefficient is nonzero, checking
++            # "rosenthal" first, so a list selecting both would silently drop the global one.
++            # Enforce here what that resolution assumes.
++            raise ValueError(
++                "moe_router_load_balancing_type selects more than one rosenthal type "
++                f"({_rosenthal_types_selected!r}) -- 'rosenthal' and 'global_rosenthal' are "
++                "mutually exclusive"
++            )
++
++        if _rosenthal_types_selected:
++            # Local import, reached only for a rosenthal balancing type. cost_families.py imports
++            # no torch, so this costs nothing on a login node.
++            from moe_congestion_routing.losses.cost_families import (
++                COST_FAMILIES,
++                VARIANTS,
++                cost_exponent,
++                pressure_bound,
++            )
++
++            if self.moe_rosenthal_variant not in VARIANTS:
++                raise ValueError(
++                    f"moe_rosenthal_variant must be one of {VARIANTS}, got "
++                    f"{self.moe_rosenthal_variant!r}"
++                )
++            if self.moe_rosenthal_cost not in COST_FAMILIES:
++                raise ValueError(
++                    f"moe_rosenthal_cost must be one of {COST_FAMILIES}, got "
++                    f"{self.moe_rosenthal_cost!r}"
++                )
++            if self.moe_rosenthal_lambda <= 0:
++                raise ValueError(
++                    f"moe_rosenthal_lambda must be > 0, got {self.moe_rosenthal_lambda}"
++                )
++            if self.moe_router_score_function != "softmax":
++                raise ValueError(
++                    "a rosenthal balancing type requires moe_router_score_function == 'softmax' "
++                    "(sigmoid needs mean-centering to define the congestion loss, which is out "
++                    f"of scope), got {self.moe_router_score_function!r}"
++                )
++            # Rules 5 and 6 (soft rejected with global_rosenthal; soft required
++            # tensor_model_parallel_size == 1 with rosenthal) are RETIRED: 0017 replaced the
++            # potential-form soft loss, which needed a size-1 reduce group, with a synced-
++            # coefficient construction (a detached, globally-reduced marginal cost multiplying a
++            # still-local, still-differentiable carrier -- see _apply_rosenthal_loss) that is
++            # correct at any reduce-group size. Numbers 5 and 6 are retired, not reused: they are
++            # pinned into test names elsewhere in this codebase
++            # (pretrain_config_test.py, this file's own test module), and renaming eight tests to
++            # renumber the two survivors below would buy nothing. The survivors keep rules 1-4,
++            # 7, 8.
++            #
++            # Sanity bound on the congestion pressure at full imbalance -- not a correctness
++            # condition, so this warns rather than blocking what may be a deliberate high-lambda
++            # experiment. Only evaluated when moe_aux_loss_coeff is a plain scalar: the list form
++            # (one coefficient per entry of a list-valued moe_router_load_balancing_type) is out
++            # of scope for the congestion loss, which only ever selects one balancing type. The
++            # bound expression itself lives in losses/cost_families.py, imported here and by our
++            # own launcher's copy of this check, so it is written out in exactly one place --
++            # pressure_bound returns the expression string alongside the value (not just the
++            # value) so neither caller re-derives which branch (hard's capped E/K vs soft's
++            # uncapped E) produced it by testing the variant a second time; a caller that got that
++            # second branch wrong would print a plausible but wrong expression next to a correct
++            # number, in a warning string no test asserts on.
++            if isinstance(self.moe_aux_loss_coeff, (int, float)):
++                _p = cost_exponent(self.moe_rosenthal_cost)
++                _bound = pressure_bound(
++                    self.moe_aux_loss_coeff,
++                    self.moe_rosenthal_lambda,
++                    self.num_moe_experts,
++                    self.moe_router_topk,
++                    self.moe_rosenthal_cost,
++                    self.moe_rosenthal_variant,
++                    num_experts_name="num_moe_experts",
++                )
++                if _bound.value > 1:
++                    warnings.warn(
++                        "moe_rosenthal_lambda * moe_aux_loss_coeff * "
++                        f"{_bound.expr}**{_p} = {_bound.value:.4g} > 1 -- the "
++                        "congestion pressure at full imbalance exceeds the sanity bound; not an "
++                        "error, but check moe_rosenthal_lambda and moe_aux_loss_coeff are what "
++                        "you intend."
++                    )
++
++        # Rule 7 is about the NON-rosenthal case (a stray --moe-rosenthal-log-grad-ratio on an
++        # aux_loss/sinkhorn/none run), so it must sit outside the "is it rosenthal?" branch above --
++        # nested inside it, this check would never fire on exactly the run it exists to catch. Same
++        # list-vs-scalar fix as the guard above: a list selecting a rosenthal type alongside another
++        # type must not be rejected here either.
++        #
++        # Requires the selection to be EXACTLY one rosenthal type, not merely to include one:
++        # accepting ["seq_aux_loss", "rosenthal"] would be wrong because the "cg" gradient probe
++        # (the router-grad-probe patch) wraps the ONE `logits` tensor that feeds
++        # compute_routing_scores_for_aux_loss, and every active aux loss type reads that same
++        # tensor -- so with a mixed list, rosenthal_grad_norm_cg would silently record the
++        # COMBINED gradient of every active aux loss, not the congestion loss's own contribution,
++        # with no error (that metric is the numerator of the Exp 3 gradient-share ratio).
++        if self.moe_rosenthal_log_grad_ratio:
++            # selected_rosenthal_types owns the scalar/list normalization and the ROSENTHAL_TYPES
++            # membership test (see its docstring and the guard above, which shares it); the only
++            # thing this rule needs beyond that is whether the field selects anything ELSE besides
++            # the one rosenthal type, which is a question about the field's raw length, not about
++            # which of its entries are rosenthal types, so it is answered directly rather than by
++            # re-deriving a second normalized list here.
++            from moe_congestion_routing.metrics.track_names import selected_rosenthal_types
++
++            _is_single_balancing_type = (
++                not isinstance(self.moe_router_load_balancing_type, list)
++                or len(self.moe_router_load_balancing_type) == 1
++            )
++            if not (_is_single_balancing_type and len(selected_rosenthal_types(self)) == 1):
++                raise ValueError(
++                    "moe_rosenthal_log_grad_ratio requires moe_router_load_balancing_type to be "
++                    "EXACTLY 'rosenthal' or 'global_rosenthal' (not combined with any other "
++                    f"balancing type via the list form), got {self.moe_router_load_balancing_type!r}"
+                 )
+ 
+         if self.moe_pad_expert_input_to_capacity:
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 18cb5ef8a..06ed16a55 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -3134,9 +3134,9 @@ def _add_moe_args(parser):
+                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
+     # Router arguments
+     group.add_argument('--moe-router-load-balancing-type', nargs='+', type=str,
+-                       choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'none'],
++                       choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'rosenthal', 'global_rosenthal', 'sinkhorn', 'none'],
+                        default='aux_loss',
+-                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
++                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "rosenthal"/"global_rosenthal" (moe_congestion_routing patch) price relative expert load through a congestion cost family instead of the Switch linear-in-load form, at micro-batch or global-batch level respectively; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
+     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
+                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
+     # Token dispatcher arguments
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 235a616df..6280710e4 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -26,6 +26,12 @@ from megatron.core.transformer.moe.moe_utils import (
+ from megatron.core.transformer.moe.router_replay import RouterReplay
+ from megatron.core.transformer.transformer_config import TransformerConfig
+ 
++# Deliberately its own import rather than an entry in the moe_utils list above, which patch 0004
++# edits: a hunk within three lines of that list would force 0004 to be regenerated too. Used by
++# _apply_rosenthal_loss to fuse the prob_sum reduce into the token-count all-reduce
++# (moe_congestion_routing patch).
++from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region  # noqa: E402
++
+ 
+ class Router(ABC, MegatronModule):
+     """Base Router class"""
+@@ -213,6 +219,12 @@ class TopKRouter(Router):
+             self.global_tokens_per_expert = None
+             self.ga_steps = None
+ 
++        # global_rosenthal (moe_congestion_routing patch) allocates nothing here, on purpose. Its
++        # three accumulators are created lazily in _apply_rosenthal_loss as plain fp32 attributes,
++        # because Float16Module.__init__ calls module.bfloat16() and nn.Module._apply casts every
++        # registered buffer whatever dtype it was registered with. A buffer here, or a share of
++        # global_aux_loss's buffers above, quantizes the accumulation to the bf16 grid.
++
+         self.router_replay = None
+         if self.config.moe_enable_routing_replay:
+             self.router_replay = RouterReplay()
+@@ -278,7 +290,13 @@ class TopKRouter(Router):
+ 
+     def is_aux_loss_enabled(self) -> bool:
+         """Check if the auxiliary loss is enabled."""
+-        for aux_loss_type in ["aux_loss", "seq_aux_loss", "global_aux_loss"]:
++        for aux_loss_type in [
++            "aux_loss",
++            "seq_aux_loss",
++            "global_aux_loss",
++            "rosenthal",
++            "global_rosenthal",
++        ]:
+             if self.get_aux_loss_coeff(aux_loss_type) > 0:
+                 return True
+         return False
+@@ -424,6 +442,139 @@ class TopKRouter(Router):
+         )
+         return probs
+ 
++    def _apply_rosenthal_loss(
++        self,
++        probs: torch.Tensor,
++        scores_for_aux_loss: torch.Tensor,
++        routing_map: torch.Tensor,
++        with_padding_mask: bool = False,
++    ):
++        """Apply the Rosenthal congestion loss (moe_congestion_routing patch).
++
++        Mirrors _apply_aux_loss and _apply_global_aux_loss. "rosenthal" reduces over tp_cp_group
++        and is stateless; "global_rosenthal" reduces over tp_dp_cp_group and averages across
++        grad-accumulation steps in its own three attributes, which are a second copy of
++        _apply_global_aux_loss's protocol rather than a share of its buffers. See __init__ above
++        for why they cannot be shared.
++
++        The router never all-reduces a differentiable tensor. Only the detached prob_sum is
++        reduced, and it is handed to rosenthal_loss as a synced coefficient multiplying a local
++        differentiable carrier, which is exact at any reduce-group size. All the math lives in
++        moe_congestion_routing.losses.rosenthal; nothing here restates a formula.
++        """
++        rosenthal_coeff = self.get_aux_loss_coeff("rosenthal")
++        is_global = False
++        if rosenthal_coeff == 0:
++            rosenthal_coeff = self.get_aux_loss_coeff("global_rosenthal")
++            is_global = True
++        if rosenthal_coeff == 0:
++            return probs
++
++        reduce_group = self.tp_dp_cp_group if is_global else self.tp_cp_group
++
++        # One fused all-reduce rather than get_tokens_per_expert_and_token_count plus a separate
++        # reduce for prob_sum. Counts and prob_sum must cover the same pre-drop token set, which a
++        # single joint reduce guarantees by construction. Both halves are detached statistics, so
++        # the identity backward is never exercised; the router's gradient flows through the local,
++        # undetached scores_for_aux_loss passed to rosenthal_loss below.
++        local_tokens_per_expert = routing_map.sum(dim=0).float()
++        local_prob_sum = scores_for_aux_loss.float().sum(dim=0).detach()
++        fused_local = torch.cat([local_tokens_per_expert, local_prob_sum])
++        fused_global = reduce_from_tensor_model_parallel_region(fused_local, reduce_group)
++        global_tokens_per_expert, global_prob_sum = fused_global.chunk(2)
++        if with_padding_mask:
++            local_num_tokens = local_tokens_per_expert.sum() / self.topk
++            total_num_tokens = global_tokens_per_expert.sum() / self.topk
++        else:
++            local_num_tokens = routing_map.shape[0]
++            total_num_tokens = local_num_tokens * reduce_group.size()
++
++        if is_global:
++            # Created lazily here rather than in __init__, where a plain attribute would have no
++            # device yet. zeros_like inherits fused_global's dtype, which is fp32 because
++            # compute_routing_scores_for_aux_loss softmaxes with dtype=torch.float32
++            # unconditionally, independent of moe_router_dtype.
++            if getattr(self, "rosenthal_global_tokens_per_expert", None) is None:
++                self.rosenthal_global_tokens_per_expert = torch.zeros_like(global_tokens_per_expert)
++                self.rosenthal_global_prob_sum = torch.zeros_like(global_prob_sum)
++                self.rosenthal_ga_steps = torch.zeros((), dtype=torch.float32, device=global_tokens_per_expert.device)
++
++            # Both accumulators are averaged over the same counter, as _apply_global_aux_loss
++            # already does for its counts. total_num_tokens stays the current micro-batch's total
++            # and is never averaged. Dividing global_prob_sum is what keeps sum_e u_glob == E once
++            # the counter exceeds 1; skipping it leaves sum_e u_glob == ga_steps*E, which
++            # rosenthal_loss's conservation assert catches loudly. A bf16 counter would also
++            # saturate at 256.0, freezing the divisor while the numerator kept growing.
++            self.rosenthal_global_tokens_per_expert += global_tokens_per_expert
++            self.rosenthal_global_prob_sum += global_prob_sum
++            self.rosenthal_ga_steps += 1
++            global_tokens_per_expert = self.rosenthal_global_tokens_per_expert / self.rosenthal_ga_steps
++            global_prob_sum = self.rosenthal_global_prob_sum / self.rosenthal_ga_steps
++
++        # Local import: keep the vendored router free of an import-time dependency on our package.
++        from moe_congestion_routing.losses.rosenthal import pressure, rosenthal_loss
++
++        prob_sum = scores_for_aux_loss.float().sum(dim=0)
++        rosenthal = rosenthal_loss(
++            prob_sum=prob_sum,
++            tokens_per_expert=global_tokens_per_expert,
++            total_num_tokens=total_num_tokens,
++            topk=self.topk,
++            num_experts=self.config.num_moe_experts,
++            coeff=rosenthal_coeff,
++            lam=self.config.moe_rosenthal_lambda,
++            variant=self.config.moe_rosenthal_variant,
++            cost_family=self.config.moe_rosenthal_cost,
++            global_prob_sum=global_prob_sum,
++        )
++        # 'hard's per-rank loss values sum to the whole-batch loss (linear in the local prob_sum),
++        # so summing across reduce_group reconstructs the right total -- pass reduce_group. 'soft's
++        # logged value is the continuized potential evaluated at global_prob_sum, already identical
++        # on every rank in the group by construction, so summing it would multiply the logged value
++        # by the group size; pass no reduce_group, exactly as rosenthal_pressure_max already does
++        # below (needs_dp_avg still averages over whatever ranks reduce_group did not cover).
++        loss_reduce_group = None if self.config.moe_rosenthal_variant == "soft" else reduce_group
++        probs = self.attach_and_log_load_balancing_loss(
++            probs,
++            rosenthal_coeff,
++            rosenthal,
++            "rosenthal_loss",
++            loss_reduce_group,
++            needs_dp_avg=not is_global,
++            valid_token_count=local_num_tokens,
++        )
++
++        with torch.no_grad():
++            pressure_vec = pressure(
++                prob_sum=prob_sum,
++                tokens_per_expert=global_tokens_per_expert,
++                total_num_tokens=total_num_tokens,
++                topk=self.topk,
++                num_experts=self.config.num_moe_experts,
++                coeff=rosenthal_coeff,
++                lam=self.config.moe_rosenthal_lambda,
++                variant=self.config.moe_rosenthal_variant,
++                cost_family=self.config.moe_rosenthal_cost,
++                global_prob_sum=global_prob_sum,
++            )
++        # pressure() reads u_glob (soft) or u_hat (hard) -- both already derived from
++        # global_tokens_per_expert / total_num_tokens, which every rank in reduce_group shares, so
++        # this value is rank-invariant within the group and must NOT be summed across it (unlike
++        # rosenthal_loss above, whose per-rank contributions from a LOCAL prob_sum need summing to
++        # reconstruct the whole-batch loss). Hence no reduce_group here, only needs_dp_avg to
++        # average over the ranks the reduce group did not already cover.
++        # NOT comparable between the 'soft' and 'hard' variant: pressure() prices the expected
++        # load under 'soft' and the realized load under 'hard', so this number differs between
++        # rosenthal_micro_soft.yaml and rosenthal_micro_hard.yaml even at identical config.
++        get_moe_metrics_tracker().record(
++            "rosenthal_pressure_max",
++            pressure_vec.max(),
++            self.layer_number,
++            self.config.num_layers,
++            needs_dp_avg=not is_global,
++        )
++        return probs
++
+     def attach_and_log_load_balancing_loss(
+         self,
+         activation: torch.Tensor,
+@@ -665,6 +816,12 @@ class TopKRouter(Router):
+                 routing_map_for_aux_loss,
+                 with_padding_mask=padding_mask is not None,
+             )
++            probs = self._apply_rosenthal_loss(
++                probs,
++                scores_for_aux_loss,
++                routing_map_for_aux_loss,
++                with_padding_mask=padding_mask is not None,
++            )
+ 
+         # Optionally apply expert bias
+         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+@@ -676,6 +833,19 @@ class TopKRouter(Router):
+         if self.global_tokens_per_expert is not None:
+             self.global_tokens_per_expert.zero_()
+             self.ga_steps.zero_()
++        # global_rosenthal's (moe_congestion_routing patch) three accumulators are a SEPARATE
++        # copy of the above, not a share of it (see _apply_rosenthal_loss), so they need their
++        # own condition rather than piggybacking on `self.global_tokens_per_expert is not None`
++        # -- a global_rosenthal-only run (no global_aux_loss) never allocates that buffer at all,
++        # and reusing its condition would silently skip this reset every global batch, pricing an
++        # ever-more-stale running average with no error. getattr(..., None) rather than a bare
++        # attribute read: the three attributes are created lazily on first use inside
++        # _apply_rosenthal_loss, so they may not exist yet the first time this runs (e.g. before
++        # the first optimizer step of a global_rosenthal run).
++        if getattr(self, "rosenthal_global_tokens_per_expert", None) is not None:
++            self.rosenthal_global_tokens_per_expert.zero_()
++            self.rosenthal_global_prob_sum.zero_()
++            self.rosenthal_ga_steps.zero_()
+ 
+     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+         """
+diff --git a/megatron/core/distributed/finalize_model_grads.py b/megatron/core/distributed/finalize_model_grads.py
+index 778d1b754..60361e738 100644
+--- a/megatron/core/distributed/finalize_model_grads.py
++++ b/megatron/core/distributed/finalize_model_grads.py
+@@ -324,6 +324,12 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
+             if (
+                 config.moe_router_load_balancing_type == "global_aux_loss"
+                 or "global_aux_loss" in config.moe_router_load_balancing_type
++                # global_rosenthal (moe_congestion_routing patch) keeps its own accumulators,
++                # separate from global_aux_loss's, so it needs this dispatch on its own merits
++                # rather than because state is shared. Omitting it prices a stale running average
++                # that drifts further from the current batch every step, with no error.
++                or config.moe_router_load_balancing_type == "global_rosenthal"
++                or "global_rosenthal" in config.moe_router_load_balancing_type
+             ) and hasattr(module, 'reset_global_aux_loss_tracker'):
+                 module.reset_global_aux_loss_tracker()
+ 
