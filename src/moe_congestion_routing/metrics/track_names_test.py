@@ -56,6 +56,7 @@ def test_moe_track_names_includes_rosenthal_names_for_both_rosenthal_types():
         names = moe_track_names(SimpleNamespace(moe_router_load_balancing_type=balancing_type))
         assert "rosenthal_loss" in names
         assert "rosenthal_pressure_max" in names
+        assert "u_glob_sum" in names
 
 
 def test_moe_track_names_excludes_rosenthal_names_for_non_rosenthal_types():
@@ -65,6 +66,11 @@ def test_moe_track_names_excludes_rosenthal_names_for_non_rosenthal_types():
         names = moe_track_names(SimpleNamespace(moe_router_load_balancing_type=balancing_type))
         assert "rosenthal_loss" not in names
         assert "rosenthal_pressure_max" not in names
+        # u_glob_sum is gated on being a rosenthal arm rather than on being a global one. At
+        # tensor_model_parallel_size == context_parallel_size == 1 a micro arm's reduce group has
+        # size 1 and the series is a flat E, but that is a fact about the config rather than the
+        # code, and the flat series is the control the global arm's is read against.
+        assert "u_glob_sum" not in names
 
 
 def test_selected_rosenthal_types_filters_and_preserves_order():

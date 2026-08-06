@@ -330,7 +330,7 @@ index 18cb5ef8a..06ed16a55 100644
                         help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
      # Token dispatcher arguments
 diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
-index 235a616df..6280710e4 100644
+index 235a616df..54a7b44ca 100644
 --- a/megatron/core/transformer/moe/router.py
 +++ b/megatron/core/transformer/moe/router.py
 @@ -26,6 +26,12 @@ from megatron.core.transformer.moe.moe_utils import (
@@ -374,7 +374,7 @@ index 235a616df..6280710e4 100644
              if self.get_aux_loss_coeff(aux_loss_type) > 0:
                  return True
          return False
-@@ -424,6 +442,139 @@ class TopKRouter(Router):
+@@ -424,6 +442,156 @@ class TopKRouter(Router):
          )
          return probs
  
@@ -509,12 +509,29 @@ index 235a616df..6280710e4 100644
 +            self.config.num_layers,
 +            needs_dp_avg=not is_global,
 +        )
++
++        # A direct readout of the reduce group, not a generic sanity number. Softmax rows sum to 1,
++        # so sum_e prob_sum_e is exactly the local token count, and total_num_tokens assumes
++        # reduce_group.size() ranks. sum_e u_glob is therefore E times the ranks the numerator
++        # covers over the ranks the denominator assumes, which is E only when the two agree and
++        # otherwise an integer ratio the misconfiguration reads off directly: at E=64, 32.0 means
++        # context parallelism was dropped and 8.0 means the all-reduce never happened.
++        # rosenthal_loss's own assert kills a grossly wrong group at step 1; logging the value also
++        # shows drift across a long run, which an assert can only turn into a mid-run crash.
++        # Rank-invariant within reduce_group, like rosenthal_pressure_max above, so no reduce_group.
++        get_moe_metrics_tracker().record(
++            "u_glob_sum",
++            self.config.num_moe_experts * global_prob_sum.sum() / total_num_tokens,
++            self.layer_number,
++            self.config.num_layers,
++            needs_dp_avg=not is_global,
++        )
 +        return probs
 +
      def attach_and_log_load_balancing_loss(
          self,
          activation: torch.Tensor,
-@@ -665,6 +816,12 @@ class TopKRouter(Router):
+@@ -665,6 +833,12 @@ class TopKRouter(Router):
                  routing_map_for_aux_loss,
                  with_padding_mask=padding_mask is not None,
              )
@@ -527,7 +544,7 @@ index 235a616df..6280710e4 100644
  
          # Optionally apply expert bias
          self._apply_expert_bias(routing_map, padding_mask=padding_mask)
-@@ -676,6 +833,19 @@ class TopKRouter(Router):
+@@ -676,6 +850,19 @@ class TopKRouter(Router):
          if self.global_tokens_per_expert is not None:
              self.global_tokens_per_expert.zero_()
              self.ga_steps.zero_()

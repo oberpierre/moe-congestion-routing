@@ -42,7 +42,7 @@ def moe_track_names(args) -> list[str]:
         *(f"phi_cong_{family}" for family in COST_FAMILIES),
     ]
     if selects_rosenthal_type(args):
-        names += ["rosenthal_loss", "rosenthal_pressure_max"]
+        names += ["rosenthal_loss", "rosenthal_pressure_max", "u_glob_sum"]
     if getattr(args, "moe_rosenthal_log_grad_ratio", False):
         names += ["rosenthal_grad_norm_task", "rosenthal_grad_norm_cg"]
     return names
