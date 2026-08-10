@@ -1,0 +1,88 @@
+# Patch: enable compatibility with Megatron v0.18+
+# ==================================
+# Problem:
+#   MegatronLMEval._initialize_megatron() calls
+#   initialize_megatron(extra_args_provider=None, args_defaults={...}). That
+#   signature predates Megatron commit 97aca2f88 ("Extract args init to launch
+#   scripts"), which removed extra_args_provider/args_defaults/
+#   ignore_unknown_args/parsed_args from initialize_megatron() and moved
+#   argument parsing (including handling --use-checkpoint-args) into a new
+#   caller-side parse_and_validate_args(). Our vendored Megatron-LM post-dates
+#   that refactor, so the harness's call raises
+#   `TypeError: initialize_megatron() got an unexpected keyword argument
+#   'extra_args_provider'` before a single checkpoint tensor loads. This is
+#   unreachable from any --model_args flag: it is inside the harness's own
+#   call, and there is exactly one such call site in the harness.
+#
+# What this patch does:
+#   Makes the two-step form (parse_and_validate_args() then a bare
+#   initialize_megatron()) the path taken when the installed Megatron exposes
+#   parse_and_validate_args, and keeps the original single call as a fallback
+#   when it does not for backwards compatibility with older Megatron versions.
+#
+#   Detection is by import rather than by megatron.core.__version__, and the
+#   hunk body says why in short form. At length: VERIFIED on this submodule
+#   that 97aca2f88 and its parent BOTH report 0.18.0 (megatron/core/
+#   package_info.py, MAJOR=0 MINOR=18 PATCH=0 on each), i.e. the refactor
+#   landed mid-0.18 development rather than at the 0.17->0.18 boundary. Two
+#   checkouts reporting the same version therefore differ in the API, so a
+#   version comparison cannot express this boundary and the import can.
+#
+# Where in the code:
+#   File: lm_eval/models/megatron_lm.py
+#   Function: _initialize_megatron()
+#   Location: below other megatron imports for the guarded import, and
+#   after Initialize Megatron comment at the start of existing try block
+#
+# How to fix if this patch breaks on a future harness version:
+#   Search for `_initialize_megatron` in lm_eval/models/megatron_lm.py. Find
+#   the `initialize_megatron(extra_args_provider=..., args_defaults=...)` call
+#   and re-apply the same guarded-import-and-branch shape around it.
+#
+# Applied to: lm-evaluation-harness v0.4.12
+#
+diff --git a/lm_eval/models/megatron_lm.py b/lm_eval/models/megatron_lm.py
+index 6f9a0402..8d7bff90 100644
+--- a/lm_eval/models/megatron_lm.py
++++ b/lm_eval/models/megatron_lm.py
+@@ -322,6 +322,14 @@ class MegatronLMEval(LM):
+         from megatron.training.arguments import core_transformer_config_from_args
+         from megatron.training.checkpointing import load_checkpoint
+ 
++        # Megatron moved argument parsing out of initialize_megatron() in
++        # core_v0.18. Detecting by import, not by version, because the refactor
++        # is not split by version number (commits both report version 0.18.0).
++        try:
++            from megatron.training.arguments import parse_and_validate_args
++        except ImportError:
++            parse_and_validate_args = None
++
+         devices = kwargs["devices"]
+         tp_size = kwargs["tensor_model_parallel_size"]
+         pp_size = kwargs["pipeline_model_parallel_size"]
+@@ -401,10 +409,21 @@ class MegatronLMEval(LM):
+ 
+         try:
+             # Initialize Megatron
+-            initialize_megatron(
+-                extra_args_provider=None,
+-                args_defaults={"tokenizer_type": kwargs["tokenizer_type"]},
+-            )
++            # parse_and_validate_args() must run first as it populates the global
++            # args, including --use-checkpoint-args, that initialize_megatron()
++            # then reads using get_args(). Previous Megatron parses args inside
++            # the initialize call instead.
++            if parse_and_validate_args is not None:
++                parse_and_validate_args(
++                    extra_args_provider=None,
++                    args_defaults={"tokenizer_type": kwargs["tokenizer_type"]},
++                )
++                initialize_megatron()
++            else:
++                initialize_megatron(
++                    extra_args_provider=None,
++                    args_defaults={"tokenizer_type": kwargs["tokenizer_type"]},
++                )
+ 
+             args = get_args()
+             self._args = args
