@@ -56,13 +56,10 @@ def _ensure_hf_home() -> Path:
     return path
 
 
-def _task_dataset_ids(tasks: list[str]) -> dict[str, tuple[str, str | None]]:
+def _task_dataset_ids(tm, tasks: list[str]) -> dict[str, tuple[str, str | None]]:
     """{task_name: (dataset_path, dataset_name)}, resolved through the harness's own
     TaskManager (which follows each task yaml's `include:` chain, e.g. arc_challenge.yaml
     includes arc_easy.yaml) rather than by reading the yaml files by hand."""
-    from lm_eval.tasks.manager import TaskManager
-
-    tm = TaskManager()
     ids: dict[str, tuple[str, str | None]] = {}
     for name in tasks:
         entry = tm.task_index.get(name)
@@ -84,27 +81,31 @@ def main() -> None:
 
     hf_home = _ensure_hf_home()
     tasks = _tasks()
-    dataset_ids = _task_dataset_ids(tasks)
 
     print(f"HF_HOME={hf_home}")
-    print("tasks:")
+    print(f"tasks: {', '.join(tasks)}")
+    print(f"tokenizer: {FLAME_TOKENIZER}")
+    print("indexing the harness task registry (>13000 task files)...", flush=True)
+
+    from lm_eval.tasks.manager import TaskManager
+
+    tm = TaskManager()
+    dataset_ids = _task_dataset_ids(tm, tasks)
     for name, (dataset_path, dataset_name) in dataset_ids.items():
         suffix = f" ({dataset_name})" if dataset_name else ""
         print(f"  {name}: {dataset_path}{suffix}")
-    print(f"tokenizer: {FLAME_TOKENIZER}")
 
     if args.dry_run:
         print("--dry-run: fetched nothing")
         return
 
-    from lm_eval.tasks.manager import TaskManager
     from transformers import AutoTokenizer
 
-    print("fetching task datasets...")
+    print("fetching task datasets...", flush=True)
     # Building a ConfigurableTask calls its own .download() eagerly (lm_eval/api/task.py), so
-    # this is the exact call the harness itself makes at eval time -- not a reimplementation of
+    # this is the exact call the harness itself makes at eval time, not a reimplementation of
     # it. datasets.load_dataset() is itself cache-aware, so rerunning this is a no-op.
-    TaskManager().load(tasks)
+    tm.load(tasks)
 
     print(f"fetching tokenizer {FLAME_TOKENIZER}...")
     AutoTokenizer.from_pretrained(FLAME_TOKENIZER)

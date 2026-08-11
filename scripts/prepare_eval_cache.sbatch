@@ -57,6 +57,9 @@ srun --nodes=1 --ntasks=1 --environment=alps6 --cpus-per-task "$SLURM_CPUS_PER_T
   cd $WORKDIR
   set +u; source .venv/bin/activate; set -u
 
+  # Unbuffered: stdout here is a redirected log file, not a terminal, so Python block-buffers it
+  # and a job that is working looks like a job that has hung. Children inherit the variable.
+  export PYTHONUNBUFFERED=1
   python scripts/prepare_eval_cache.py
 
   echo \"=== done | \$(date) ===\"
