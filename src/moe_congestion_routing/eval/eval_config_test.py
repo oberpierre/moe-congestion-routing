@@ -7,6 +7,7 @@ from moe_congestion_routing.eval.eval_config import (
     EvalConfig,
     build_lm_eval_args,
     eval_output_dir,
+    eval_run_dir,
 )
 
 
@@ -41,11 +42,10 @@ def _flag(args: list[str], name: str) -> str | None:
 
 def test_from_yaml_roundtrip(tmp_path):
     path = tmp_path / "run.yaml"
-    path.write_text("ckpt_step: 40\ntasks: [arc_easy]\nnum_fewshot: 0\n")
+    path.write_text("ckpt_step: 40\ntasks: [arc_easy]\n")
     cfg = EvalConfig.from_yaml(path)
     assert cfg.ckpt_step == 40
     assert cfg.tasks == ["arc_easy"]
-    assert cfg.num_fewshot == 0
     assert cfg.tokenizer_type == "HuggingFaceTokenizer"  # default preserved
     assert cfg.tokenizer_model == "assets/tokenizer/gpt2"  # default preserved
 
@@ -57,11 +57,25 @@ def test_from_yaml_rejects_unknown_key(tmp_path):
         EvalConfig.from_yaml(path)
 
 
-def test_from_yaml_requires_ckpt_step(tmp_path):
+def test_from_yaml_rejects_num_fewshot_key(tmp_path):
+    # num_fewshot moved to lm-eval's own task/group configs -- a config still setting it here
+    # is stale rather than silently accepted, because --num_fewshot would overwrite every task's
+    # own split.
     path = tmp_path / "run.yaml"
-    path.write_text("tasks: [arc_easy]\n")
+    path.write_text("ckpt_step: 20\nnum_fewshot: 0\n")
     with pytest.raises(TypeError):
         EvalConfig.from_yaml(path)
+
+
+def test_from_yaml_allows_missing_ckpt_step_and_load(tmp_path):
+    # A config need not name a checkpoint at all: scripts/run_lm_eval.py's --load/--ckpt-step
+    # can supply both later. require_launch_ready, not from_yaml, is what enforces they arrive
+    # from somewhere before a run launches.
+    path = tmp_path / "run.yaml"
+    path.write_text("tasks: [arc_easy]\n")
+    cfg = EvalConfig.from_yaml(path)
+    assert cfg.ckpt_step is None
+    assert cfg.load is None
 
 
 def test_from_yaml_extends_merges_base_with_override(tmp_path):
@@ -122,21 +136,51 @@ def test_load_omitted_from_model_args_when_unset():
 
 
 def test_absent_optional_top_level_flags_are_omitted_not_emitted_empty():
-    cfg = _cfg(tasks=[], num_fewshot=None, batch_size=None, limit=None)
+    cfg = _cfg(tasks=[], batch_size=None, limit=None)
     args = build_lm_eval_args(cfg)
     assert "--tasks" not in args
-    assert "--num_fewshot" not in args
     assert "--batch_size" not in args
     assert "--limit" not in args
 
 
 def test_top_level_flags_emitted_when_set():
-    cfg = _cfg(tasks=["arc_easy", "piqa"], num_fewshot=10, batch_size=16, limit=50)
+    cfg = _cfg(tasks=["arc_easy", "piqa"], batch_size=16, limit=50)
     args = build_lm_eval_args(cfg)
     assert _flag(args, "--tasks") == "arc_easy,piqa"
-    assert _flag(args, "--num_fewshot") == "10"
     assert _flag(args, "--batch_size") == "16"
     assert _flag(args, "--limit") == "50"
+
+
+def test_include_path_flag_always_emitted_with_its_default():
+    # Without --include_path the harness never looks outside its own built-in task registry, so
+    # tasks: [flame_suite] fails with "task not found". Should always be emitted.
+    cfg = _cfg(tasks=["arc_easy"])
+    args = build_lm_eval_args(cfg)
+    assert _flag(args, "--include_path") == "configs/eval/tasks"
+
+
+def test_include_path_override_reaches_the_flag():
+    cfg = _cfg(include_path="/custom/tasks")
+    args = build_lm_eval_args(cfg)
+    assert _flag(args, "--include_path") == "/custom/tasks"
+
+
+def test_ckpt_step_omitted_from_model_args_when_unset(monkeypatch):
+    import moe_congestion_routing.eval.eval_config as eval_config_module
+
+    monkeypatch.setattr(eval_config_module, "eval_output_dir", lambda cfg: Path("/unused"))
+    cfg = EvalConfig(ckpt_step=None, load="/ckpt/dir")
+    model_args = _model_args(build_lm_eval_args(cfg))
+    assert "ckpt_step" not in model_args
+
+
+def test_num_fewshot_flag_never_emitted():
+    # num_fewshot is not an EvalConfig field at all: passing --num_fewshot would overwrite every
+    # task's own split, so the launcher must never be able to emit it regardless of what a
+    # config sets on other fields.
+    cfg = _cfg(tasks=["arc_easy"])
+    args = build_lm_eval_args(cfg)
+    assert "--num_fewshot" not in args
 
 
 def test_both_seeds_reach_the_seed_flag():
@@ -189,14 +233,29 @@ def test_output_path_derives_from_the_checkpoint_run_dir(tmp_path):
     assert _flag(build_lm_eval_args(cfg), "--output_path") == str(path)
 
 
-def test_output_dir_override_skips_the_evals_subdir(tmp_path):
+def test_output_dir_override_still_gets_the_evals_subdir(tmp_path):
+    # An override IS the run directory directly (one level shallower than the derived case,
+    # which has a <run_tag> to nest under), but the tail below it is identical either way.
+    # The glob in results.py has to find both.
     cfg = _cfg(
         ckpt_step=5473,
         load=str(tmp_path / "some" / "checkpoints"),
         output_dir=str(tmp_path / "flame"),
     )
     path = eval_output_dir(cfg)
-    assert path == tmp_path / "flame" / "iter_0005473"
+    assert path == tmp_path / "flame" / "evals" / "iter_0005473"
+
+
+def test_eval_run_dir_derives_from_the_checkpoint_when_no_override(tmp_path):
+    checkpoints = tmp_path / "run" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    cfg = _cfg(ckpt_step=20, load=str(checkpoints))
+    assert eval_run_dir(cfg) == tmp_path / "run"
+
+
+def test_eval_run_dir_is_the_override_itself(tmp_path):
+    cfg = _cfg(ckpt_step=5473, output_dir=str(tmp_path / "flame"))
+    assert eval_run_dir(cfg) == tmp_path / "flame"
 
 
 # --- resolved() ----------------------------------------------------------------------------
@@ -229,7 +288,43 @@ def test_resolved_expands_env_vars_in_load(tmp_path, monkeypatch):
     assert resolved.load == str(tmp_path / "store" / "run" / "checkpoints")
 
 
+# --- require_launch_ready --------------------------------------------------------------------
+
+
+def test_require_launch_ready_passes_when_both_set():
+    cfg = _cfg(ckpt_step=20, load="/ckpt/dir")
+    cfg.require_launch_ready()  # must not raise
+
+
+def test_require_launch_ready_raises_naming_load_when_only_ckpt_step_missing():
+    cfg = EvalConfig(ckpt_step=None, load="/ckpt/dir")
+    with pytest.raises(ValueError, match="ckpt_step"):
+        cfg.require_launch_ready()
+
+
+def test_require_launch_ready_raises_naming_ckpt_step_when_only_load_missing():
+    cfg = EvalConfig(ckpt_step=20, load=None)
+    with pytest.raises(ValueError, match="load"):
+        cfg.require_launch_ready()
+
+
+def test_require_launch_ready_names_both_config_key_and_flag_for_each_missing_field():
+    # A config supplying neither, launched with neither, must name both ways to supply each.
+    cfg = EvalConfig(ckpt_step=None, load=None)
+    with pytest.raises(ValueError) as excinfo:
+        cfg.require_launch_ready()
+    message = str(excinfo.value)
+    assert "load" in message and "--load" in message
+    assert "ckpt_step" in message and "--ckpt-step" in message
+
+
 def test_resolved_absolutises_output_dir_override(tmp_path):
     cfg = _cfg(output_dir="artifacts/eval/flame_290m")
     resolved = cfg.resolved(tmp_path)
     assert resolved.output_dir == str(tmp_path / "artifacts" / "eval" / "flame_290m")
+
+
+def test_resolved_absolutises_include_path():
+    cfg = _cfg()
+    resolved = cfg.resolved(Path("/repo"))
+    assert resolved.include_path == "/repo/configs/eval/tasks"

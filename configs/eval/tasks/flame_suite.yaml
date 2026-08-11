@@ -1,0 +1,15 @@
+group: flame_suite
+task:
+  - task: openbookqa
+  - task: winogrande
+  - task: wikitext
+  - task: piqa
+    num_fewshot: 10
+  - task: arc_easy
+    num_fewshot: 10
+  - task: arc_challenge
+    num_fewshot: 10
+  - task: hellaswag
+    num_fewshot: 10
+metadata:
+  version: 0.0

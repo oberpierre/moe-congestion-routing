@@ -8,8 +8,10 @@ Reads an eval-config yaml, builds the harness CLI arg list, and execs
 mirrors.
 
 Usage:
-    uv run python scripts/run_lm_eval.py --config configs/eval/ours.yaml
-    uv run python scripts/run_lm_eval.py --config configs/eval/ours.yaml --dry-run
+    uv run python scripts/run_lm_eval.py --config configs/eval/arc_easy.yaml \
+        --load artifacts/e1_local/20260804-180522/checkpoints --ckpt-step 100
+    uv run python scripts/run_lm_eval.py --config configs/eval/arc_easy.yaml \
+        --load <run>/checkpoints --ckpt-step 100 --dry-run
 """
 
 import argparse
@@ -17,12 +19,18 @@ import os
 import shlex
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 import yaml
 
-from moe_congestion_routing.eval.eval_config import EvalConfig, build_lm_eval_args, eval_output_dir
+from moe_congestion_routing.eval.eval_config import (
+    EvalConfig,
+    build_lm_eval_args,
+    eval_output_dir,
+    eval_run_dir,
+)
 from moe_congestion_routing.training.megatron_path import megatron_root, torch_cuda_lib_dirs
 
 
@@ -47,6 +55,20 @@ def _git(*args: str, cwd: Path) -> str | None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="path to an EvalConfig yaml file")
+    parser.add_argument(
+        "--load",
+        default=None,
+        help="checkpoints DIR to evaluate, e.g. artifacts/<run>/checkpoints. Overrides the "
+        "config's load, so one committed config can be pointed at any arm/checkpoint from the "
+        "command line instead of needing a file per pair.",
+    )
+    parser.add_argument(
+        "--ckpt-step",
+        type=int,
+        default=None,
+        help="checkpoint iteration to load, and to name the output directory after "
+        "(evals/iter_{step:07d}). Overrides the config's ckpt_step.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the command and exit")
     args = parser.parse_args()
 
@@ -54,9 +76,18 @@ def main() -> None:
     repo_root = megatron_dir.parent
     harness_dir = _harness_root(repo_root)
 
-    cfg = EvalConfig.from_yaml(args.config).resolved(repo_root)
+    cfg = EvalConfig.from_yaml(args.config)
+    # An --load off the command line has not been through expand_path yet, so we apply the override
+    # before resolved() so both sources get the identical ${VAR}/~ expansion.
+    if args.load is not None:
+        cfg = replace(cfg, load=args.load)
+    if args.ckpt_step is not None:
+        cfg = replace(cfg, ckpt_step=args.ckpt_step)
+    cfg = cfg.resolved(repo_root)
+    # Require `load`/`ckpt_step` to be configured either via CLI or config
+    cfg.require_launch_ready()
 
-    run_dir = eval_output_dir(cfg)
+    results_dir = eval_output_dir(cfg)
     cmd = [
         sys.executable,
         "-m",
@@ -79,24 +110,34 @@ def main() -> None:
         print(shlex.join(cmd))
         return
 
-    run_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
 
     # Provenance: append the exact command, like run_moe_pretrain.py's launch_command.txt.
-    with open(run_dir / "eval_command.txt", "a") as f:
+    with open(results_dir / "eval_command.txt", "a") as f:
         f.write(f"# {datetime.now():%Y-%m-%d %H:%M:%S}\n{shlex.join(cmd)}\n\n")
 
+    # The run directory results.py's arm field is computed from either the config's output_dir
+    # (if it was explicitly overridden) or from the derived run directory. The latter is the
+    # normal case, where the run directory is nested under a per-launch <run_tag> (e.g.
+    # artifacts/exp1/switch/<run_tag>/...).
+    run_dir = eval_run_dir(cfg)
+    arm = run_dir.name if cfg.output_dir is not None else run_dir.parent.name
+
     # A results file next to no record of what produced it is a number nobody can defend later:
-    # the harness submodule's own version, both RNG seeds, the task set and the checkpoint
-    # iteration this run resolved to.
+    # the harness submodule's own version, both RNG seeds, the task set, which checkpoint this
+    # run scored, and which arm it belongs to.
     snapshot = {
         "harness_tag": _git("describe", "--tags", "--exact-match", cwd=harness_dir),
         "harness_sha": _git("rev-parse", "HEAD", cwd=harness_dir),
         "seed": cfg.seed,
         "fewshot_seed": cfg.fewshot_seed,
         "tasks": cfg.tasks,
+        "load": cfg.load,
+        "run_dir": str(run_dir),
         "ckpt_step": cfg.ckpt_step,
+        "arm": arm,
     }
-    with open(run_dir / "config_snapshot.yaml", "w") as f:
+    with open(results_dir / "config_snapshot.yaml", "w") as f:
         yaml.safe_dump(snapshot, f, sort_keys=False)
 
     # -m lm_eval imports megatron.core (via the harness's own MEGATRON_PATH lookup) in the

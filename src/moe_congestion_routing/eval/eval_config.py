@@ -70,14 +70,13 @@ class EvalConfig:
     """Everything needed to launch one lm-evaluation-harness run against a Megatron checkpoint,
     loadable from a yaml file."""
 
-    ckpt_step: int
+    ckpt_step: int | None = None
     """Checkpoint iteration to load, and to name the output directory after
-    (``evals/iter_{step:07d}``). Required, with no default."""
+    (``evals/iter_{step:07d}``). Required at launch via config field or CLI arg override."""
 
     load: str | None = None
     """Checkpoint DIRECTORY to evaluate (a ``<run>/checkpoints`` dir, same semantics as
-    training's ``load``). Required at launch; kept optional here only so an unrelated config
-    error (e.g. a bad task name) is not masked by a missing-load error first."""
+    training's ``load``). Required at launch via config field or CLI arg override."""
 
     tokenizer_type: str = "HuggingFaceTokenizer"
     """Real tokenizer for evaluating our own checkpoints, NEVER NullTokenizer, which has no
@@ -99,10 +98,6 @@ class EvalConfig:
     batch_size: int | None = None
     """lm-eval's own batching (documents per batch). Independent of micro_batch_size."""
 
-    num_fewshot: int | None = None
-    """Few-shot example count. ``None`` leaves the harness's per-task default. A real run should
-    set this explicitly per the task's fixed split."""
-
     tasks: list[str] = field(default_factory=list)
     """Task names to evaluate, e.g. ``["arc_easy"]``. Which tasks belong to the suite is a
     decision this config does not make. A config just names the ones it runs."""
@@ -120,11 +115,15 @@ class EvalConfig:
     Sanity probes and smoke runs set this. Should not be set for a real score."""
 
     output_dir: str | None = None
-    """Explicit override for where results land, given as the run directory
-    (``<output_dir>/iter_{step:07d}``). ``None`` (the normal case) derives the path from the
-    checkpoint's own run directory instead, see ``eval_output_dir``. Needed for a checkpoint
-    this repo did not produce (no run directory of ours to nest under) or one moved to read-only
-    storage, where the derived path would not be writable."""
+    """Explicit override for the run directory results nest under\
+    (``<output_dir>/evals/iter_{step:07d}``). ``None`` derives the run directory from the
+    checkpoint's own instead. Needed for a checkpoint this repo did not produce, e.g. FLAME-MoE's"""
+
+    include_path: str = "configs/eval/tasks"
+    """Directory lm-eval searches for extra task/group yaml files beyond its own built-in
+    registry, e.g. ``configs/eval/tasks/flame_suite.yaml``. Without ``--include_path`` pointed
+    here, ``tasks: [flame_suite]`` fails with "task not found" because the harness never looks
+    outside its own registry on its own."""
 
     extra_args: str = ""
     """Additional Megatron CLI flags, space-separated, forwarded through the harness's own
@@ -157,26 +156,49 @@ class EvalConfig:
             load=absolutise(self.load) if self.load else None,
             tokenizer_model=absolutise(self.tokenizer_model),
             output_dir=absolutise(self.output_dir) if self.output_dir else None,
+            include_path=absolutise(self.include_path),
         )
+
+    def require_launch_ready(self) -> None:
+        """Raise if ``load`` or ``ckpt_step`` is still unset.
+
+        Both are optional on ``EvalConfig`` itself so one committed config can be reused across
+        checkpoints from the command line (``scripts/run_lm_eval.py``'s ``--load``/``--ckpt-step``)
+        instead of needing one config file per checkpoint. But they are required to load a model
+        and launch an evaluation, so this method requires them to be set before building the
+        command line.
+        """
+        missing = []
+        if self.load is None:
+            missing.append("`load` (set it in the config, or pass --load)")
+        if self.ckpt_step is None:
+            missing.append("`ckpt_step` (set it in the config, or pass --ckpt-step)")
+        if missing:
+            raise ValueError("eval config is missing required field(s): " + "; ".join(missing))
+
+
+def eval_run_dir(cfg: EvalConfig) -> Path:
+    """The run directory this evaluation's results nest under, one level above ``evals/``.
+
+    Normally the checkpoint's own run directory: ``resolve_run_dir(..., load=cfg.load)``, reused
+    (imported from ``training.pretrain_config``) rather than re-deriving the
+    parent-of-checkpoints relationship a second time, so the two stay in sync by construction.
+
+    An explicit ``cfg.output_dir`` overrides this and IS the run directory directly, since an
+    externally-produced checkpoint (e.g. FLAME-MoE's) has no per-checkpoint run directory to nest
+    an ``evals/`` tail under.
+    """
+    if cfg.output_dir is not None:
+        return Path(cfg.output_dir)
+    # The first positional argument is unused whenever `load` is given (resolve_run_dir returns
+    # the load path's own parent in that case), which is always true for a real eval run.
+    return resolve_run_dir(cfg.output_dir or ".", load=cfg.load)
 
 
 def eval_output_dir(cfg: EvalConfig) -> Path:
-    """Where this evaluation's results and provenance land.
-
-    Normally the checkpoint's own run directory, mirroring ``checkpoints/`` with ``evals/``:
-    ``resolve_run_dir(..., load=cfg.load) / "evals" / f"iter_{cfg.ckpt_step:07d}"``. Reuses
-    ``resolve_run_dir`` (imported from ``training.pretrain_config``) rather than re-deriving the
-    parent-of-checkpoints relationship a second time, so the two stay in sync by construction.
-
-    An explicit ``cfg.output_dir`` overrides this, giving ``<output_dir>/iter_{step:07d}``
-    directly. E.g. for a checkpoint this repo did not produce like the FLAME-MoE checkpoints.
-    """
-    step_dir = f"iter_{cfg.ckpt_step:07d}"
-    if cfg.output_dir is not None:
-        return Path(cfg.output_dir) / step_dir
-    # The first positional argument is unused whenever `load` is given (resolve_run_dir returns
-    # the load path's own parent in that case), which is always true for a real eval run.
-    return resolve_run_dir(cfg.output_dir or ".", load=cfg.load) / "evals" / step_dir
+    """Where this evaluation's results land: ``eval_run_dir(cfg) / "evals" /
+    f"iter_{cfg.ckpt_step:07d}"``, mirroring ``checkpoints/`` with ``evals/``."""
+    return eval_run_dir(cfg) / "evals" / f"iter_{cfg.ckpt_step:07d}"
 
 
 def build_lm_eval_args(cfg: EvalConfig) -> list[str]:
@@ -184,7 +206,8 @@ def build_lm_eval_args(cfg: EvalConfig) -> list[str]:
     model_args_parts = []
     if cfg.load is not None:
         model_args_parts.append(f"load={cfg.load}")
-    model_args_parts.append(f"ckpt_step={cfg.ckpt_step}")
+    if cfg.ckpt_step is not None:
+        model_args_parts.append(f"ckpt_step={cfg.ckpt_step}")
     model_args_parts.append(f"tokenizer_type={cfg.tokenizer_type}")
     model_args_parts.append(f"tokenizer_model={cfg.tokenizer_model}")
     if cfg.seq_length is not None:
@@ -203,10 +226,12 @@ def build_lm_eval_args(cfg: EvalConfig) -> list[str]:
         "--model_args",
         ",".join(model_args_parts),
     ]
+    # Always emitted, not guarded like the optional flags below: a config naming only built-in
+    # tasks is unaffected by pointing the harness at one extra directory, while a config naming
+    # a group config (e.g. flame_suite) fails with "task not found" without this.
+    args += ["--include_path", cfg.include_path]
     if cfg.tasks:
         args += ["--tasks", ",".join(cfg.tasks)]
-    if cfg.num_fewshot is not None:
-        args += ["--num_fewshot", str(cfg.num_fewshot)]
     if cfg.batch_size is not None:
         args += ["--batch_size", str(cfg.batch_size)]
     if cfg.limit is not None:
