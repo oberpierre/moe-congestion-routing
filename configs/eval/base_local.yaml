@@ -1,0 +1,10 @@
+# Shared local-scale eval settings seq_length is not restored from the checkpoint, so this is only
+# correct for a local (1024 seq_length) checkpoint; a cluster-scale suite needs its own base.
+# seed/fewshot_seed must be identical across arms for a paired comparison.
+seq_length: 1024
+micro_batch_size: 8
+batch_size: 16
+limit: 5
+
+seed: 42
+fewshot_seed: 42

@@ -7,6 +7,10 @@ Reads an eval-config yaml, builds the harness CLI arg list, and execs
 ``run_moe_pretrain.py`` builds the equivalent preamble for training and is the reference this
 mirrors.
 
+A config describes the experiment; the command line says which checkpoint to score. So
+--load and --ckpt-step are not optional extras, they are how a config is aimed -- omitting
+both fails loudly rather than falling back to some previously-named checkpoint.
+
 Usage:
     uv run python scripts/run_lm_eval.py --config configs/eval/arc_easy.yaml \
         --load artifacts/e1_local/20260804-180522/checkpoints --ckpt-step 100
@@ -27,7 +31,7 @@ import yaml
 
 from moe_congestion_routing.eval.eval_config import (
     EvalConfig,
-    build_lm_eval_args,
+    build_launch_command,
     eval_arm,
     eval_output_dir,
     eval_run_dir,
@@ -70,6 +74,7 @@ def main() -> None:
         help="checkpoint iteration to load, and to name the output directory after "
         "(evals/iter_{step:07d}). Overrides the config's ckpt_step.",
     )
+    parser.add_argument("--nproc", type=int, default=1, help="processes (GPUs) per node")
     parser.add_argument("--dry-run", action="store_true", help="print the command and exit")
     args = parser.parse_args()
 
@@ -89,17 +94,7 @@ def main() -> None:
     cfg.require_launch_ready()
 
     results_dir = eval_output_dir(cfg)
-    cmd = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc-per-node",
-        "1",
-        "-m",
-        "lm_eval",
-        *build_lm_eval_args(cfg),
-    ]
+    cmd = build_launch_command(cfg, nproc=args.nproc)
 
     # shlex.join, not " ".join: --model_args' value carries extra_args' own space-separated
     # flag list (e.g. "...,extra_args=--no-use-tokenizer-model-from-checkpoint-args
@@ -132,6 +127,9 @@ def main() -> None:
         "run_dir": str(run_dir),
         "ckpt_step": cfg.ckpt_step,
         "arm": eval_arm(cfg),
+        # Not an EvalConfig field: the device count is deployment and doesn't influence the results.
+        # Still kept to record what actually ran.
+        "devices": args.nproc,
     }
 
     # lm-eval writes each run's results into <results_dir>/<args-hash>/results_<timestamp>.json.

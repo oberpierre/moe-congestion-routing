@@ -5,6 +5,7 @@ import pytest
 
 from moe_congestion_routing.eval.eval_config import (
     EvalConfig,
+    build_launch_command,
     build_lm_eval_args,
     eval_arm,
     eval_output_dir,
@@ -257,6 +258,53 @@ def test_eval_run_dir_derives_from_the_checkpoint_when_no_override(tmp_path):
 def test_eval_run_dir_is_the_override_itself(tmp_path):
     cfg = _cfg(ckpt_step=5473, output_dir=str(tmp_path / "flame"))
     assert eval_run_dir(cfg) == tmp_path / "flame"
+
+
+# --- build_launch_command: nproc and devices move together ------------------------------------
+
+
+@pytest.mark.parametrize("nproc", [1, 2, 4])
+def test_nproc_per_node_and_devices_move_together(nproc):
+    # The spec's actual point: a test that checked only one of these would pass even if the two
+    # went out of sync, since --nproc-per-node and devices= are set from two different places in
+    # a command built by hand. Asserting both from one `nproc` catches that they cannot drift.
+    cmd = build_launch_command(_cfg(), nproc=nproc)
+    assert _flag(cmd, "--nproc-per-node") == str(nproc)
+    assert _model_args(cmd)["devices"] == str(nproc)
+
+
+def test_build_launch_command_default_nproc_is_one():
+    cmd = build_launch_command(_cfg())
+    assert _flag(cmd, "--nproc-per-node") == "1"
+    assert _model_args(cmd)["devices"] == "1"
+
+
+def test_build_launch_command_runs_lm_eval_as_a_module_via_torch_distributed_run():
+    cmd = build_launch_command(_cfg(), nproc=4)
+    assert cmd[1:4] == ["-m", "torch.distributed.run", "--standalone"]
+    assert "lm_eval" in cmd
+    assert cmd[cmd.index("lm_eval") - 1] == "-m"
+
+
+def test_build_launch_command_carries_the_rest_of_build_lm_eval_args():
+    # devices= is the only thing build_launch_command adds; everything else (checkpoint,
+    # tokenizer, tasks, seeds, output path) must still reach the command the same way
+    # build_lm_eval_args produces it on its own.
+    cfg = _cfg(tasks=["arc_easy"], seed=42, fewshot_seed=7)
+    cmd = build_launch_command(cfg, nproc=2)
+    model_args = _model_args(cmd)
+    assert model_args["load"] == cfg.load
+    assert model_args["ckpt_step"] == str(cfg.ckpt_step)
+    assert _flag(cmd, "--tasks") == "arc_easy"
+    assert _flag(cmd, "--seed") == "42,42,42,7"
+
+
+def test_build_lm_eval_args_never_emits_devices():
+    # devices is not an EvalConfig field, so the plain (non-launch) arg builder must never emit
+    # it even though it shares the same underlying key=value construction as
+    # build_launch_command.
+    model_args = _model_args(build_lm_eval_args(_cfg()))
+    assert "devices" not in model_args
 
 
 # --- eval_arm --------------------------------------------------------------------------------

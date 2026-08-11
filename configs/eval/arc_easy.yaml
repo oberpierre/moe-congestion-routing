@@ -1,9 +1,6 @@
-seq_length: 1024
-micro_batch_size: 8
-batch_size: 16
+# The cheap probe: one task, 50 examples, 0-shot. Which checkpoint to score comes from
+# --load and --ckpt-step.
+extends: base_local.yaml
 
 tasks: [arc_easy]
 limit: 50
-
-seed: 42
-fewshot_seed: 42

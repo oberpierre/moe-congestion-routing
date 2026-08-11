@@ -2,6 +2,7 @@
 backend (``lm_eval/models/megatron_lm.py``).
 """
 
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -219,13 +220,20 @@ def eval_arm(cfg: EvalConfig) -> str | None:
     return run_dir.parent.name
 
 
-def build_lm_eval_args(cfg: EvalConfig) -> list[str]:
-    """Map the config to the lm-evaluation-harness CLI arg list (pure)."""
+def _model_args_parts(cfg: EvalConfig, devices: int | None) -> list[str]:
+    """Build the comma-joined ``--model_args`` key=value parts, shared by ``build_lm_eval_args``
+    and ``build_launch_command`` so the two never drift apart on how a value gets rendered.
+
+    ``devices`` is the backend's own parallelism key (``lm_eval/models/megatron_lm.py``), not an
+    ``EvalConfig`` field. ``None`` omits it, which is what ``build_lm_eval_args`` needs.
+    """
     model_args_parts = []
     if cfg.load is not None:
         model_args_parts.append(f"load={cfg.load}")
     if cfg.ckpt_step is not None:
         model_args_parts.append(f"ckpt_step={cfg.ckpt_step}")
+    if devices is not None:
+        model_args_parts.append(f"devices={devices}")
     model_args_parts.append(f"tokenizer_type={cfg.tokenizer_type}")
     model_args_parts.append(f"tokenizer_model={cfg.tokenizer_model}")
     if cfg.seq_length is not None:
@@ -237,12 +245,16 @@ def build_lm_eval_args(cfg: EvalConfig) -> list[str]:
     # commas first, and a flag list has none, so nothing here can be mistaken for a further key.
     extra = " ".join(part for part in (cfg.extra_args, *_MANDATORY_EXTRA_ARGS) if part)
     model_args_parts.append(f"extra_args={extra}")
+    return model_args_parts
 
+
+def _lm_eval_args(cfg: EvalConfig, devices: int | None) -> list[str]:
+    """The lm-evaluation-harness CLI arg list (pure)"""
     args = [
         "--model",
         "megatron_lm",
         "--model_args",
-        ",".join(model_args_parts),
+        ",".join(_model_args_parts(cfg, devices=devices)),
     ]
     # Always emitted, not guarded like the optional flags below: a config naming only built-in
     # tasks is unaffected by pointing the harness at one extra directory, while a config naming
@@ -261,3 +273,28 @@ def build_lm_eval_args(cfg: EvalConfig) -> list[str]:
     args += ["--seed", f"{cfg.seed},{cfg.seed},{cfg.seed},{cfg.fewshot_seed}"]
     args += ["--output_path", str(eval_output_dir(cfg))]
     return args
+
+
+def build_lm_eval_args(cfg: EvalConfig) -> list[str]:
+    """Map the config to the lm-evaluation-harness CLI arg list (pure)."""
+    return _lm_eval_args(cfg, devices=None)
+
+
+def build_launch_command(cfg: EvalConfig, nproc: int = 1) -> list[str]:
+    """Full torch-elastic launch command that scores one checkpoint data-parallel across
+    ``nproc`` GPUs on one node.
+
+    ``--nproc-per-node`` and the backend's own ``devices`` must be in sync and are therefore derived
+    from ``nproc``.
+    """
+    return [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node",
+        str(nproc),
+        "-m",
+        "lm_eval",
+        *_lm_eval_args(cfg, devices=nproc),
+    ]

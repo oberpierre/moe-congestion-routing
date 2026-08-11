@@ -1,0 +1,8 @@
+# Shared eval settings seq_length is not restored from the checkpoint, so this is only correct
+# for 2048 seq_length checkpoints.
+# seed/fewshot_seed must be identical across arms for a paired comparison.
+seq_length: 2048
+micro_batch_size: 32
+
+seed: 42
+fewshot_seed: 42
