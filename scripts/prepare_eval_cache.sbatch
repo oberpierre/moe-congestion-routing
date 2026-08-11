@@ -35,7 +35,12 @@ srun --nodes=1 --ntasks=1 --environment=alps6 bash -c "
   set -euo pipefail
   $CACHE_ENV_EXPORT
   cd $WORKDIR
-  if [ ! -f .venv/pyvenv.cfg ] || ! grep -q 'include-system-site-packages = true' .venv/pyvenv.cfg; then
+  # Rebuild the venv if it is missing, misconfigured, or damaged. Probe the dependencies the eval
+  # path actually needs.
+  if [ ! -f .venv/pyvenv.cfg ] \
+     || ! grep -q 'include-system-site-packages = true' .venv/pyvenv.cfg \
+     || ! .venv/bin/python -c 'import transformers, huggingface_hub, datasets' 2>/dev/null; then
+    echo '[env] rebuilding venv (missing, misconfigured, or failed its import probe)'
     rm -rf .venv
     uv venv --system-site-packages --python \"\$(which python)\"
   fi
