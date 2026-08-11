@@ -6,6 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus-per-task=1           # only so the EDF/NGC container's NVIDIA hook can start
 #SBATCH --time=02:00:00
+#SBATCH --network=disable_rdzv_get
 #SBATCH --output=logs/eval_cache_prep_%j.log
 #SBATCH --error=logs/eval_cache_prep_%j.log
 
@@ -38,7 +39,10 @@ srun --nodes=1 --ntasks=1 --environment=alps6 bash -c "
     rm -rf .venv
     uv venv --system-site-packages --python \"\$(which python)\"
   fi
-  uv sync --inexact --no-install-package torch
+  # --reinstall-package huggingface-hub: the venv has system site-packages so the container's
+  # torch/TE are visible, but that also exposes the container's older huggingface_hub, which
+  # is incompatible with the datasets version uv installs. Reinstall is therefore required.
+  uv sync --inexact --no-install-package torch --reinstall-package huggingface-hub
   set +u; source .venv/bin/activate; set -u
   # megatron-core 0.18 needs nvidia-resiliency-ext>=0.6; the NGC image ships 0.5.x. Newer wheel
   # into the venv (shadows the container copy), --no-deps so it can't pull a conflicting torch.
