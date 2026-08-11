@@ -201,6 +201,24 @@ def eval_output_dir(cfg: EvalConfig) -> Path:
     return eval_run_dir(cfg) / "evals" / f"iter_{cfg.ckpt_step:07d}"
 
 
+def eval_arm(cfg: EvalConfig) -> str | None:
+    """Which arm's routing rule this evaluation scored, or ``None`` when that cannot be told
+    apart from an arbitrary directory name.
+
+    With an explicit ``cfg.output_dir`` override, that directory IS the run directory (see
+    ``eval_run_dir``) and the caller chose its name, so its own basename is the arm, e.g.
+    ``artifacts/eval/flame_290m`` names the arm ``flame_290m``. Without an override, the run
+    directory is ``<output_dir>/<arm>/<run_tag>``, but only if it was produced by our launcher,
+    which this checks by probing the filesystem for the ``launch_command.txt`` it writes.
+    """
+    run_dir = eval_run_dir(cfg)
+    if cfg.output_dir is not None:
+        return run_dir.name
+    if not (run_dir / "launch_command.txt").exists():
+        return None
+    return run_dir.parent.name
+
+
 def build_lm_eval_args(cfg: EvalConfig) -> list[str]:
     """Map the config to the lm-evaluation-harness CLI arg list (pure)."""
     model_args_parts = []

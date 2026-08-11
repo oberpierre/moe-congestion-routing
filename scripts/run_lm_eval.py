@@ -28,6 +28,7 @@ import yaml
 from moe_congestion_routing.eval.eval_config import (
     EvalConfig,
     build_lm_eval_args,
+    eval_arm,
     eval_output_dir,
     eval_run_dir,
 )
@@ -112,17 +113,12 @@ def main() -> None:
 
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Provenance: append the exact command, like run_moe_pretrain.py's launch_command.txt.
+    # Provenance: append the exact command, like run_moe_pretrain.py's launch_command.txt. This
+    # file is genuinely one-per-iteration and meant to grow, unlike config_snapshot.yaml below.
     with open(results_dir / "eval_command.txt", "a") as f:
         f.write(f"# {datetime.now():%Y-%m-%d %H:%M:%S}\n{shlex.join(cmd)}\n\n")
 
-    # The run directory results.py's arm field is computed from either the config's output_dir
-    # (if it was explicitly overridden) or from the derived run directory. The latter is the
-    # normal case, where the run directory is nested under a per-launch <run_tag> (e.g.
-    # artifacts/exp1/switch/<run_tag>/...).
     run_dir = eval_run_dir(cfg)
-    arm = run_dir.name if cfg.output_dir is not None else run_dir.parent.name
-
     # A results file next to no record of what produced it is a number nobody can defend later:
     # the harness submodule's own version, both RNG seeds, the task set, which checkpoint this
     # run scored, and which arm it belongs to.
@@ -135,10 +131,14 @@ def main() -> None:
         "load": cfg.load,
         "run_dir": str(run_dir),
         "ckpt_step": cfg.ckpt_step,
-        "arm": arm,
+        "arm": eval_arm(cfg),
     }
-    with open(results_dir / "config_snapshot.yaml", "w") as f:
-        yaml.safe_dump(snapshot, f, sort_keys=False)
+
+    # lm-eval writes each run's results into <results_dir>/<args-hash>/results_<timestamp>.json.
+    # So there may be more than one results file per iteration in case of a reruns or different
+    # task sets. Since the hash directory's name is computed inside the harness and unknown until
+    # it runs, we have to diff before and after to find it and put the config snapshot next to it.
+    results_before = set(results_dir.glob("*/results_*.json"))
 
     # -m lm_eval imports megatron.core (via the harness's own MEGATRON_PATH lookup) in the
     # subprocess, so both the interpreter's PYTHONPATH and the harness-read MEGATRON_PATH env var
@@ -167,7 +167,15 @@ def main() -> None:
     env.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
     print(f"[run_lm_eval] launching:\n  {shlex.join(cmd)}\n", flush=True)
-    sys.exit(subprocess.run(cmd, env=env, cwd=repo_root).returncode)
+    result = subprocess.run(cmd, env=env, cwd=repo_root)
+
+    if result.returncode == 0:
+        new_results_files = sorted(set(results_dir.glob("*/results_*.json")) - results_before)
+        for results_file in new_results_files:
+            with open(results_file.parent / "config_snapshot.yaml", "w") as f:
+                yaml.safe_dump(snapshot, f, sort_keys=False)
+
+    sys.exit(result.returncode)
 
 
 if __name__ == "__main__":

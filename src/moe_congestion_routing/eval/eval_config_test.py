@@ -6,6 +6,7 @@ import pytest
 from moe_congestion_routing.eval.eval_config import (
     EvalConfig,
     build_lm_eval_args,
+    eval_arm,
     eval_output_dir,
     eval_run_dir,
 )
@@ -256,6 +257,49 @@ def test_eval_run_dir_derives_from_the_checkpoint_when_no_override(tmp_path):
 def test_eval_run_dir_is_the_override_itself(tmp_path):
     cfg = _cfg(ckpt_step=5473, output_dir=str(tmp_path / "flame"))
     assert eval_run_dir(cfg) == tmp_path / "flame"
+
+
+# --- eval_arm --------------------------------------------------------------------------------
+
+
+def test_eval_arm_derived_from_the_run_directorys_parent_when_launch_command_marks_it_ours(
+    tmp_path,
+):
+    run_dir = tmp_path / "exp1" / "switch" / "20260101-000000"
+    checkpoints = run_dir / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (run_dir / "launch_command.txt").write_text("some command\n")
+    cfg = _cfg(ckpt_step=20, load=str(checkpoints))
+    assert eval_arm(cfg) == "switch"
+
+
+def test_eval_arm_is_the_output_dir_overrides_own_basename(tmp_path):
+    cfg = _cfg(ckpt_step=5473, output_dir=str(tmp_path / "flame_290m"))
+    assert eval_arm(cfg) == "flame_290m"
+
+
+def test_eval_arm_returns_none_when_the_run_directory_has_no_launch_command_marker(tmp_path):
+    # Right shape (a "switch"-looking directory two levels above the checkpoints), but nothing
+    # our own launcher wrote there -- exactly the case a path-shape check alone cannot see.
+    checkpoints = tmp_path / "exp1" / "switch" / "20260101-000000" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    cfg = _cfg(ckpt_step=20, load=str(checkpoints))
+    assert eval_arm(cfg) is None
+
+
+@pytest.mark.parametrize(
+    "load",
+    [
+        "/data/flame_moe_290m/checkpoints",
+        "/home/user/scratch/flame_moe_290m/checkpoints",
+        "/home/user/downloads/checkpoints",
+    ],
+)
+def test_eval_arm_returns_none_for_external_checkpoints_with_no_output_dir_override(load):
+    # None of these directories were produced by scripts/run_moe_pretrain.py, so none of them
+    # have a launch_command.txt regardless of how plausible the path looks.
+    cfg = _cfg(ckpt_step=5473, load=load)
+    assert eval_arm(cfg) is None
 
 
 # --- resolved() ----------------------------------------------------------------------------
