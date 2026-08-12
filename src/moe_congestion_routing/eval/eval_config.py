@@ -48,9 +48,12 @@ class EvalConfig:
     training as the dataset is pre-tokenized. Restoring from checkpoint without this would restore
     the wrong tokenizer and produce plausible but meaningless scores rather than an error."""
 
-    tokenizer_model: str = "assets/tokenizer/gpt2"
+    tokenizer_model: str = "./assets/tokenizer/gpt2"
     """The real GPT-2 BPE tokenizer, committed in-tree, loaded fully offline. Not the caller's
-    choice as our model is trained using a GPT-2 id space because ClimbMix ships pre-tokenized."""
+    choice as our model is trained using a GPT-2 id space because ClimbMix ships pre-tokenized.
+    The leading ``./`` is load-bearing, not decoration: it is what tells ``resolved()`` this is a
+    filesystem path rather than a hub id like FLAME's ``EleutherAI/pythia-12b``, so it must stay
+    even though a bare ``assets/tokenizer/gpt2`` would resolve identically on this machine."""
 
     seq_length: int | None = None
     """Sequence length the checkpoint was trained at (also the harness's max context).
@@ -106,7 +109,9 @@ class EvalConfig:
         return cls(**data)
 
     def resolved(self, repo_root: Path) -> "EvalConfig":
-        """Absolutise every path-valued field against ``repo_root``."""
+        """Absolutise every path-valued field against ``repo_root``, but only absolutise
+        ``tokenizer_model`` when it is explicitly marked as a filesystem path, since it may
+        instead be a hub identifier such as FLAME's ``EleutherAI/pythia-12b``."""
 
         def absolutise(p: str) -> str:
             # Expand ${VAR} and ~ first, so a committed config can reference ${DATA_STORE} rather
@@ -115,10 +120,21 @@ class EvalConfig:
             path = Path(expand_path(p))
             return str(path if path.is_absolute() else repo_root / path)
 
+        def absolutise_tokenizer(p: str) -> str:
+            # AutoTokenizer.from_pretrained takes either a local directory or a hub id, so this
+            # cannot be absolutised like load/output_dir: prefixing repo_root onto a hub id such
+            # as "EleutherAI/pythia-12b" makes a path that does not exist. Treat the value as a
+            # path only when it is marked as one, and pass anything else through as a hub id.
+            expanded = expand_path(p)
+            if not expanded.startswith(("/", "~", "./", "../")):
+                return expanded
+            path = Path(expanded)
+            return str(path if path.is_absolute() else repo_root / path)
+
         return replace(
             self,
             load=absolutise(self.load) if self.load else None,
-            tokenizer_model=absolutise(self.tokenizer_model),
+            tokenizer_model=absolutise_tokenizer(self.tokenizer_model),
             output_dir=absolutise(self.output_dir) if self.output_dir else None,
             include_path=absolutise(self.include_path),
         )

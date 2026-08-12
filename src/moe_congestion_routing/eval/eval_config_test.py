@@ -48,7 +48,7 @@ def test_from_yaml_roundtrip(tmp_path):
     assert cfg.ckpt_step == 40
     assert cfg.tasks == ["arc_easy"]
     assert cfg.tokenizer_type == "HuggingFaceTokenizer"  # default preserved
-    assert cfg.tokenizer_model == "assets/tokenizer/gpt2"  # default preserved
+    assert cfg.tokenizer_model == "./assets/tokenizer/gpt2"  # default preserved
 
 
 def test_from_yaml_rejects_unknown_key(tmp_path):
@@ -105,7 +105,7 @@ def test_checkpoint_and_tokenizer_reach_model_args():
     assert model_args["load"] == "/ckpt/dir"
     assert model_args["ckpt_step"] == "20"
     assert model_args["tokenizer_type"] == "HuggingFaceTokenizer"
-    assert model_args["tokenizer_model"] == "assets/tokenizer/gpt2"
+    assert model_args["tokenizer_model"] == "./assets/tokenizer/gpt2"
 
 
 def test_tokenizer_override_reaches_model_args():
@@ -343,10 +343,42 @@ def test_eval_arm_returns_none_for_external_checkpoints_with_no_output_dir_overr
 
 
 def test_resolved_absolutises_load_and_tokenizer_model(tmp_path):
-    cfg = _cfg(load="artifacts/run/checkpoints", tokenizer_model="assets/tokenizer/gpt2")
+    cfg = _cfg(load="artifacts/run/checkpoints", tokenizer_model="./assets/tokenizer/gpt2")
     resolved = cfg.resolved(tmp_path)
     assert resolved.load == str(tmp_path / "artifacts" / "run" / "checkpoints")
     assert resolved.tokenizer_model == str(tmp_path / "assets" / "tokenizer" / "gpt2")
+
+
+# --- resolved(): tokenizer_model is a hub id unless explicitly marked as a path (0026) --------
+
+
+def test_resolved_passes_a_bare_hub_id_through_unchanged(tmp_path):
+    # A bare "namespace/name" is FLAME's tokenizer, EleutherAI/pythia-12b. Joining it with
+    # repo_root would turn it into a path that does not exist, so AutoTokenizer.from_pretrained
+    # must see it exactly as the config wrote it.
+    cfg = _cfg(tokenizer_model="EleutherAI/pythia-12b")
+    resolved = cfg.resolved(tmp_path)
+    assert resolved.tokenizer_model == "EleutherAI/pythia-12b"
+
+
+def test_resolved_absolutises_a_dot_slash_marked_tokenizer_model(tmp_path):
+    cfg = _cfg(tokenizer_model="./assets/tokenizer/gpt2")
+    resolved = cfg.resolved(tmp_path)
+    assert resolved.tokenizer_model == str(tmp_path / "assets" / "tokenizer" / "gpt2")
+
+
+def test_resolved_keeps_an_already_absolute_tokenizer_model(tmp_path):
+    abs_tokenizer = str(tmp_path / "abs" / "tokenizer")
+    cfg = _cfg(tokenizer_model=abs_tokenizer)
+    resolved = cfg.resolved(tmp_path)
+    assert resolved.tokenizer_model == abs_tokenizer
+
+
+def test_resolved_expands_env_var_tokenizer_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOKENIZER_DIR", str(tmp_path / "store" / "gpt2"))
+    cfg = _cfg(tokenizer_model="${TOKENIZER_DIR}")
+    resolved = cfg.resolved(Path("/unused"))
+    assert resolved.tokenizer_model == str(tmp_path / "store" / "gpt2")
 
 
 def test_resolved_keeps_load_none_when_unset(tmp_path):
