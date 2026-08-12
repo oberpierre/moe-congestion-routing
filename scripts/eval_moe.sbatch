@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 #SBATCH --network=disable_rdzv_get
 #SBATCH --output=logs/moe_eval_%j.log
 #SBATCH --error=logs/moe_eval_%j.log
