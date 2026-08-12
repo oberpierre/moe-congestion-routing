@@ -6,35 +6,10 @@ import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from ..checkpoint_args import CHECKPOINT_OVERRIDE_ARGS
 from ..config_extends import load_yaml_with_extends
 from ..paths import expand_path
 from ..training.pretrain_config import resolve_run_dir
-
-# These four Megatron flags must reach every evaluation of one of our own checkpoints, no matter
-# what a config's own extra_args sets:
-#
-# --no-use-tokenizer-model-from-checkpoint-args: --use-checkpoint-args (which the harness backend
-# always passes) restores tokenizer_type/tokenizer_model from the checkpoint's saved args with
-# force=True, silently overwriting the HuggingFaceTokenizer/gpt2 pair below with the training
-# run's NullTokenizer -- which has no vocabulary and cannot turn text into ids.
-#
-# --no-gradient-accumulation-fusion: gradient_accumulation_fusion defaults True and needs an apex
-# CUDA extension that isn't built on this box; nothing accumulates gradients at eval anyway.
-#
-# --moe-router-dtype fp32: --use-checkpoint-args restores structure but not numerics, so without
-# this every checkpoint this project trains (fp32 routing) is scored with Megatron's bf16 default.
-#
-# --norm-epsilon 1e-6: matches the epsilon every checkpoint this project trains and FLAME's own
-# checkpoint are built at, whereas Megatron's own default is 1e-5.
-#
-# Appended by _model_args_parts itself rather than left to a config's own extra_args, so a config
-# that sets extra_args cannot accidentally (or deliberately) drop any of these.
-_MANDATORY_EXTRA_ARGS = (
-    "--no-use-tokenizer-model-from-checkpoint-args",
-    "--no-gradient-accumulation-fusion",
-    "--moe-router-dtype fp32",
-    "--norm-epsilon 1e-6",
-)
 
 
 @dataclass(frozen=True)
@@ -102,7 +77,7 @@ class EvalConfig:
 
     extra_args: str = ""
     """Additional Megatron CLI flags, space-separated, forwarded through the harness's own
-    ``extra_args`` model_args key. The four mandatory flags above are appended by
+    ``extra_args`` model_args key. ``checkpoint_args.CHECKPOINT_OVERRIDE_ARGS`` is appended by
     ``_model_args_parts`` regardless of what this holds, so a config cannot drop them by setting
     this."""
 
@@ -230,7 +205,7 @@ def _model_args_parts(cfg: EvalConfig, devices: int) -> list[str]:
     # extra_args' value itself contains spaces (it is a space-separated flag list, shlex-parsed
     # by the harness), so it must be the last comma-joined part: the harness splits model_args on
     # commas first, and a flag list has none, so nothing here can be mistaken for a further key.
-    extra = " ".join(part for part in (cfg.extra_args, *_MANDATORY_EXTRA_ARGS) if part)
+    extra = " ".join(part for part in (cfg.extra_args, *CHECKPOINT_OVERRIDE_ARGS) if part)
     model_args_parts.append(f"extra_args={extra}")
     return model_args_parts
 
