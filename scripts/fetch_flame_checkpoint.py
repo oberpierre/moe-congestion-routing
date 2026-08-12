@@ -169,7 +169,13 @@ def main() -> None:
         total_files += n_files
         total_bytes += n_bytes
         print(f"{_iter_name(iteration)}: {n_files} files, {n_bytes} bytes")
-        if not args.dry_run:
+        if args.dry_run:
+            # Name every file, because the counts and the total alone cannot distinguish a
+            # shard layout that changed from one that did not: a renamed shard of identical
+            # size leaves both numbers untouched.
+            for name, size in files:
+                print(f"  {name} ({size} bytes)")
+        else:
             _download(_data_store(), iteration, args.metadata_only)
 
     print(f"total: {total_files} files, {total_bytes} bytes")
