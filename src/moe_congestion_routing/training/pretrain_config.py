@@ -54,7 +54,7 @@ class MoEPretrainConfig:
     position_embedding_type: str = "learned_absolute"
     """``learned_absolute`` (Megatron's default: an extra ``seq_length * hidden_size`` parameter
     table) or ``rope`` (no parameters, what every modern reference uses). ARCHITECTURAL: a
-    checkpoint cannot be loaded under a different value, so ``infer_config`` mirrors it."""
+    checkpoint cannot be loaded under a different value."""
 
     normalization: str = "LayerNorm"
     """``LayerNorm`` (Megatron's default; has a bias) or ``RMSNorm`` (scale only). ARCHITECTURAL."""
