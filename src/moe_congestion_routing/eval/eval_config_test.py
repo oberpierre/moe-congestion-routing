@@ -6,7 +6,6 @@ import pytest
 from moe_congestion_routing.eval.eval_config import (
     EvalConfig,
     build_launch_command,
-    build_lm_eval_args,
     eval_arm,
     eval_output_dir,
     eval_run_dir,
@@ -15,7 +14,7 @@ from moe_congestion_routing.eval.eval_config import (
 
 def _cfg(**kw) -> EvalConfig:
     kw.setdefault("ckpt_step", 20)
-    # eval_output_dir (and therefore build_lm_eval_args) needs a way to name the output path;
+    # eval_output_dir (and therefore build_launch_command) needs a way to name the output path;
     # give every test a load path unless it overrides load or output_dir itself.
     if kw.get("load") is None and kw.get("output_dir") is None:
         kw.setdefault("load", "/ckpt/dir")
@@ -97,12 +96,12 @@ def test_from_yaml_extends_rejects_cycles(tmp_path):
         EvalConfig.from_yaml(tmp_path / "x.yaml")
 
 
-# --- build_lm_eval_args: the emitter -----------------------------------------------------
+# --- build_launch_command: the emitter ---------------------------------------------------
 
 
 def test_checkpoint_and_tokenizer_reach_model_args():
     cfg = _cfg(ckpt_step=20, load="/ckpt/dir")
-    model_args = _model_args(build_lm_eval_args(cfg))
+    model_args = _model_args(build_launch_command(cfg))
     assert model_args["load"] == "/ckpt/dir"
     assert model_args["ckpt_step"] == "20"
     assert model_args["tokenizer_type"] == "HuggingFaceTokenizer"
@@ -111,21 +110,21 @@ def test_checkpoint_and_tokenizer_reach_model_args():
 
 def test_tokenizer_override_reaches_model_args():
     cfg = _cfg(tokenizer_type="NullTokenizer", tokenizer_model="gpt2-alt")
-    model_args = _model_args(build_lm_eval_args(cfg))
+    model_args = _model_args(build_launch_command(cfg))
     assert model_args["tokenizer_type"] == "NullTokenizer"
     assert model_args["tokenizer_model"] == "gpt2-alt"
 
 
 def test_absent_optional_model_args_keys_are_omitted():
     cfg = _cfg(seq_length=None, micro_batch_size=None)
-    model_args = _model_args(build_lm_eval_args(cfg))
+    model_args = _model_args(build_launch_command(cfg))
     assert "seq_length" not in model_args
     assert "micro_batch_size" not in model_args
 
 
 def test_optional_model_args_keys_emitted_when_set():
     cfg = _cfg(seq_length=1024, micro_batch_size=8)
-    model_args = _model_args(build_lm_eval_args(cfg))
+    model_args = _model_args(build_launch_command(cfg))
     assert model_args["seq_length"] == "1024"
     assert model_args["micro_batch_size"] == "8"
 
@@ -133,13 +132,13 @@ def test_optional_model_args_keys_emitted_when_set():
 def test_load_omitted_from_model_args_when_unset():
     # output_dir stands in for the run-directory-from-checkpoint derivation, which needs `load`.
     cfg = _cfg(load=None, output_dir="/out")
-    model_args = _model_args(build_lm_eval_args(cfg))
+    model_args = _model_args(build_launch_command(cfg))
     assert "load" not in model_args
 
 
 def test_absent_optional_top_level_flags_are_omitted_not_emitted_empty():
     cfg = _cfg(tasks=[], batch_size=None, limit=None)
-    args = build_lm_eval_args(cfg)
+    args = build_launch_command(cfg)
     assert "--tasks" not in args
     assert "--batch_size" not in args
     assert "--limit" not in args
@@ -147,7 +146,7 @@ def test_absent_optional_top_level_flags_are_omitted_not_emitted_empty():
 
 def test_top_level_flags_emitted_when_set():
     cfg = _cfg(tasks=["arc_easy", "piqa"], batch_size=16, limit=50)
-    args = build_lm_eval_args(cfg)
+    args = build_launch_command(cfg)
     assert _flag(args, "--tasks") == "arc_easy,piqa"
     assert _flag(args, "--batch_size") == "16"
     assert _flag(args, "--limit") == "50"
@@ -157,13 +156,13 @@ def test_include_path_flag_always_emitted_with_its_default():
     # Without --include_path the harness never looks outside its own built-in task registry, so
     # tasks: [flame_suite] fails with "task not found". Should always be emitted.
     cfg = _cfg(tasks=["arc_easy"])
-    args = build_lm_eval_args(cfg)
+    args = build_launch_command(cfg)
     assert _flag(args, "--include_path") == "configs/eval/tasks"
 
 
 def test_include_path_override_reaches_the_flag():
     cfg = _cfg(include_path="/custom/tasks")
-    args = build_lm_eval_args(cfg)
+    args = build_launch_command(cfg)
     assert _flag(args, "--include_path") == "/custom/tasks"
 
 
@@ -172,7 +171,7 @@ def test_ckpt_step_omitted_from_model_args_when_unset(monkeypatch):
 
     monkeypatch.setattr(eval_config_module, "eval_output_dir", lambda cfg: Path("/unused"))
     cfg = EvalConfig(ckpt_step=None, load="/ckpt/dir")
-    model_args = _model_args(build_lm_eval_args(cfg))
+    model_args = _model_args(build_launch_command(cfg))
     assert "ckpt_step" not in model_args
 
 
@@ -181,13 +180,13 @@ def test_num_fewshot_flag_never_emitted():
     # task's own split, so the launcher must never be able to emit it regardless of what a
     # config sets on other fields.
     cfg = _cfg(tasks=["arc_easy"])
-    args = build_lm_eval_args(cfg)
+    args = build_launch_command(cfg)
     assert "--num_fewshot" not in args
 
 
 def test_both_seeds_reach_the_seed_flag():
     cfg = _cfg(seed=42, fewshot_seed=7)
-    args = build_lm_eval_args(cfg)
+    args = build_launch_command(cfg)
     assert _flag(args, "--seed") == "42,42,42,7"
 
 
@@ -197,31 +196,30 @@ def test_argv_with_space_containing_value_survives_shlex_roundtrip():
     # shlex.join (or equivalent quoting), not " ".join, or pasting the printed command back
     # into a shell splits that element into two and drops or misplaces a flag.
     cfg = _cfg(extra_args="--no-rope-fusion")
-    args = build_lm_eval_args(cfg)
-    cmd = ["python", "-m", "lm_eval", *args]
-    model_args_value = args[args.index("--model_args") + 1]
+    cmd = build_launch_command(cfg)
+    model_args_value = cmd[cmd.index("--model_args") + 1]
     assert " " in model_args_value  # otherwise this test would not exercise the bug
     assert shlex.split(shlex.join(cmd)) == cmd
 
 
 def test_extra_args_passes_through():
     cfg = _cfg(extra_args="--no-rope-fusion")
-    model_args = _model_args(build_lm_eval_args(cfg))
+    model_args = _model_args(build_launch_command(cfg))
     assert "--no-rope-fusion" in model_args["extra_args"]
 
 
 def test_mandatory_flags_present_with_no_extra_args_set():
     cfg = _cfg(extra_args="")
-    model_args = _model_args(build_lm_eval_args(cfg))
+    model_args = _model_args(build_launch_command(cfg))
     assert "--no-use-tokenizer-model-from-checkpoint-args" in model_args["extra_args"]
     assert "--no-gradient-accumulation-fusion" in model_args["extra_args"]
 
 
 def test_mandatory_flags_present_even_when_config_sets_extra_args():
     # A config cannot drop the two mandatory flags by setting its own extra_args -- they are
-    # appended by build_lm_eval_args itself, not left to the config to include.
+    # appended by _model_args_parts itself, not left to the config to include.
     cfg = _cfg(extra_args="--no-use-tokenizer-model-from-checkpoint-args")
-    model_args = _model_args(build_lm_eval_args(cfg))
+    model_args = _model_args(build_launch_command(cfg))
     assert model_args["extra_args"].count("--no-use-tokenizer-model-from-checkpoint-args") >= 1
     assert "--no-gradient-accumulation-fusion" in model_args["extra_args"]
 
@@ -232,7 +230,7 @@ def test_output_path_derives_from_the_checkpoint_run_dir(tmp_path):
     cfg = _cfg(ckpt_step=20, load=str(checkpoints))
     path = eval_output_dir(cfg)
     assert path == tmp_path / "run" / "evals" / "iter_0000020"
-    assert _flag(build_lm_eval_args(cfg), "--output_path") == str(path)
+    assert _flag(build_launch_command(cfg), "--output_path") == str(path)
 
 
 def test_output_dir_override_still_gets_the_evals_subdir(tmp_path):
@@ -286,10 +284,9 @@ def test_build_launch_command_runs_lm_eval_as_a_module_via_torch_distributed_run
     assert cmd[cmd.index("lm_eval") - 1] == "-m"
 
 
-def test_build_launch_command_carries_the_rest_of_build_lm_eval_args():
-    # devices= is the only thing build_launch_command adds; everything else (checkpoint,
-    # tokenizer, tasks, seeds, output path) must still reach the command the same way
-    # build_lm_eval_args produces it on its own.
+def test_build_launch_command_carries_checkpoint_tasks_and_seeds_alongside_devices():
+    # devices= is derived from nproc, but everything else (checkpoint, tokenizer, tasks, seeds,
+    # output path) must still reach the command the same way regardless of nproc.
     cfg = _cfg(tasks=["arc_easy"], seed=42, fewshot_seed=7)
     cmd = build_launch_command(cfg, nproc=2)
     model_args = _model_args(cmd)
@@ -297,14 +294,6 @@ def test_build_launch_command_carries_the_rest_of_build_lm_eval_args():
     assert model_args["ckpt_step"] == str(cfg.ckpt_step)
     assert _flag(cmd, "--tasks") == "arc_easy"
     assert _flag(cmd, "--seed") == "42,42,42,7"
-
-
-def test_build_lm_eval_args_never_emits_devices():
-    # devices is not an EvalConfig field, so the plain (non-launch) arg builder must never emit
-    # it even though it shares the same underlying key=value construction as
-    # build_launch_command.
-    model_args = _model_args(build_lm_eval_args(_cfg()))
-    assert "devices" not in model_args
 
 
 # --- eval_arm --------------------------------------------------------------------------------

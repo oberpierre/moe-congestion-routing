@@ -132,10 +132,11 @@ def main() -> None:
         "devices": args.nproc,
     }
 
-    # lm-eval writes each run's results into <results_dir>/<args-hash>/results_<timestamp>.json.
-    # So there may be more than one results file per iteration in case of a reruns or different
-    # task sets. Since the hash directory's name is computed inside the harness and unknown until
-    # it runs, we have to diff before and after to find it and put the config snapshot next to it.
+    # lm-eval writes each run's results into <results_dir>/<subdir>/results_<timestamp>.json,
+    # where <subdir> is a name the harness makes up for itself (eight random characters for our
+    # --model_args, not a hash of them) and unknown until it runs. So there may be more than one
+    # results file per iteration in case of a reruns or different task sets, and we have to diff
+    # before and after to find the new subdirectory and put the config snapshot next to it.
     results_before = set(results_dir.glob("*/results_*.json"))
 
     # -m lm_eval imports megatron.core (via the harness's own MEGATRON_PATH lookup) in the

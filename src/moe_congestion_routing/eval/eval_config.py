@@ -26,7 +26,7 @@ _EXTENDS_KEY = "extends"
 # --no-gradient-accumulation-fusion: gradient_accumulation_fusion defaults True and needs an apex
 # CUDA extension that isn't built on this box; nothing accumulates gradients at eval anyway.
 #
-# Appended by build_lm_eval_args itself rather than left to a config's own extra_args, so a config
+# Appended by _model_args_parts itself rather than left to a config's own extra_args, so a config
 # that sets extra_args cannot accidentally (or deliberately) drop either one.
 _MANDATORY_EXTRA_ARGS = (
     "--no-use-tokenizer-model-from-checkpoint-args",
@@ -129,7 +129,7 @@ class EvalConfig:
     extra_args: str = ""
     """Additional Megatron CLI flags, space-separated, forwarded through the harness's own
     ``extra_args`` model_args key. The two mandatory flags above are appended by
-    ``build_lm_eval_args`` regardless of what this holds, so a config cannot drop them by setting
+    ``_model_args_parts`` regardless of what this holds, so a config cannot drop them by setting
     this."""
 
     @classmethod
@@ -220,20 +220,20 @@ def eval_arm(cfg: EvalConfig) -> str | None:
     return run_dir.parent.name
 
 
-def _model_args_parts(cfg: EvalConfig, devices: int | None) -> list[str]:
-    """Build the comma-joined ``--model_args`` key=value parts, shared by ``build_lm_eval_args``
-    and ``build_launch_command`` so the two never drift apart on how a value gets rendered.
+def _model_args_parts(cfg: EvalConfig, devices: int) -> list[str]:
+    """Build the comma-joined ``--model_args`` key=value parts, called from ``build_launch_command``
+    by way of ``_lm_eval_args``.
 
     ``devices`` is the backend's own parallelism key (``lm_eval/models/megatron_lm.py``), not an
-    ``EvalConfig`` field. ``None`` omits it, which is what ``build_lm_eval_args`` needs.
+    ``EvalConfig`` field, and always reflects ``--nproc-per-node`` of the launch command it is
+    part of.
     """
     model_args_parts = []
     if cfg.load is not None:
         model_args_parts.append(f"load={cfg.load}")
     if cfg.ckpt_step is not None:
         model_args_parts.append(f"ckpt_step={cfg.ckpt_step}")
-    if devices is not None:
-        model_args_parts.append(f"devices={devices}")
+    model_args_parts.append(f"devices={devices}")
     model_args_parts.append(f"tokenizer_type={cfg.tokenizer_type}")
     model_args_parts.append(f"tokenizer_model={cfg.tokenizer_model}")
     if cfg.seq_length is not None:
@@ -248,7 +248,7 @@ def _model_args_parts(cfg: EvalConfig, devices: int | None) -> list[str]:
     return model_args_parts
 
 
-def _lm_eval_args(cfg: EvalConfig, devices: int | None) -> list[str]:
+def _lm_eval_args(cfg: EvalConfig, devices: int) -> list[str]:
     """The lm-evaluation-harness CLI arg list (pure)"""
     args = [
         "--model",
@@ -273,11 +273,6 @@ def _lm_eval_args(cfg: EvalConfig, devices: int | None) -> list[str]:
     args += ["--seed", f"{cfg.seed},{cfg.seed},{cfg.seed},{cfg.fewshot_seed}"]
     args += ["--output_path", str(eval_output_dir(cfg))]
     return args
-
-
-def build_lm_eval_args(cfg: EvalConfig) -> list[str]:
-    """Map the config to the lm-evaluation-harness CLI arg list (pure)."""
-    return _lm_eval_args(cfg, devices=None)
 
 
 def build_launch_command(cfg: EvalConfig, nproc: int = 1) -> list[str]:

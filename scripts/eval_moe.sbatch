@@ -72,6 +72,9 @@ srun -l --mpi=pmix --wait 60 \
   echo \"=== node \$(hostname) | \$(date) ===\"
   $CACHE_ENV_EXPORT
 
+  NPROC=\${SLURM_GPUS_PER_NODE:-\$(nvidia-smi -L | wc -l)}
+  echo \"=== \$NPROC GPU(s) ===\"
+
   export CUDA_DEVICE_MAX_CONNECTIONS=1
   export OMP_NUM_THREADS=\$((SLURM_CPUS_PER_TASK/NPROC))
   export TORCH_NCCL_AVOID_RECORD_STREAMS=1
@@ -79,9 +82,6 @@ srun -l --mpi=pmix --wait 60 \
   export HF_HUB_OFFLINE=1
   export HF_DATASETS_OFFLINE=1
   export PYTHONUNBUFFERED=1
-
-  NPROC=\${SLURM_GPUS_PER_NODE:-\$(nvidia-smi -L | wc -l)}
-  echo \"=== \$NPROC GPU(s) ===\"
 
   cd $WORKDIR
   set +u; source .venv/bin/activate; set -u
