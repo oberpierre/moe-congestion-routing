@@ -27,6 +27,7 @@ hidden_size: 1024
 num_attention_heads: 16
 position_embedding_type: rope
 normalization: RMSNorm
+norm_epsilon: 1.0e-6
 swiglu: true
 untie_embeddings_and_output_weights: true
 # Matching FLAME and DeepSeek 1B, which both use a dense first layer. So 1 dense + 8 MoE layers.

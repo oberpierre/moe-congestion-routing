@@ -213,15 +213,23 @@ def test_mandatory_flags_present_with_no_extra_args_set():
     model_args = _model_args(build_launch_command(cfg))
     assert "--no-use-tokenizer-model-from-checkpoint-args" in model_args["extra_args"]
     assert "--no-gradient-accumulation-fusion" in model_args["extra_args"]
+    assert "--moe-router-dtype fp32" in model_args["extra_args"]
+    assert "--norm-epsilon 1e-6" in model_args["extra_args"]
 
 
 def test_mandatory_flags_present_even_when_config_sets_extra_args():
-    # A config cannot drop the two mandatory flags by setting its own extra_args -- they are
-    # appended by _model_args_parts itself, not left to the config to include.
-    cfg = _cfg(extra_args="--no-use-tokenizer-model-from-checkpoint-args")
+    # A config cannot drop any of the four mandatory flags by setting its own extra_args -- they
+    # are appended by _model_args_parts itself, not left to the config to include. flame.yaml sets
+    # its own extra_args (--dist-ckpt-strictness log_all), which is the real case this guards.
+    cfg = _cfg(
+        extra_args="--no-use-tokenizer-model-from-checkpoint-args --dist-ckpt-strictness log_all"
+    )
     model_args = _model_args(build_launch_command(cfg))
     assert model_args["extra_args"].count("--no-use-tokenizer-model-from-checkpoint-args") >= 1
     assert "--no-gradient-accumulation-fusion" in model_args["extra_args"]
+    assert "--moe-router-dtype fp32" in model_args["extra_args"]
+    assert "--norm-epsilon 1e-6" in model_args["extra_args"]
+    assert "--dist-ckpt-strictness log_all" in model_args["extra_args"]
 
 
 def test_output_path_derives_from_the_checkpoint_run_dir(tmp_path):

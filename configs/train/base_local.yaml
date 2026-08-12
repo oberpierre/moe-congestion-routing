@@ -4,6 +4,7 @@ hidden_size: 512
 num_attention_heads: 8
 position_embedding_type: rope
 normalization: RMSNorm
+norm_epsilon: 1.0e-6
 swiglu: true
 untie_embeddings_and_output_weights: true
 moe_layer_freq: "[0]*1+[1]*8"

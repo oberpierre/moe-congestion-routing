@@ -10,7 +10,7 @@ from ..config_extends import load_yaml_with_extends
 from ..paths import expand_path
 from ..training.pretrain_config import resolve_run_dir
 
-# These two Megatron flags must reach every evaluation of one of our own checkpoints, no matter
+# These four Megatron flags must reach every evaluation of one of our own checkpoints, no matter
 # what a config's own extra_args sets:
 #
 # --no-use-tokenizer-model-from-checkpoint-args: --use-checkpoint-args (which the harness backend
@@ -21,11 +21,19 @@ from ..training.pretrain_config import resolve_run_dir
 # --no-gradient-accumulation-fusion: gradient_accumulation_fusion defaults True and needs an apex
 # CUDA extension that isn't built on this box; nothing accumulates gradients at eval anyway.
 #
+# --moe-router-dtype fp32: --use-checkpoint-args restores structure but not numerics, so without
+# this every checkpoint this project trains (fp32 routing) is scored with Megatron's bf16 default.
+#
+# --norm-epsilon 1e-6: matches the epsilon every checkpoint this project trains and FLAME's own
+# checkpoint are built at, whereas Megatron's own default is 1e-5.
+#
 # Appended by _model_args_parts itself rather than left to a config's own extra_args, so a config
-# that sets extra_args cannot accidentally (or deliberately) drop either one.
+# that sets extra_args cannot accidentally (or deliberately) drop any of these.
 _MANDATORY_EXTRA_ARGS = (
     "--no-use-tokenizer-model-from-checkpoint-args",
     "--no-gradient-accumulation-fusion",
+    "--moe-router-dtype fp32",
+    "--norm-epsilon 1e-6",
 )
 
 
@@ -94,7 +102,7 @@ class EvalConfig:
 
     extra_args: str = ""
     """Additional Megatron CLI flags, space-separated, forwarded through the harness's own
-    ``extra_args`` model_args key. The two mandatory flags above are appended by
+    ``extra_args`` model_args key. The four mandatory flags above are appended by
     ``_model_args_parts`` regardless of what this holds, so a config cannot drop them by setting
     this."""
 
