@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 from moe_congestion_routing.checkpoint_args import checkpoint_override_argv
@@ -46,11 +47,16 @@ def test_resolved_expands_env_var_load(tmp_path, monkeypatch):
 # --- build_generate_command ---------------------------------------------------------------
 
 
-def test_command_is_a_torchrun_invocation_of_the_generate_script():
+def test_command_runs_torch_distributed_run_under_the_current_interpreter():
+    # Not a bare `torchrun`: the cluster venv borrows torch from the container and so has no
+    # torchrun of its own, which would send PATH to the container's copy and its system python,
+    # where the venv's transformers is invisible.
     req = _req()
     cmd = build_generate_command(req, "/repo/scripts/moe_generate.py", nproc=2)
-    assert cmd[:5] == [
-        "torchrun",
+    assert cmd[:7] == [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
         "--standalone",
         "--nproc-per-node",
         "2",
@@ -133,5 +139,7 @@ def test_default_engine_is_auto():
 
 
 def test_generate_script_accepts_a_path(tmp_path: Path):
+    # Located relative to --nproc-per-node rather than by absolute index, so adding a launcher
+    # flag ahead of the script does not fail this test for the wrong reason.
     cmd = build_generate_command(_req(), tmp_path / "moe_generate.py")
-    assert cmd[4] == str(tmp_path / "moe_generate.py")
+    assert cmd[cmd.index("--nproc-per-node") + 2] == str(tmp_path / "moe_generate.py")

@@ -6,6 +6,7 @@ generation run names a checkpoint and takes its architecture from ``--use-checkp
 rather than restating it in a config file.
 """
 
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -130,8 +131,14 @@ def build_generate_command(
     args += list(req.passthrough)
     if not req.interactive:
         args += ["--prompts", *req.prompts]
+    # `sys.executable -m torch.distributed.run` rather than a bare `torchrun`, because the
+    # cluster venv is built with --system-site-packages and `uv sync --no-install-package
+    # torch`, so it has no torchrun of its own and PATH finds the container's, which runs the
+    # system python and cannot see the venv's transformers. Same form as eval's launcher.
     return [
-        "torchrun",
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
         "--standalone",
         "--nproc-per-node",
         str(nproc),
