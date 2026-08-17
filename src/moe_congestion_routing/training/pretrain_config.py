@@ -1,15 +1,37 @@
 """Run config for a MoE pretraining run through Megatron's ``pretrain_gpt.py``."""
 
 import sys
+import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
 
+from ..losses.cost_families import (
+    COST_FAMILIES,
+    DEFAULT_LAMBDA,
+    ROSENTHAL_TYPES,
+    VARIANTS,
+    cost_exponent,
+    pressure_bound,
+)
 from ..paths import expand_path
 
-# Key a config file uses to name its base config(s). Consumed by the loader (never a
-# MoEPretrainConfig field), so it is stripped before the dataclass is constructed.
+# Every name Megatron's own --moe-router-load-balancing-type accepts at the pinned commit, plus
+# our two rosenthal names. Checked unconditionally so a typo fails at --dry-run rather than at the
+# front of a cluster queue. Without the check an unknown value builds cleanly, skips every
+# rosenthal validation rule, and emits no --moe-rosenthal-* flags at all.
+_MOE_ROUTER_LOAD_BALANCING_TYPES = (
+    "aux_loss",
+    "seq_aux_loss",
+    "global_aux_loss",
+    "sinkhorn",
+    "none",
+    *ROSENTHAL_TYPES,
+)
+
+# Key a config file uses to name its base config(s). The loader consumes it and it is never a
+# MoEPretrainConfig field, so it is stripped before the dataclass is constructed.
 _EXTENDS_KEY = "extends"
 
 
@@ -134,7 +156,36 @@ class MoEPretrainConfig:
     """Load-balancing strategy; ``aux_loss`` is the vanilla Switch auxiliary loss."""
 
     moe_aux_loss_coeff: float = 0.01
-    """Aux-loss weight. Megatron's default is 0.0, which makes the aux loss a no-op."""
+    """Aux-loss weight. Megatron's default is 0.0, which makes the aux loss a no-op. Reused
+    unchanged as the Rosenthal congestion loss's coefficient (alpha) when
+    ``moe_router_load_balancing_type`` is ``rosenthal``/``global_rosenthal``."""
+
+    moe_rosenthal_variant: str = "hard"
+    """Rosenthal congestion loss variant, live only under ``moe_router_load_balancing_type in
+    (rosenthal, global_rosenthal)``: ``hard`` (default) prices the REALIZED, detached load;
+    ``soft`` prices the EXPECTED load. ``soft``'s continuized potential is non-linear in the mean
+    gate mass, so it cannot decompose across ranks the way a straight all-reduce of a
+    differentiable tensor would -- but the router never does that: it all-reduces the DETACHED
+    marginal cost and prices a still-local, still-differentiable carrier against it (the
+    synced-coefficient construction), which is exact at any reduce-group size. ``soft`` is
+    therefore valid with ``global_rosenthal`` and at any ``tensor_model_parallel_size``, exactly
+    like ``hard``."""
+
+    moe_rosenthal_cost: str = "linear"
+    """Congestion cost family, live only under a rosenthal balancing type: ``linear`` (default,
+    ``c(x) = lambda*x``) or ``quadratic`` (``c(x) = lambda*x**2``)."""
+
+    moe_rosenthal_lambda: float | None = None
+    """Congestion cost coefficient (lambda), live only under a rosenthal balancing type. ``None``
+    (the default) resolves to the cost family's own slope-matched default from
+    ``DEFAULT_LAMBDA`` in ``losses/cost_families.py`` (1.0 for linear, 0.5 for quadratic) when the
+    flag is emitted, so paired arms stay slope-matched without the config author restating it. An
+    explicit value overrides that and must be > 0."""
+
+    moe_rosenthal_log_grad_ratio: bool = False
+    """Log the logit-space gradient norm the congestion loss injects, relative to the task
+    gradient at the same point. Requires a rosenthal balancing type. Read by the router-grad-probe
+    patch, which places one identity autograd probe on each consumer of the post-z-loss logits."""
 
     moe_router_score_function: str = "softmax"
     """Router scoring: ``softmax`` or ``sigmoid`` (Deepseek-V3 style). Megatron REQUIRES sigmoid
@@ -240,8 +291,9 @@ class MoEPretrainConfig:
     eval_iters: int = 0
     """Batches per validation pass; 0 disables eval entirely."""
 
-    # checkpointing (Megatron semantics). save/load are DIRECTORIES, not single checkpoints: each
-    # save drops an iter_<N>/ subdir + a latest_checkpointed_iteration.txt tracker inside.
+    # Checkpointing, in Megatron's semantics. save and load are directories rather than single
+    # checkpoints: each save drops an iter_<N>/ subdir and a latest_checkpointed_iteration.txt
+    # tracker inside.
     save: str | None = None
     """Directory to write checkpoints to; unset => the launcher uses
     ``<output_dir>/<timestamp>/checkpoints``."""
@@ -261,17 +313,17 @@ class MoEPretrainConfig:
     ckpt_step: int | None = None
     """Load this iteration from ``load`` instead of the newest (200 => ``iter_0000200/``)."""
 
-    # Use Transformer Engine (its fused attention/LayerNorm/Linear speedup the model).
-    # Training and inference both need to use the same implementation, so a checkpoint never
-    # crosses impls - a `local`-trained checkpoint is NOT loadable into a TE model.
+    # Transformer Engine, for its fused attention, LayerNorm and Linear kernels. Training and
+    # inference must use the same implementation, because a checkpoint never crosses them: one
+    # trained under `local` is not loadable into a TE model.
     transformer_impl: str = "transformer_engine"
     """Megatron transformer implementation. ``transformer_engine`` uses TE's fused modules."""
 
     attention_backend: str = "auto"
     """TE attention backend: flash / fused / unfused / auto / local. ``auto`` lets TE pick."""
 
-    # The Megatron/apex fusion paths below stay OFF: TE supplies its own fused kernels, and the
-    # apex/prebuilt kernels these need aren't installed locally. (Harmless no-ops under TE.)
+    # The Megatron and apex fusion paths below stay off. TE supplies its own fused kernels, and
+    # the prebuilt kernels these would need are not installed locally, so they are no-ops under TE.
     persist_layer_norm: bool = False
     """Megatron's non-TE fused persistent LayerNorm; off (TE has its own)."""
 
@@ -364,8 +416,8 @@ class MoEPretrainConfig:
         """Absolutise all paths against ``repo_root`` and derive the data cache dir if unset."""
 
         def absolutise(p: str) -> str:
-            # Expand ${VAR}/~ first (so committed configs can reference ${DATA_STORE}/${SCRATCH}
-            # instead of a personal path; fails loud on an unset var), then anchor to repo_root.
+            # Expand ${VAR} and ~ first, so a committed config can reference ${DATA_STORE} rather
+            # than a personal path, and an unset variable fails loud. Then anchor to repo_root.
             path = Path(expand_path(p))
             return str(path if path.is_absolute() else repo_root / path)
 
@@ -443,6 +495,11 @@ def resolve_run_dir(
 
 def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
     """Map the config to a flat Megatron ``pretrain_gpt.py`` CLI arg list (pure)."""
+    if cfg.moe_router_load_balancing_type not in _MOE_ROUTER_LOAD_BALANCING_TYPES:
+        raise ValueError(
+            f"moe_router_load_balancing_type must be one of {_MOE_ROUTER_LOAD_BALANCING_TYPES}, "
+            f"got {cfg.moe_router_load_balancing_type!r}"
+        )
     args = [
         # model
         "--num-layers",
@@ -457,8 +514,8 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         str(cfg.seq_length),
         "--max-position-embeddings",
         str(cfg.seq_length),
-        # Architecture. Emitted unconditionally even at Megatron's own defaults: these define the
-        # network a checkpoint loads into, so the frozen launch_command.txt must record them.
+        # Architecture, emitted even at Megatron's own defaults. These define the network a
+        # checkpoint loads into, so the frozen launch_command.txt has to record them.
         "--position-embedding-type",
         cfg.position_embedding_type,
         "--normalization",
@@ -564,6 +621,85 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         args += ["--moe-z-loss-coeff", str(cfg.moe_z_loss_coeff)]
     if cfg.moe_per_layer_logging:
         args += ["--moe-per-layer-logging"]
+    # Rosenthal congestion-loss balancing types. Validated here and again on Megatron's own
+    # TransformerConfig. The duplication is deliberate rather than a leftover: this copy saves
+    # cluster queue time by failing at --dry-run, and the TransformerConfig copy is the one no
+    # launch path can bypass.
+    if (
+        cfg.moe_rosenthal_log_grad_ratio
+        and cfg.moe_router_load_balancing_type not in ROSENTHAL_TYPES
+    ):
+        raise ValueError(
+            "moe_rosenthal_log_grad_ratio requires moe_router_load_balancing_type to be "
+            f"'rosenthal' or 'global_rosenthal', got {cfg.moe_router_load_balancing_type!r}"
+        )
+    if cfg.moe_router_load_balancing_type in ROSENTHAL_TYPES:
+        if cfg.moe_rosenthal_variant not in VARIANTS:
+            raise ValueError(
+                f"moe_rosenthal_variant must be one of {VARIANTS}, got "
+                f"{cfg.moe_rosenthal_variant!r}"
+            )
+        if cfg.moe_rosenthal_cost not in COST_FAMILIES:
+            raise ValueError(
+                f"moe_rosenthal_cost must be one of {COST_FAMILIES}, got {cfg.moe_rosenthal_cost!r}"
+            )
+        # None means "use this cost family's own slope-matched default". Resolving it here means
+        # the sanity bound below and the emitted flag both see one concrete value.
+        _lambda = (
+            cfg.moe_rosenthal_lambda
+            if cfg.moe_rosenthal_lambda is not None
+            else DEFAULT_LAMBDA[cfg.moe_rosenthal_cost]
+        )
+        if _lambda <= 0:
+            raise ValueError(f"moe_rosenthal_lambda must be > 0, got {_lambda}")
+        if cfg.moe_router_score_function != "softmax":
+            raise ValueError(
+                "a rosenthal balancing type requires moe_router_score_function == 'softmax' "
+                "(sigmoid needs mean-centering to define the congestion loss, which is out of "
+                f"scope), got {cfg.moe_router_score_function!r}"
+            )
+        # Rules 5 and 6 rejected soft with global_rosenthal, and required
+        # tensor_model_parallel_size == 1 for soft with rosenthal. Both are retired: the
+        # synced-coefficient construction replaced the potential-form soft loss, which had needed a
+        # size-1 reduce group, and is correct at any reduce-group size. The numbers stay retired
+        # rather than being reused, because they are pinned into test names here and in
+        # megatron_rosenthal_test.py. The survivors are rules 1-4, 7 and 8.
+        #
+        # Rule 8 is a sanity bound on the pressure at full imbalance rather than a correctness
+        # condition, so it warns instead of blocking what may be a deliberate high-lambda
+        # experiment. The bound expression lives in losses/cost_families.py, imported both here and
+        # by the Megatron patch's copy of this check, so it is written out once. pressure_bound
+        # returns the expression string alongside the value so this caller does not decide which
+        # branch produced it a second time. Getting that second branch wrong would print a
+        # plausible but wrong expression beside a correct number, in a warning string no test
+        # asserts on.
+        _p = cost_exponent(cfg.moe_rosenthal_cost)
+        _bound = pressure_bound(
+            cfg.moe_aux_loss_coeff,
+            _lambda,
+            cfg.num_experts,
+            cfg.moe_router_topk,
+            cfg.moe_rosenthal_cost,
+            cfg.moe_rosenthal_variant,
+        )
+        if _bound.value > 1:
+            warnings.warn(
+                f"moe_rosenthal_lambda * moe_aux_loss_coeff * {_bound.expr}**{_p} = "
+                f"{_bound.value:.4g} > 1 -- the congestion pressure at full imbalance exceeds the "
+                "sanity bound; not an error, but check moe_rosenthal_lambda and moe_aux_loss_coeff "
+                "are what you intend.",
+                stacklevel=2,
+            )
+        args += [
+            "--moe-rosenthal-variant",
+            cfg.moe_rosenthal_variant,
+            "--moe-rosenthal-cost",
+            cfg.moe_rosenthal_cost,
+            "--moe-rosenthal-lambda",
+            str(_lambda),
+        ]
+        if cfg.moe_rosenthal_log_grad_ratio:
+            args += ["--moe-rosenthal-log-grad-ratio"]
     if cfg.log_throughput:
         args += ["--log-throughput"]
     if cfg.tensorboard_dir:
@@ -576,11 +712,11 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
             args += ["--wandb-entity", cfg.wandb_entity]
         if cfg.wandb_save_dir:
             args += ["--wandb-save-dir", cfg.wandb_save_dir]
-    # Data source — two mutually exclusive modes Megatron enforces (blend vs blend_per_split):
-    #   (1) single blob carved by --split into train/valid/test (ClimbMix), or
-    #   (2) pre-split --train-/--valid-data-path prefixes (per-cluster ClimbLab).
-    # Mixing them, or a blob without --split, leaves the valid split empty and eval crashes at
-    # eval_interval — hence the fail-loud checks here.
+    # Data source. Megatron enforces two mutually exclusive modes, blend and blend_per_split:
+    # either a single blob carved by --split into train/valid/test (ClimbMix), or pre-split
+    # --train-data-path and --valid-data-path prefixes (per-cluster ClimbLab). Mixing them, or
+    # giving a blob without --split, leaves the valid split empty and eval crashes at
+    # eval_interval, so the checks below fail loud instead.
     if cfg.data_path and cfg.train_data_path:
         raise ValueError("set either data_path (single blob + split) or train_data_path, not both")
     if cfg.data_path:

@@ -19,7 +19,7 @@ mkdir -p logs
 
 : "${WORKDIR:?set WORKDIR in config.sh and source it before sbatch}"
 
-CONFIG="${1:-configs/train/switch_local.yaml}"
+CONFIG="${1:?pass a config, e.g. configs/train/linear_rosenthal_hard.yaml}"
 # Optional 2nd arg: a checkpoints DIR to RESUME from (e.g. artifacts/<run>/checkpoints).
 # Given => the run continues in that dir and fails loud if it holds no checkpoint. Omitted => fresh
 # run in a new timestamped dir. Shell autocomplete works on the path.
@@ -77,6 +77,10 @@ srun --nodes=1 --ntasks=1 --environment=alps6 bash -c "
   # megatron-core 0.18 needs nvidia-resiliency-ext>=0.6; the NGC image ships 0.5.x. Newer wheel
   # into the venv (shadows the container copy), --no-deps so it can't pull a conflicting torch.
   uv pip install --no-deps 'nvidia-resiliency-ext>=0.6.0'
+  # The vendored Megatron carries no patches in git, so they must be applied before every run.
+  # Skipping this is silent for the aux_loss/none arms: they train fine and log none of the
+  # load-balance battery, SwapGap or phi_cong. A rosenthal arm fails loud at argparse instead.
+  ./scripts/apply-patches.sh
   echo '[env] build complete'
 "
 

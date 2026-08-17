@@ -1,0 +1,177 @@
+# Patch: Logit-space gradient probes for the Rosenthal congestion loss
+# ==================================
+# Problem: the spec asks how large a gradient the congestion loss injects into the router
+#   logits, relative to the task gradient at the same point. Separating the two on the router
+#   weight itself is not possible without reasoning about MoEAuxLossAutoScaler's backward and
+#   main_grad accumulation under the distributed optimizer -- internals that are not a stable
+#   interface. The two gradients are already separated upstream of where they merge: in
+#   TopKRouter.routing() the post-z-loss `logits` tensor feeds exactly two consumers,
+#   topk_routing_with_score_function (task loss) and compute_routing_scores_for_aux_loss
+#   (router-side balancing loss, here the congestion loss). An identity autograd probe on each
+#   branch records that branch's own incoming gradient norm and passes it through unchanged, so
+#   neither the z-loss gradient (probes sit after MoEAuxLossAutoScaler.apply) nor the sibling
+#   branch's gradient (a separate autograd node) is ever mixed in.
+#
+# What this patch does:
+#   - moe_utils.py: adds RouterGradProbe, an identity-forward autograd.Function that records its
+#     incoming gradient norm into the MoE metrics tracker and passes the gradient through. Placed
+#     beside MoEAuxLossAutoScaler, the other identity-forward Function this file already carries.
+#   - router.py: two call sites in TopKRouter.routing(), both gated on
+#     self.config.moe_rosenthal_log_grad_ratio (declared in transformer_config.py by patch 0003;
+#     this patch does not touch that file) and both after apply_z_loss's
+#     MoEAuxLossAutoScaler.apply call:
+#       - wraps the `logits` passed to topk_routing_with_score_function, recording under
+#         "rosenthal_grad_norm_task";
+#       - wraps the `logits` passed to compute_routing_scores_for_aux_loss, recording under
+#         "rosenthal_grad_norm_cg".
+#     Both read the same upstream `logits` tensor, but they are separate apply calls and so
+#     separate autograd nodes, meaning each backward only ever receives the gradient its own
+#     consumer produced. When the flag is false `logits` passes through unwrapped, so the probes
+#     cost nothing on a run that does not opt in.
+#   This patch registers no metric names and declares no config field. The two names reach the log
+#   through moe_track_names, and moe_rosenthal_log_grad_ratio was declared by patch 0003, so this
+#   patch touches neither training.py nor transformer_config.py.
+#
+# Where in the code:
+#   File: megatron/core/transformer/moe/moe_utils.py
+#   Location: immediately after MoEAuxLossAutoScaler, before permute() (~line 299).
+#
+#   File: megatron/core/transformer/moe/router.py
+#   Function: TopKRouter.routing()
+#   Location: the moe_utils import list (~line 12); the branch computing probs/routing_map via
+#     topk_routing_with_score_function, right after the `else:` for the sinkhorn check (~line
+#     730); the aux-loss block's call to compute_routing_scores_for_aux_loss, right after the
+#     `is_aux_loss_enabled()` gate (~line 766). Both hunks land clear of patch 0001's and patch
+#     0003's insertions in the same function, confirmed by grep rather than predicted from line
+#     numbers, so none of the three freezes the others.
+#
+# How to fix if this patch breaks on a future Megatron version:
+#   Search router.py's routing() for where the post-z-loss `logits` tensor is passed to
+#   topk_routing_with_score_function and to compute_routing_scores_for_aux_loss, and re-insert
+#   the two guarded RouterGradProbe.apply calls immediately before each, reading
+#   self.config.moe_rosenthal_log_grad_ratio. If MoEAuxLossAutoScaler has moved within moe_utils.py,
+#   RouterGradProbe can move with it -- its own location is not load-bearing, only that both
+#   routing() call sites sit after the z-loss autoscaler and read the same `logits` tensor as two
+#   distinct autograd nodes.
+#
+# Known limitations:
+#   - Recomputation (activation checkpointing) would fire both probes' backward twice per step,
+#     double-counting the recorded norm. None of our configs enable it for the MoE layer; if that
+#     changes, this metric needs re-checking before being trusted.
+#   - The "cg" probe is only meaningful when the congestion loss is the sole consumer of
+#     scores_for_aux_loss. Patch 0003's rule 7 enforces that before the probes are ever inserted,
+#     which is why that rule exists.
+#   - The ratio itself is not computed here and there is no in-training alert; it is formed at
+#     analysis time as the ratio of the two metrics' reported means over a window, not per step.
+#
+# Applied to: Megatron-LM core_v0.18.0
+#
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+index ca004bd10..8393a7630 100644
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -296,6 +296,53 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
+             MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
+ 
+ 
++class RouterGradProbe(torch.autograd.Function):
++    """Identity autograd probe that records the norm of the gradient flowing through it.
++
++    Inserted on a single branch of the router's post-z-loss ``logits`` tensor (one probe per
++    branch, e.g. the branch feeding the task loss and the branch feeding a router-side balancing
++    loss), it lets each branch's contribution to the router's gradient be measured separately even
++    though both are summed into the same weight gradient later in the same backward pass. This
++    works because forward is the identity and backward only ever receives the gradient flowing
++    into it from its own consumer -- it does not see, and cannot be confused with, whatever
++    gradient a probe on a sibling branch records (moe_congestion_routing patch).
++    """
++
++    @staticmethod
++    def forward(ctx, x: torch.Tensor, name: str, layer_number: int, num_layers: int) -> torch.Tensor:
++        """Pass ``x`` through unchanged, stashing the metric identity for backward.
++
++        Args:
++            x (torch.Tensor): The tensor to probe.
++            name (str): Metric name to record the gradient norm under.
++            layer_number (int): 1-based layer index, forwarded to the metrics tracker.
++            num_layers (int): Total number of layers, forwarded to the metrics tracker.
++
++        Returns:
++            torch.Tensor: ``x``, unchanged.
++        """
++        ctx.name = name
++        ctx.layer_number = layer_number
++        ctx.num_layers = num_layers
++        return x
++
++    @staticmethod
++    def backward(ctx, grad_output: torch.Tensor):
++        """Record the incoming gradient's norm, then pass it through unchanged.
++
++        Args:
++            grad_output (torch.Tensor): The gradient flowing back through this branch only.
++
++        Returns:
++            Tuple[torch.Tensor, None, None, None]: The gradient, unchanged, and ``None`` for the
++                three non-tensor forward arguments.
++        """
++        get_moe_metrics_tracker().record(
++            ctx.name, grad_output.float().norm(), ctx.layer_number, ctx.num_layers
++        )
++        return grad_output, None, None, None
++
++
+ def permute(
+     tokens: torch.Tensor,
+     routing_map: torch.Tensor,
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index baf887e55..b7442dad4 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -12,6 +12,7 @@ from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+ from megatron.core.transformer.moe.moe_utils import (
+     MoEAuxLossAutoScaler,
+     ProcessGroupCollection,
++    RouterGradProbe,
+     apply_biased_logits,
+     apply_random_logits,
+     apply_router_token_dropping,
+@@ -729,8 +730,17 @@ class TopKRouter(Router):
+         if self.routing_type == "sinkhorn":
+             probs, routing_map = self.sinkhorn_load_balancing(logits)
+         else:
++            # Logit-space gradient probe (moe_congestion_routing patch): wraps the branch that
++            # feeds the task loss, after the z-loss autoscaler so this sees neither the z-loss
++            # gradient nor the aux-loss branch's -- only what the task loss itself injects here.
++            if self.config.moe_rosenthal_log_grad_ratio:
++                logits_for_task = RouterGradProbe.apply(
++                    logits, "rosenthal_grad_norm_task", self.layer_number, self.config.num_layers
++                )
++            else:
++                logits_for_task = logits
+             probs, routing_map = topk_routing_with_score_function(
+-                logits,
++                logits_for_task,
+                 self.topk,
+                 use_pre_softmax=self.config.moe_router_pre_softmax,
+                 num_groups=self.config.moe_router_num_groups,
+@@ -756,8 +766,18 @@ class TopKRouter(Router):
+         # Apply each aux loss type and attach aux loss autograd function to probs
+         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
+             # Calculate scores and routing_map for aux loss
++            # Logit-space gradient probe (moe_congestion_routing patch): wraps the branch that
++            # feeds the router-side balancing loss (e.g. the congestion loss), on the same
++            # post-z-loss `logits` tensor as the task probe above but a separate autograd node, so
++            # each records only its own branch's contribution to the router's gradient.
++            if self.config.moe_rosenthal_log_grad_ratio:
++                logits_for_cg = RouterGradProbe.apply(
++                    logits, "rosenthal_grad_norm_cg", self.layer_number, self.config.num_layers
++                )
++            else:
++                logits_for_cg = logits
+             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+-                logits,
++                logits_for_cg,
+                 self.topk,
+                 self.score_function,
+                 fused=self.config.moe_router_fusion,

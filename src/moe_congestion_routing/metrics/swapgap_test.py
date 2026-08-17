@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from moe_congestion_routing.metrics.swapgap import SWAPGAP_COSTS, swapgap
+from moe_congestion_routing.metrics.swapgap import SWAPGAP_COSTS, _is_admissible_price, swapgap
 
 
 def _map(rows: list[list[int]]) -> torch.Tensor:
@@ -93,3 +93,21 @@ def test_cost_function_values():
     assert torch.allclose(SWAPGAP_COSTS["linear"](load, 1.0), torch.tensor([0.0, 2.0, 4.0]))
     assert torch.allclose(SWAPGAP_COSTS["quadratic"](load, 1.0), torch.tensor([0.0, 4.0, 16.0]))
     assert torch.allclose(SWAPGAP_COSTS["zero"](load, 1.0), torch.zeros(3))
+
+
+def test_admissibility_rejects_a_hard_barrier_price():
+    # 0 below a capacity threshold, inf above it
+    def hard_barrier(load: torch.Tensor, lam: float) -> torch.Tensor:
+        del lam
+        return torch.where(load <= 1.25, torch.zeros_like(load), torch.full_like(load, torch.inf))
+
+    assert not _is_admissible_price(hard_barrier)
+
+
+def test_admissibility_rejects_a_finite_non_monotone_price():
+    # Finite everywhere but strictly decreasing over roughly half of [0, 8]
+    def oscillating(load: torch.Tensor, lam: float) -> torch.Tensor:
+        del lam
+        return load + 2.0 * torch.sin(2.0 * torch.pi * load / 5.0)
+
+    assert not _is_admissible_price(oscillating)

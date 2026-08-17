@@ -5,11 +5,9 @@
 # applied fresh onto the pinned checkout. Anything that imports megatron.core (training, the losses
 # tests) needs the patches applied first.
 #
-# Idempotent by RESET: each submodule's tracked files are reset to the pinned commit
-# (git checkout -- .) before its patches are (re)applied, so this is safe to rerun in any state --
-# already-patched, half-patched, or after a submodule update. Mirrors the reference project's
-# `git checkout -- . && git apply patches/*.patch`. (We never edit the submodule by hand, so the
-# reset only ever discards a previous run's patches, never real work.)
+# Idempotent by RESET: each submodule is reset to the commit the project records for it
+# (`git rev-parse HEAD:<submodule>`) before its patches are (re)applied, so this is safe to rerun
+# in any state -- already-patched, half-patched, with a dirty index, or after a submodule update.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,8 +35,18 @@ for submodule_dir in "$patches_root"/*/; do
     fi
 
     # Reset to the pinned commit first, so patches always apply onto a clean tree (idempotency).
-    git -C "$target" checkout -- .
-    echo "[apply-patches] reset $submodule to pinned commit"
+    pin="$(git -C "$repo_root" rev-parse "HEAD:$submodule" 2>/dev/null || true)"
+    if [[ -z "$pin" ]]; then
+        echo "[apply-patches] ERROR: $submodule is not a submodule of this repo (no gitlink at HEAD)." >&2
+        exit 1
+    fi
+    if ! git -C "$target" cat-file -e "$pin^{commit}" 2>/dev/null; then
+        echo "[apply-patches] ERROR: $submodule does not contain its pinned commit $pin." >&2
+        echo "  Run: git submodule update --init $submodule" >&2
+        exit 1
+    fi
+    git -C "$target" reset --hard "$pin" >/dev/null
+    echo "[apply-patches] reset $submodule to pinned commit ${pin:0:9}"
 
     for patch in "${patches[@]}"; do
         name="$submodule/$(basename "$patch")"
