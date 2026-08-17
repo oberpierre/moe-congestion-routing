@@ -28,6 +28,7 @@ from moe_congestion_routing.training.megatron_path import ensure_on_path
 from moe_congestion_routing.training.probe_batch import (
     PROBE_ASSET_VERSION,
     PROBE_ROLES,
+    compute_provenance_sha256,
     tail_window,
 )
 
@@ -68,7 +69,8 @@ def _extract(args: argparse.Namespace) -> None:
     int32_info = numpy.iinfo(numpy.int32)
     if concatenated.min() < int32_info.min or concatenated.max() > int32_info.max:
         # IndexedDataset supports int64 blobs, so a downcast to int32 below would wrap silently
-        # rather than raise. Climb is uint16 so compatible.
+        # rather than raise. Climb's ids are uint16, so they fit int32 with room to spare, but
+        # this guard exists for a future blob whose ids might not.
         sys.exit(
             f"error: token ids exceed int32 range [{int32_info.min}, {int32_info.max}]: "
             f"min={int(concatenated.min())}, max={int(concatenated.max())}"
@@ -94,6 +96,7 @@ def _extract(args: argparse.Namespace) -> None:
         "seq_labels_sha256": seq_labels_sha256,
         "blob_dtype": numpy.dtype(ds.index.dtype).name,
     }
+    provenance["provenance_sha256"] = compute_provenance_sha256(provenance)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     numpy.savez(

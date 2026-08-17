@@ -14,11 +14,18 @@ from typing import TYPE_CHECKING, Any
 import numpy
 
 if TYPE_CHECKING:
-    import torch  # only for the probe_micro_batches type hint, not imported at runtime
+    import torch  # This import supplies only the probe_micro_batches type hint and never runs.
 
 PROBE_ASSET_VERSION = 1
 
 PROBE_ROLES = ("standing", "skewed", "dev")
+
+
+def compute_provenance_sha256(provenance: dict[str, Any]) -> str:
+    """Return the sha256 of every provenance field except ``provenance_sha256`` itself."""
+    fields = {key: value for key, value in provenance.items() if key != "provenance_sha256"}
+    canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def tail_window(
@@ -56,7 +63,7 @@ def tail_window(
 
 @dataclass(frozen=True)
 class ProbeBatch:
-    """A frozen probe instrument, loaded from an ``assets/probe/*.npz`` file."""
+    """A frozen probe batch, loaded from an ``assets/probe/*.npz`` file."""
 
     tokens: numpy.ndarray
     """``[S, seq_length + 1]`` int32; the raw ids, one extra trailing token per sequence."""
@@ -88,9 +95,10 @@ class ProbeBatch:
 def load_probe_batch(path: str | Path) -> ProbeBatch:
     """Load and validate a probe asset, raising ``ValueError`` naming ``path`` on any defect.
 
-    The sha256 check is the point of this function: a hand-edited or corrupted instrument must
-    fail the first time it is loaded rather than silently measuring the router on the wrong
-    tokens.
+    The sha256 checks are the point of this function, because every comparison across training
+    steps and across arms assumes these token ids never change. A hand-edited or corrupted file
+    must therefore fail the first time it is loaded, rather than silently measuring the router on
+    different tokens than the runs it will be compared against.
     """
     path = Path(path)
     with numpy.load(path, allow_pickle=False) as data:
@@ -110,6 +118,19 @@ def load_probe_batch(path: str | Path) -> ProbeBatch:
     role = provenance.get("role")
     if role not in PROBE_ROLES:
         raise ValueError(f"{path}: role {role!r} is not one of {PROBE_ROLES}")
+    if not path.name.startswith(f"{role}_"):
+        raise ValueError(
+            f"{path}: role {role!r} disagrees with filename {path.name!r}, which must "
+            f"start with '{role}_' (the writer's own naming rule, enforced here too)"
+        )
+
+    recomputed_provenance_sha256 = compute_provenance_sha256(provenance)
+    recorded_provenance_sha256 = provenance.get("provenance_sha256")
+    if recomputed_provenance_sha256 != recorded_provenance_sha256:
+        raise ValueError(
+            f"{path}: recomputed provenance_sha256 {recomputed_provenance_sha256} != recorded "
+            f"{recorded_provenance_sha256} (a provenance field was edited after extraction)"
+        )
 
     expected_shape = (provenance.get("S"), provenance.get("seq_length", -1) + 1)
     if tokens.shape != expected_shape:
@@ -140,7 +161,9 @@ def load_probe_batch(path: str | Path) -> ProbeBatch:
             f"{recorded_seq_labels_sha256} (asset is corrupted or was hand-edited)"
         )
 
-    tokens.setflags(write=False)  # make a probe asset immutable once loaded
+    # Freeze both arrays as changes would mutate what the probe measures
+    tokens.setflags(write=False)
+    seq_labels.setflags(write=False)
 
     return ProbeBatch(
         tokens=tokens,
@@ -180,6 +203,8 @@ def probe_micro_batches(
         raise ValueError(
             f"num_sequences {num_sequences} exceeds batch.num_sequences {batch.num_sequences}"
         )
+    if micro_batch_size <= 0:
+        raise ValueError(f"micro_batch_size must be positive, got {micro_batch_size}")
     if num_sequences % micro_batch_size != 0:
         raise ValueError(
             f"num_sequences {num_sequences} is not divisible by micro_batch_size {micro_batch_size}"
