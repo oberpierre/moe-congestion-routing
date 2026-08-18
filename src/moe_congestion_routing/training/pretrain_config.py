@@ -67,8 +67,9 @@ class MoEPretrainConfig:
     different geometry). ARCHITECTURAL: adds ``output_layer.weight`` to the state dict."""
 
     norm_epsilon: float = 1.0e-5
-    """Epsilon inside LayerNorm/RMSNorm. Megatron's default is 1e-5 and the FLAME reference does not
-    override it, so parity means leaving this alone -- exposed for deliberate deviations only."""
+    """Epsilon inside LayerNorm/RMSNorm. Defaults to Megatron's own 1e-5 because a config that sets
+    nothing should get Megatron's behaviour. The reference architecture (base_cluster.yaml) sets
+    1e-6 to match FLAME, which trains at that value."""
 
     swiglu: bool = False
     """Gated SiLU MLP instead of the default non-gated GELU. ARCHITECTURAL: ``linear_fc1`` emits
