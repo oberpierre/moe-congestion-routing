@@ -1,5 +1,6 @@
 """Run config for a MoE pretraining run through Megatron's ``pretrain_gpt.py``."""
 
+import itertools
 import sys
 import warnings
 from dataclasses import dataclass, replace
@@ -15,6 +16,7 @@ from ..losses.cost_families import (
     pressure_bound,
 )
 from ..paths import expand_path
+from ..probe_windows import parse_windows
 
 # Every name Megatron's own --moe-router-load-balancing-type accepts at the pinned commit, plus
 # our two rosenthal names. Checked unconditionally so a typo fails at --dry-run rather than at the
@@ -169,6 +171,29 @@ class MoEPretrainConfig:
 
     moe_per_layer_logging: bool = False
     """Also log every MoE metric per layer (``moe/<metric>_layer_<i>``), not just the layer-mean."""
+
+    moe_probe_batch: str | None = None
+    """Path to a frozen probe-batch asset (``assets/probe/*.npz``). Required whenever
+    ``moe_probe_coarse_interval`` is nonzero."""
+
+    moe_probe_coarse_interval: int = 0
+    """Probe every N iterations. ``0`` (the default) disables the probe entirely."""
+
+    moe_probe_dense_interval: int = 0
+    """Probe cadence inside a ``moe_probe_dense_windows`` window. Must be > 0 whenever a window is
+    given."""
+
+    moe_probe_dense_windows: list[str] | None = None
+    """Inclusive ``"start:end"`` step ranges probed at ``moe_probe_dense_interval``, anchored at
+    each window's own start rather than at iteration 0, e.g. ``["0:500"]``."""
+
+    moe_probe_seqs: int = 8
+    """Number of sequences from the probe asset forwarded per probe step. ``micro_batch_size``
+    must divide it evenly, so the probe batch splits into a whole number of microbatches."""
+
+    moe_probe_dir: str | None = None
+    """Directory probe dumps are written to. ``None`` => the launcher derives ``<run_dir>/probes``,
+    exactly like ``tensorboard_dir``."""
 
     train_data_path: str | None = None
     """``.bin``/``.idx`` prefix for the training split."""
@@ -400,6 +425,8 @@ class MoEPretrainConfig:
             load=absolutise(self.load) if self.load else None,
             tensorboard_dir=absolutise(self.tensorboard_dir) if self.tensorboard_dir else None,
             wandb_save_dir=absolutise(self.wandb_save_dir) if self.wandb_save_dir else None,
+            moe_probe_batch=absolutise(self.moe_probe_batch) if self.moe_probe_batch else None,
+            moe_probe_dir=absolutise(self.moe_probe_dir) if self.moe_probe_dir else None,
         )
 
 
@@ -586,6 +613,76 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         args += ["--moe-z-loss-coeff", str(cfg.moe_z_loss_coeff)]
     if cfg.moe_per_layer_logging:
         args += ["--moe-per-layer-logging"]
+    # Router probe. moe_probe_coarse_interval == 0 is the off-switch: no flag below is emitted.
+    if not cfg.moe_probe_coarse_interval and (
+        cfg.moe_probe_dense_interval or cfg.moe_probe_dense_windows
+    ):
+        raise ValueError(
+            "moe_probe_dense_interval/moe_probe_dense_windows are set but "
+            "moe_probe_coarse_interval is 0, which disables the probe entirely: the dense "
+            "settings would be silently dropped rather than sampled"
+        )
+    if cfg.moe_probe_coarse_interval:
+        if not cfg.moe_probe_batch:
+            raise ValueError("moe_probe_coarse_interval requires moe_probe_batch to be set")
+        if cfg.tensor_model_parallel_size != 1 or cfg.pipeline_model_parallel_size != 1:
+            raise ValueError(
+                "the router probe requires tensor_model_parallel_size == 1 and "
+                "pipeline_model_parallel_size == 1 (TP shards tokens across ranks, PP puts MoE "
+                f"layers on other ranks), got TP={cfg.tensor_model_parallel_size} "
+                f"PP={cfg.pipeline_model_parallel_size}"
+            )
+        # These four fields are not part of MoEPretrainConfig today, but would invalidate the probe
+        # therefore they are pinned by a test below, so it fires loud if they are added.
+        context_parallel_size = getattr(cfg, "context_parallel_size", 1)
+        if context_parallel_size != 1:
+            raise ValueError(
+                "the router probe requires context_parallel_size == 1 (CP shards tokens across "
+                f"ranks), got {context_parallel_size}"
+            )
+        if getattr(cfg, "moe_input_jitter_eps", None) is not None:
+            raise ValueError(
+                "the router probe requires moe_input_jitter_eps unset: apply_input_jitter is not "
+                "guarded by self.training, so a probe forward would route on perturbed inputs"
+            )
+        if getattr(cfg, "moe_expert_capacity_factor", None) is not None:
+            raise ValueError(
+                "the router probe requires moe_expert_capacity_factor unset: a capacity drop "
+                "would misalign the writer's fixed-K combine array against routing_map's bits"
+            )
+        if getattr(cfg, "cuda_graph_impl", "none") not in (None, "none"):
+            raise ValueError(
+                "the router probe requires CUDA graphs disabled (cuda_graph_impl='none'): a "
+                "captured graph would not re-run the probe's own no-grad forward"
+            )
+        if cfg.moe_probe_seqs % cfg.micro_batch_size != 0:
+            raise ValueError(
+                f"moe_probe_seqs {cfg.moe_probe_seqs} must be divisible by micro_batch_size "
+                f"{cfg.micro_batch_size}"
+            )
+        windows = parse_windows(cfg.moe_probe_dense_windows or [])
+        if windows and cfg.moe_probe_dense_interval <= 0:
+            raise ValueError("moe_probe_dense_windows requires moe_probe_dense_interval > 0")
+        for (_, end), (next_start, _) in itertools.pairwise(windows):
+            if next_start <= end:
+                raise ValueError(
+                    "moe_probe_dense_windows must be sorted and non-overlapping, got "
+                    f"{cfg.moe_probe_dense_windows}"
+                )
+        args += [
+            "--moe-probe-batch",
+            cfg.moe_probe_batch,
+            "--moe-probe-coarse-interval",
+            str(cfg.moe_probe_coarse_interval),
+            "--moe-probe-dense-interval",
+            str(cfg.moe_probe_dense_interval),
+            "--moe-probe-seqs",
+            str(cfg.moe_probe_seqs),
+        ]
+        if cfg.moe_probe_dense_windows:
+            args += ["--moe-probe-dense-windows", *cfg.moe_probe_dense_windows]
+        if cfg.moe_probe_dir:
+            args += ["--moe-probe-dir", cfg.moe_probe_dir]
     # Rosenthal congestion-loss balancing types. Validated here and again on Megatron's own
     # TransformerConfig. The duplication is deliberate rather than a leftover: this copy saves
     # cluster queue time by failing at --dry-run, and the TransformerConfig copy is the one no
