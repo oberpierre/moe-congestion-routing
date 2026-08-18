@@ -1,0 +1,6 @@
+# The cheap probe: one task, 50 examples, 0-shot. Which checkpoint to score comes from
+# --load and --ckpt-step.
+extends: base_local.yaml
+
+tasks: [arc_easy]
+limit: 50

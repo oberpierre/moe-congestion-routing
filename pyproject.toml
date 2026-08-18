@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "huggingface-hub>=1.23.0",
+    "lm_eval",
     "numpy>=2.5.1",
     "psutil>=7.2.2",
     "pyarrow>=25.0.0",
@@ -24,6 +25,14 @@ moe-congestion-routing = "moe_congestion_routing.main:main"
 [build-system]
 requires = ["uv_build>=0.11.26,<0.12.0"]
 build-backend = "uv_build"
+
+[tool.uv.sources]
+# The upstream lm-evaluation-harness's own `megatron_lm` optional-dependency group is
+# commented out in its pyproject.toml ("requires separate installation of Megatron-LM") because
+# it expects a pip-installed Megatron. We drive the vendored Megatron-LM/ submodule via
+# MEGATRON_PATH instead, so the plain path dependency is enough. Pinned to a release tag rather
+# than a branch so the harness version behind any published number is resolvable.
+lm_eval = { path = "lm-evaluation-harness", editable = true }
 
 [dependency-groups]
 dev = [

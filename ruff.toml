@@ -2,7 +2,7 @@ target-version = "py312"
 line-length = 100
 
 # Vendored/third-party code, not ours to lint:
-extend-exclude = ["Megatron-LM"]
+extend-exclude = ["Megatron-LM", "lm-evaluation-harness"]
 
 [lint]
 select = [

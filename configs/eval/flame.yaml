@@ -1,0 +1,24 @@
+# Scores against a downloaded CMU-FLAME/FLAME-MoE-290M-1.3B checkpoint.
+# Use scripts/fetch_flame_checkpoint.py to fetch a checkpoint, then point --load /
+# --ckpt-step at it, e.g.:
+#   uv run python scripts/run_lm_eval.py --config configs/eval/flame.yaml \
+#       --load $DATA_STORE/models/CMU-FLAME/FLAME-MoE-290M-1.3B --ckpt-step 5473
+extends: base_cluster.yaml
+
+# We pass --use-checkpoint-args with --no-use-tokenizer-model-from-checkpoint-args on every run,
+# so the architecture is restored but the tokenizer needs to be set explicitly here.
+tokenizer_type: HuggingFaceTokenizer
+tokenizer_model: EleutherAI/pythia-12b
+
+# FLAME's weights don't have a run dir, so we set output dir directly
+output_dir: artifacts/CMU-FLAME/FLAME-MoE-290M-1.3B
+
+tasks: [flame_suite]
+
+# --dist-ckpt-strictness log_all is required because the checkpoint predates TransformerEngine's
+# final_layernorm._extra_state blob, which FLAME's fp8-free training never wrote; the default
+# strictness raises on that missing key instead of dropping it. This is the only flag genuinely
+# specific to FLAME's checkpoint: --moe-router-dtype and --norm-epsilon are now mandatory for
+# every evaluation, since every checkpoint this project scores, FLAME's included, was trained
+# at fp32 routing and 1e-6.
+extra_args: "--dist-ckpt-strictness log_all"

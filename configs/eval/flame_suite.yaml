@@ -1,0 +1,3 @@
+extends: base_cluster.yaml
+
+tasks: [flame_suite]

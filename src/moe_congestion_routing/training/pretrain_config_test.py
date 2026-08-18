@@ -253,8 +253,8 @@ def test_architecture_flags_always_emitted_at_megatron_defaults():
 
 def test_architecture_flags_carry_the_reference_architecture():
     # base_cluster.yaml's parity setting is RoPE, which has no learned position table, plus
-    # RMSNorm, which has no bias. norm_epsilon stays at Megatron's 1e-5, since FLAME does not
-    # override it.
+    # RMSNorm, which has no bias. This bare _cfg() call still gets the dataclass default for
+    # norm_epsilon (1e-5), unrelated to what base_cluster.yaml itself sets.
     cfg = _cfg(position_embedding_type="rope", normalization="RMSNorm")
     pairs = _pairs(build_megatron_args(cfg))
     assert pairs["--position-embedding-type"] == "rope"
@@ -367,7 +367,7 @@ def test_base_cluster_config_pins_the_reference_architecture():
     cfg = MoEPretrainConfig.from_yaml(_CONFIGS / "base_cluster.yaml")
     assert cfg.position_embedding_type == "rope"  # else +2.10M learned position table
     assert cfg.normalization == "RMSNorm"
-    assert cfg.norm_epsilon == 1.0e-5  # FLAME does not override it, so parity = Megatron's default
+    assert cfg.norm_epsilon == 1.0e-6  # matches FLAME's own training epsilon
     assert not cfg.add_bias_linear  # else +1.22M linear biases
     assert cfg.swiglu
     assert cfg.moe_layer_freq == "[0]*1+[1]*8"  # 1 dense + 8 MoE, FLAME's own pattern
