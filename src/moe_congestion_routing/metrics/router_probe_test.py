@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 
 import numpy
 import pytest
@@ -202,6 +204,26 @@ def test_write_probe_dump_writes_arrays_and_metadata(tmp_path):
     assert meta["routing_map_bitorder"] == "big"
     assert meta["role"] == "dev"
     assert meta["has_expert_bias"] is False
+
+
+@pytest.mark.parametrize("umask, expected", [(0o022, 0o644), (0o002, 0o664)])
+def test_write_probe_dump_uses_the_mode_open_would_have_given(
+    tmp_path, monkeypatch, umask, expected
+):
+    calls = []
+
+    def fake_umask(new):
+        calls.append(new)
+        return umask
+
+    monkeypatch.setattr(os, "umask", fake_umask)
+    path = tmp_path / "iter_0000006.npz"
+    write_probe_dump(path, _one_layer_capture(), {"iteration": 6})
+
+    assert stat.S_IMODE(path.stat().st_mode) == expected
+    # POSIX has no getter, so reading the umask means setting it, whereas failing to restore it
+    # would leave the whole training process at 0 and every later file world-writable.
+    assert calls == [0, umask]
 
 
 def test_write_probe_dump_skips_an_existing_complete_file(tmp_path, caplog):

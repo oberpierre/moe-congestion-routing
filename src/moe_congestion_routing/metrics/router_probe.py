@@ -165,6 +165,11 @@ def write_probe_dump(path: str | Path, capture: ProbeCapture, meta: dict[str, An
         dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
     )
     try:
+        # mkstemp always creates the file at mode 0600, unlike a plain open() which respects the
+        # process umask, so we match what open() would get.
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp_name, 0o666 & ~umask)
         with os.fdopen(tmp_fd, "wb") as tmp_file:
             numpy.savez(tmp_file, **payload)
         os.replace(tmp_name, path)
