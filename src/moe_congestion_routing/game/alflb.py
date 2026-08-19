@@ -43,6 +43,8 @@ def top_k_map(y: np.ndarray, k: int) -> np.ndarray:
     ``torch.topk``'s, so a row whose k-th and (k+1)-th values are close is one where the rule
     and not the data picked the expert. :func:`tie_margins` measures that gap.
     """
+    # "stable" is what makes the tie rule true: an unstable sort may return tied columns in any
+    # order, so lowest-index-wins would hold only by luck.
     return np.argsort(-y, axis=1, kind="stable")[:, :k]
 
 
@@ -54,6 +56,13 @@ def tie_margins(y: np.ndarray, k: int) -> np.ndarray:
     Raw margins rather than a boolean count at some epsilon, because the right epsilon belongs
     to whatever reads the result instead of being baked in here.
     """
+    num_experts = y.shape[1]
+    # k == num_experts would index one past the last column. iterate accepts that k, so refusing
+    # here with the package's ValueError keeps one entry point from raising IndexError instead.
+    if not 1 <= k < num_experts:
+        raise ValueError(
+            f"1 <= k < num_experts required to have a margin, got k={k}, E={num_experts}"
+        )
     sorted_desc = np.sort(y, axis=1)[:, ::-1]
     return sorted_desc[:, k - 1] - sorted_desc[:, k]
 

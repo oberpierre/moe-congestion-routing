@@ -59,6 +59,27 @@ def test_returned_assignment_satisfies_both_constraints():
     assert np.all(result.x.sum(axis=0) <= 6)
 
 
+def test_every_expert_is_exactly_full_on_a_divisible_instance():
+    # When cap * E == N * k the loads must sum to N * k and none may exceed cap, so counting alone
+    # forces every expert to sit exactly at cap. Nothing about the affinities can change that.
+    a = np.random.default_rng(11).random((30, 5))
+    result = solve(a, k=2, cap=12)
+    assert result.divisible
+    assert result.max_load == 12
+    assert set(result.x.sum(axis=0).tolist()) == {12}
+
+
+def test_an_expert_with_spare_capacity_prices_at_zero():
+    # Complementary slackness: a constraint that is not binding cannot carry a shadow price. The
+    # converse does not hold, since a binding expert may also price at zero when the optimum is
+    # degenerate, so only this direction is asserted.
+    a = np.random.default_rng(7).random((37, 5))
+    result = solve(a, k=2, cap=16)
+    slack = result.x.sum(axis=0) < result.cap
+    assert slack.any()
+    np.testing.assert_allclose(result.capacity_duals[slack], 0.0)
+
+
 def test_duals_shapes_and_capacity_dual_sign_on_divisible_instance():
     n, e, k = 512, 8, 2
     a = np.random.default_rng(1).random((n, e))

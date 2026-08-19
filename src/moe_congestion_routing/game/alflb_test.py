@@ -49,6 +49,27 @@ def test_one_step_matches_hand_computed_update():
 # ---------------------------------------------------------------------------------------------
 
 
+def test_tie_margins_refuses_k_equal_to_num_experts():
+    # iterate accepts k == num_experts, so tie_margins must not be the one entry point that
+    # raises IndexError from an out-of-bounds column instead of the package's ValueError.
+    a = np.random.default_rng(0).random((4, 3))
+    with pytest.raises(ValueError, match="1 <= k < num_experts"):
+        tie_margins(a, 3)
+
+
+def test_the_returned_assignment_is_the_top_k_of_the_returned_bias():
+    # The fields must describe one state, not two. x, bias and load are computed at different
+    # points in the loop, so this is the invariant that ties them together: re-deriving the
+    # assignment from the bias the caller was handed has to reproduce the assignment it was
+    # handed, otherwise a caller comparing them is comparing different iterations.
+    a = _sigmoid(2 * np.random.default_rng(4).standard_normal((64, 8)))
+    result = iterate(a, k=2, eta=1e-2, steps=500, mode="deployed")
+    rederived = np.zeros_like(result.x)
+    np.put_along_axis(rederived, top_k_map(a + result.bias, 2), True, axis=1)
+    np.testing.assert_array_equal(result.x, rederived)
+    assert result.max_load == int(result.x.sum(axis=0).max())
+
+
 def test_top_k_map_breaks_ties_to_lowest_index():
     y = np.array([[0.5, 0.5, 0.5, 0.1]])
     assert top_k_map(y, k=2).tolist() == [[0, 1]]
