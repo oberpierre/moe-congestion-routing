@@ -22,6 +22,9 @@ class AlfResult(NamedTuple):
     # or over the last half of the trajectory when no cycle was found
     cycle_objective_mean: float  # objective averaged over one full cycle; NaN if no cycle
     cycle_max_load: int  # max load over one full cycle; final iterate's if no cycle
+    settled_at: int | None  # step at which the load hit exact balance and the bias froze
+    # None if that never happened, which for annealed mode means the convergence
+    # hypothesis was not reached inside the step budget
 
 
 def top_k_map(y: np.ndarray, k: int) -> np.ndarray:
@@ -106,6 +109,7 @@ def iterate(
     trajectory: list[tuple[np.ndarray, np.ndarray, float]] = []
 
     cycle_start = None
+    settled_at = None
     t = 0
     for t in range(steps):
         if detect_cycle:
@@ -125,8 +129,15 @@ def iterate(
         objective = float((a * x).sum())
         trajectory.append((bias.copy(), load, objective))
 
-        eta_t = _step_size(t, eta, mode, eta_schedule)
-        bias = bias + eta_t * np.sign(balanced_load - load)
+        direction = np.sign(balanced_load - load)
+        # Every sign zero means every expert carries exactly balanced_load. This is an exact
+        # fixed point and running on would change nothing. It can only occur when n*k/E is an
+        # integer, because loads are integers, so a non-divisible instance never settles.
+        if not direction.any():
+            settled_at = t
+            break
+
+        bias = bias + _step_size(t, eta, mode, eta_schedule) * direction
 
     steps_run = len(trajectory)
 
@@ -160,4 +171,5 @@ def iterate(
         band_width=band_width,
         cycle_objective_mean=cycle_objective_mean,
         cycle_max_load=cycle_max_load,
+        settled_at=settled_at,
     )

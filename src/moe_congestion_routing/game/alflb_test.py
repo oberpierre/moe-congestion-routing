@@ -1,3 +1,4 @@
+import math
 import subprocess
 import sys
 
@@ -123,23 +124,50 @@ def test_eta_schedule_with_deployed_mode_raises():
         )
 
 
-def test_annealing_damps_the_oscillation_that_a_fixed_step_sustains():
+def test_annealed_bias_reaches_a_hand_computed_endpoint():
+    # Both tokens prefer expert 0, so the bias walks to [-S, +S] with S the running sum of
+    # 0.1/sqrt(t+1). Token 1 flips once 2S > 0.6, which first holds at t=5 (S = 0.323167).
+    # Load is then [1, 1], so every sign is zero and the bias is converged for good.
+    a = np.array([[0.9, 0.1], [0.8, 0.2]])
+    expected = sum(0.1 / math.sqrt(t + 1) for t in range(5))
+    result = iterate(a, k=1, eta=0.1, steps=50, mode="annealed")
+
+    np.testing.assert_allclose(result.bias, [-expected, expected])
+    assert result.settled_at == 5
+    assert result.steps < 50  # stopped at the fixed point instead of spending the budget
+    np.testing.assert_array_equal(result.x, [[True, False], [False, True]])
+
+    # The same instance under a fixed step settles somewhere else, so the endpoint is a
+    # property of the schedule and not merely of the affinities.
+    assert not np.allclose(iterate(a, k=1, eta=0.1, steps=50, mode="deployed").bias, result.bias)
+
+
+def test_annealing_converges_where_a_fixed_step_orbits_forever():
+    # The substantive difference between the modes, on one instance. A fixed step keeps the load
+    # off balance forever inside a band of eta, whereas a decaying step reaches exact balance.
     rng = np.random.default_rng(1)
     a = _sigmoid(2 * rng.standard_normal((512, 8)))
-    steps = 2000
+    steps = 3000
     deployed = iterate(a, k=2, eta=1e-2, steps=steps, mode="deployed")
     annealed = iterate(a, k=2, eta=1e-2, steps=steps, mode="annealed")
 
-    # Deployed stops early because it found the orbit, and stays spread over a full eta.
+    assert deployed.settled_at is None  # orbits: never exactly balanced
     assert deployed.cycle_length is not None
-    assert deployed.steps < steps
     assert deployed.band_width == pytest.approx(1e-2)
 
-    # Annealed spends its whole budget and settles.
-    assert annealed.cycle_length is None
-    assert annealed.steps == steps
-    assert np.isnan(annealed.cycle_objective_mean)
+    assert annealed.settled_at is not None  # converged, and stopped there
+    assert annealed.steps == annealed.settled_at + 1
+    assert annealed.steps < steps
     assert annealed.band_width < deployed.band_width
+
+
+def test_settled_at_is_none_when_exact_balance_is_unreachable():
+    # Loads are integers, so n*k/E must be one for every sign to vanish. At 5*2/3 it cannot,
+    # and the honest report is that the budget ran out rather than that anything converged.
+    a = _sigmoid(2 * np.random.default_rng(0).standard_normal((5, 3)))
+    result = iterate(a, k=2, eta=1e-2, steps=200, mode="annealed")
+    assert result.settled_at is None
+    assert result.steps == 200
 
 
 @pytest.mark.parametrize(
