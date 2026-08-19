@@ -224,7 +224,7 @@ class MoEPretrainConfig:
     min_lr: float = 3.0e-5
     """Floor learning rate for the decay schedule."""
 
-    lr_decay_style: str = "WSDß"
+    lr_decay_style: str = "WSD"
     """Learning-rate decay schedule: ``constant``/``linear``/``cosine``/``inverse-square-root``/
     ``WSD``. ``WSD`` holds ``lr`` flat until ``lr_decay_iters - lr_wsd_decay_iters``, then anneals
     to ``min_lr``, which makes ANY stable-phase checkpoint branch-annealable into a finished model

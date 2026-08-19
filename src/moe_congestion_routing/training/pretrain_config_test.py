@@ -26,8 +26,15 @@ def _pairs(args: list[str]) -> dict[str, str]:
 
 
 def _cfg(**kw) -> MoEPretrainConfig:
-    """A build-args-ready config: fills the now-required train_data_path (yaml must set it)."""
-    return MoEPretrainConfig(train_data_path="/data/train", **kw)
+    """A build-args-ready config: fills the now-required train_data_path (yaml must set it).
+
+    ``lr_decay_style`` defaults to ``WSD``, which ``build_megatron_args`` refuses without
+    ``lr_wsd_decay_iters``, so the helper supplies one. It uses ``setdefault`` so a test can still
+    pass ``None`` explicitly to exercise that refusal.
+    """
+    kw.setdefault("train_data_path", "/data/train")
+    kw.setdefault("lr_wsd_decay_iters", 10)
+    return MoEPretrainConfig(**kw)
 
 
 def test_from_yaml_roundtrip(tmp_path):
@@ -179,7 +186,7 @@ def test_resolved_absolutises_logging_dirs(tmp_path):
 
 def test_build_megatron_args_requires_a_data_source():
     with pytest.raises(ValueError, match="a data source is required"):
-        build_megatron_args(MoEPretrainConfig(train_data_path=None, data_path=None))
+        build_megatron_args(_cfg(train_data_path=None, data_path=None))
 
 
 def test_build_megatron_args_valid_data_path_optional():
@@ -191,9 +198,7 @@ def test_build_megatron_args_valid_data_path_optional():
 
 def test_single_blob_data_path_emits_data_path_and_split():
     # ClimbMix mode: one blob carved by --split; no per-split paths.
-    args = build_megatron_args(
-        MoEPretrainConfig(train_data_path=None, data_path="/data/blob", split="99,1,0")
-    )
+    args = build_megatron_args(_cfg(train_data_path=None, data_path="/data/blob", split="99,1,0"))
     pairs = _pairs(args)
     assert pairs["--data-path"] == "/data/blob"
     assert pairs["--split"] == "99,1,0"
@@ -203,7 +208,7 @@ def test_single_blob_data_path_emits_data_path_and_split():
 def test_data_path_requires_split():
     # A blob without --split leaves the valid split empty and eval crashes, so fail loud instead.
     with pytest.raises(ValueError, match="split is required with data_path"):
-        build_megatron_args(MoEPretrainConfig(train_data_path=None, data_path="/data/blob"))
+        build_megatron_args(_cfg(train_data_path=None, data_path="/data/blob"))
 
 
 def test_split_incompatible_with_train_data_path():
