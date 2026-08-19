@@ -6,6 +6,12 @@ one expert row, so the constraint matrix is a bipartite incidence matrix and is 
 That means the LP relaxation already has integral vertices: this is the exact integer answer, not a
 relaxation of it.
 
+**Ties here are broken by HiGHS, not by us.** Elsewhere in this package the rule is "lowest
+expert index wins". On tied affinities ``solve(...).x`` and a top-k of the same matrix can name
+different experts while scoring identically, because both are optimal. So compare assignments
+against this oracle only off the tie set, which ``game.alflb.tie_margins`` identifies. The
+objective and the duals are unaffected either way.
+
 ``method="highs-ds"`` (dual simplex) is pinned for the *duals*, A simplex solve stops at a vertex,
 which is both integral and tied to a single basis, so its dual is the well-defined basic one.
 Interior-point can stop anywhere inside an optimal face. The capacity dual is the shadow price

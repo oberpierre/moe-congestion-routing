@@ -11,7 +11,17 @@ Per token ``i`` with selected set ``s_i`` and per-expert hard load ``n_e = |{j :
           - min_{e    in  s_i}( a_ie  - c_e(n_e)      )]_+  # worst expert we currently sit ON
 
 where ``a_ie`` is the token's affinity for expert ``e`` -- the raw (unbiased) router logit
-``sg(z_ie)``. For bias arms pass the *pre-bias* logits as affinities and the *realized* (biased)
+``sg(z_ie)``.
+
+**This is the measurement convention, not each arm's operative game.** Affinity is the pre-bias
+logit for *every* arm, including sigmoid-scored ones where the router actually ranks by
+``sigmoid(z) + b``, because the point of this number is to be a metric across arms: how far an
+arm's realized assignment sits from the equilibrium of a single pre-registered game. Making the
+affinity score-function-dependent would not rescue cross-arm comparison anyway, since a gap in
+sigmoid units on [0, 1] was never magnitude-comparable to one in logit units, it would only hide
+that.
+
+For bias arms pass the *pre-bias* logits as affinities and the *realized* (biased)
 assignment as the routing map: SwapGap then measures residual profitable swaps given how the model
 actually routed.
 

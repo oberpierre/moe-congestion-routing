@@ -38,15 +38,21 @@ def bias_update(load: np.ndarray, balanced_load: float, eta: float) -> np.ndarra
 
 def top_k_map(y: np.ndarray, k: int) -> np.ndarray:
     """Return the column indices of the k largest entries per row of y, shape [N, k].
-    Ties break to the lowest expert index (note that ``torch.topk`` does not)."""
+
+    Ties break to the lowest expert index, which is this package's rule rather than
+    ``torch.topk``'s, so a row whose k-th and (k+1)-th values are close is one where the rule
+    and not the data picked the expert. :func:`tie_margins` measures that gap.
+    """
     return np.argsort(-y, axis=1, kind="stable")[:, :k]
 
 
 def tie_margins(y: np.ndarray, k: int) -> np.ndarray:
     """Return, per row of y, the gap between the k-th and (k+1)-th largest values.
 
-    Raw margins rather than a boolean tie count at some epsilon, so any epsilon can be
-    applied by whatever reads the result instead of being baked in here.
+    A near-zero margin marks a row where :func:`top_k_map`'s tie rule, not the affinities,
+    decided the selection, so any comparison of assignments should be read against these.
+    Raw margins rather than a boolean count at some epsilon, because the right epsilon belongs
+    to whatever reads the result instead of being baked in here.
     """
     sorted_desc = np.sort(y, axis=1)[:, ::-1]
     return sorted_desc[:, k - 1] - sorted_desc[:, k]
