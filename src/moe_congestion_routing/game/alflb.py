@@ -27,6 +27,15 @@ class AlfResult(NamedTuple):
     # hypothesis was not reached inside the step budget
 
 
+def bias_update(load: np.ndarray, balanced_load: float, eta: float) -> np.ndarray:
+    """The ALF-LB bias delta for one step: ``eta * sign(balanced_load - load)``.
+
+    Split out of :func:`iterate` so the rule exists once and can be checked against Megatron's
+    own ``get_updated_expert_bias`` during testing.
+    """
+    return eta * np.sign(balanced_load - np.asarray(load, dtype=np.float64))
+
+
 def top_k_map(y: np.ndarray, k: int) -> np.ndarray:
     """Return the column indices of the k largest entries per row of y, shape [N, k].
     Ties break to the lowest expert index (note that ``torch.topk`` does not)."""
@@ -129,7 +138,7 @@ def iterate(
         objective = float((a * x).sum())
         trajectory.append((bias.copy(), load, objective))
 
-        direction = np.sign(balanced_load - load)
+        direction = bias_update(load, balanced_load, 1.0)
         # Every sign zero means every expert carries exactly balanced_load. This is an exact
         # fixed point and running on would change nothing. It can only occur when n*k/E is an
         # integer, because loads are integers, so a non-divisible instance never settles.

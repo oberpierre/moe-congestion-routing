@@ -5,7 +5,12 @@ import sys
 import numpy as np
 import pytest
 
-from moe_congestion_routing.game.alflb import iterate, tie_margins, top_k_map
+from moe_congestion_routing.game.alflb import (
+    bias_update,
+    iterate,
+    tie_margins,
+    top_k_map,
+)
 
 
 def _sigmoid(z: np.ndarray) -> np.ndarray:
@@ -248,7 +253,7 @@ def test_update_matches_megatron_get_updated_expert_bias(counts, tmp_path):
         eta = 1e-3
         counts_arr = np.array(counts, dtype=np.float64)
         balanced_load = counts_arr.sum() / len(counts)
-        expected_delta = eta * np.sign(balanced_load - counts_arr)
+        expected_delta = bias_update(counts_arr, balanced_load, eta)
 
         tokens = torch.tensor(counts, dtype=torch.float64)
         bias = torch.zeros(len(counts), dtype=torch.float64)
