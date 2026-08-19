@@ -59,9 +59,8 @@ moe_per_layer_logging: true
 log_throughput: true
 
 # router probe: a coarse grid every arm shares, plus a dense window over the warmup/early-
-# saturation phase. moe_probe_batch does not exist yet -- extract it from ClimbMix small's held-
-# out document tail on the cluster and commit the result before a cluster run; the standing probe
-# must be a git-tracked asset, so a run refuses to start otherwise, which is intended.
+# saturation phase. The standing asset must stay a git-tracked file, because a run refuses to
+# start without one and every arm's dumps are keyed to the same tokens.
 moe_probe_coarse_interval: 250
 moe_probe_dense_interval: 25
 moe_probe_dense_windows: ["0:500"]
