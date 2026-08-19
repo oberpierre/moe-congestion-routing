@@ -1,3 +1,4 @@
+import dataclasses
 import subprocess
 import sys
 from pathlib import Path
@@ -25,8 +26,15 @@ def _pairs(args: list[str]) -> dict[str, str]:
 
 
 def _cfg(**kw) -> MoEPretrainConfig:
-    """A build-args-ready config: fills the now-required train_data_path (yaml must set it)."""
-    return MoEPretrainConfig(train_data_path="/data/train", **kw)
+    """A build-args-ready config: fills the now-required train_data_path (yaml must set it).
+
+    ``lr_decay_style`` defaults to ``WSD``, which ``build_megatron_args`` refuses without
+    ``lr_wsd_decay_iters``, so the helper supplies one. It uses ``setdefault`` so a test can still
+    pass ``None`` explicitly to exercise that refusal.
+    """
+    kw.setdefault("train_data_path", "/data/train")
+    kw.setdefault("lr_wsd_decay_iters", 10)
+    return MoEPretrainConfig(**kw)
 
 
 def test_from_yaml_roundtrip(tmp_path):
@@ -178,7 +186,7 @@ def test_resolved_absolutises_logging_dirs(tmp_path):
 
 def test_build_megatron_args_requires_a_data_source():
     with pytest.raises(ValueError, match="a data source is required"):
-        build_megatron_args(MoEPretrainConfig(train_data_path=None, data_path=None))
+        build_megatron_args(_cfg(train_data_path=None, data_path=None))
 
 
 def test_build_megatron_args_valid_data_path_optional():
@@ -190,9 +198,7 @@ def test_build_megatron_args_valid_data_path_optional():
 
 def test_single_blob_data_path_emits_data_path_and_split():
     # ClimbMix mode: one blob carved by --split; no per-split paths.
-    args = build_megatron_args(
-        MoEPretrainConfig(train_data_path=None, data_path="/data/blob", split="99,1,0")
-    )
+    args = build_megatron_args(_cfg(train_data_path=None, data_path="/data/blob", split="99,1,0"))
     pairs = _pairs(args)
     assert pairs["--data-path"] == "/data/blob"
     assert pairs["--split"] == "99,1,0"
@@ -202,7 +208,7 @@ def test_single_blob_data_path_emits_data_path_and_split():
 def test_data_path_requires_split():
     # A blob without --split leaves the valid split empty and eval crashes, so fail loud instead.
     with pytest.raises(ValueError, match="split is required with data_path"):
-        build_megatron_args(MoEPretrainConfig(train_data_path=None, data_path="/data/blob"))
+        build_megatron_args(_cfg(train_data_path=None, data_path="/data/blob"))
 
 
 def test_split_incompatible_with_train_data_path():
@@ -401,6 +407,9 @@ def test_base_cluster_config_pins_the_reference_architecture():
     assert cfg.moe_router_topk == 8
     # At EP=1 every rank holds every expert, so per-expert load logging stays exact.
     assert cfg.expert_model_parallel_size == 1
+    # The common probe grid is structural: every arm shares one coarse interval so their dumps
+    # land on identical steps. Pinning it here guards against a config drift.
+    assert cfg.moe_probe_coarse_interval == 250
 
 
 def test_base_cluster_active_params_match_flame_exactly():
@@ -836,6 +845,185 @@ def test_all_seven_allowed_balancing_types_accepted(balancing_type):
     # build_megatron_args must not reject a name Megatron accepts.
     args = build_megatron_args(_cfg(moe_router_load_balancing_type=balancing_type))
     assert _pairs(args)["--moe-router-load-balancing-type"] == balancing_type
+
+
+def test_probe_flags_absent_by_default():
+    # moe_probe_coarse_interval defaults to 0, so an existing config's emitted command must not
+    # gain any of the six probe flags just by upgrading to a version of this schema that knows
+    # about them.
+    args = build_megatron_args(_cfg())
+    for flag in (
+        "--moe-probe-batch",
+        "--moe-probe-coarse-interval",
+        "--moe-probe-dense-interval",
+        "--moe-probe-dense-windows",
+        "--moe-probe-seqs",
+        "--moe-probe-dir",
+    ):
+        assert flag not in args
+
+
+def test_probe_emits_all_flags_when_enabled():
+    args = build_megatron_args(
+        _cfg(
+            moe_probe_batch="assets/probe/dev.npz",
+            moe_probe_coarse_interval=250,
+            moe_probe_dense_interval=25,
+            moe_probe_dense_windows=["0:500"],
+            moe_probe_seqs=8,
+            moe_probe_dir="/run/probes",
+        )
+    )
+    pairs = _pairs(args)
+    assert pairs["--moe-probe-batch"] == "assets/probe/dev.npz"
+    assert pairs["--moe-probe-coarse-interval"] == "250"
+    assert pairs["--moe-probe-dense-interval"] == "25"
+    assert pairs["--moe-probe-seqs"] == "8"
+    assert pairs["--moe-probe-dir"] == "/run/probes"
+    i = args.index("--moe-probe-dense-windows")
+    assert args[i + 1 : i + 2] == ["0:500"]
+
+
+def test_probe_requires_an_asset_when_enabled():
+    with pytest.raises(ValueError, match="moe_probe_batch"):
+        build_megatron_args(_cfg(moe_probe_coarse_interval=250))
+
+
+def test_probe_dense_settings_without_coarse_interval_are_rejected():
+    # moe_probe_coarse_interval == 0 skips the whole probe block, so dense settings left on their
+    # own would be silently dropped. Refuse the combination outright instead.
+    with pytest.raises(ValueError, match="moe_probe_coarse_interval"):
+        build_megatron_args(_cfg(moe_probe_dense_interval=25))
+    with pytest.raises(ValueError, match="moe_probe_coarse_interval"):
+        build_megatron_args(_cfg(moe_probe_dense_windows=["0:500"]))
+
+
+def test_probe_refuses_context_parallel_size_when_the_field_is_present():
+    # context_parallel_size is not a MoEPretrainConfig field today (pinned below), so this
+    # simulates a future config that adds it, via object.__setattr__ on the frozen dataclass.
+    cfg = _cfg(moe_probe_batch="assets/probe/dev.npz", moe_probe_coarse_interval=250)
+    object.__setattr__(cfg, "context_parallel_size", 2)
+    with pytest.raises(ValueError, match="context_parallel_size"):
+        build_megatron_args(cfg)
+
+
+def test_probe_refuses_moe_input_jitter_eps_when_the_field_is_present():
+    cfg = _cfg(moe_probe_batch="assets/probe/dev.npz", moe_probe_coarse_interval=250)
+    object.__setattr__(cfg, "moe_input_jitter_eps", 0.01)
+    with pytest.raises(ValueError, match="moe_input_jitter_eps"):
+        build_megatron_args(cfg)
+
+
+def test_probe_refuses_moe_expert_capacity_factor_when_the_field_is_present():
+    cfg = _cfg(moe_probe_batch="assets/probe/dev.npz", moe_probe_coarse_interval=250)
+    object.__setattr__(cfg, "moe_expert_capacity_factor", 1.5)
+    with pytest.raises(ValueError, match="moe_expert_capacity_factor"):
+        build_megatron_args(cfg)
+
+
+def test_probe_refuses_cuda_graphs_when_the_field_is_present():
+    cfg = _cfg(moe_probe_batch="assets/probe/dev.npz", moe_probe_coarse_interval=250)
+    object.__setattr__(cfg, "cuda_graph_impl", "local")
+    with pytest.raises(ValueError, match="cuda_graph_impl"):
+        build_megatron_args(cfg)
+
+
+def test_probe_refusal_fields_are_absent_from_the_schema():
+    # The four checks above read these via getattr(cfg, name, default) precisely because none is
+    # a real field. This test fires if any of these names is ever added.
+    field_names = {f.name for f in dataclasses.fields(MoEPretrainConfig)}
+    for absent in (
+        "context_parallel_size",
+        "moe_input_jitter_eps",
+        "moe_expert_capacity_factor",
+        "cuda_graph_impl",
+    ):
+        assert absent not in field_names
+
+
+def test_probe_requires_tensor_and_pipeline_parallel_size_one():
+    with pytest.raises(ValueError, match="tensor_model_parallel_size"):
+        build_megatron_args(
+            _cfg(
+                moe_probe_batch="assets/probe/dev.npz",
+                moe_probe_coarse_interval=250,
+                tensor_model_parallel_size=2,
+            )
+        )
+    with pytest.raises(ValueError, match="pipeline_model_parallel_size"):
+        build_megatron_args(
+            _cfg(
+                moe_probe_batch="assets/probe/dev.npz",
+                moe_probe_coarse_interval=250,
+                pipeline_model_parallel_size=2,
+            )
+        )
+
+
+def test_probe_seqs_must_divide_micro_batch_size():
+    with pytest.raises(ValueError, match="moe_probe_seqs"):
+        build_megatron_args(
+            _cfg(
+                moe_probe_batch="assets/probe/dev.npz",
+                moe_probe_coarse_interval=250,
+                moe_probe_seqs=7,
+                micro_batch_size=4,
+            )
+        )
+
+
+def test_probe_dense_interval_required_whenever_a_window_exists():
+    with pytest.raises(ValueError, match="moe_probe_dense_interval"):
+        build_megatron_args(
+            _cfg(
+                moe_probe_batch="assets/probe/dev.npz",
+                moe_probe_coarse_interval=250,
+                moe_probe_dense_windows=["0:500"],
+            )
+        )
+
+
+def test_probe_windows_must_be_sorted_and_non_overlapping():
+    with pytest.raises(ValueError, match="sorted and non-overlapping"):
+        build_megatron_args(
+            _cfg(
+                moe_probe_batch="assets/probe/dev.npz",
+                moe_probe_coarse_interval=250,
+                moe_probe_dense_interval=25,
+                moe_probe_dense_windows=["500:600", "0:100"],
+            )
+        )
+    with pytest.raises(ValueError, match="sorted and non-overlapping"):
+        build_megatron_args(
+            _cfg(
+                moe_probe_batch="assets/probe/dev.npz",
+                moe_probe_coarse_interval=250,
+                moe_probe_dense_interval=25,
+                moe_probe_dense_windows=["0:500", "400:600"],
+            )
+        )
+
+
+def test_probe_windows_malformed_spec_rejected():
+    with pytest.raises(ValueError, match="malformed"):
+        build_megatron_args(
+            _cfg(
+                moe_probe_batch="assets/probe/dev.npz",
+                moe_probe_coarse_interval=250,
+                moe_probe_dense_interval=25,
+                moe_probe_dense_windows=["0-500"],
+            )
+        )
+
+
+def test_resolved_absolutises_moe_probe_paths(tmp_path):
+    r = MoEPretrainConfig(
+        train_data_path="/data/train",
+        moe_probe_batch="assets/probe/dev.npz",
+        moe_probe_dir="probes",
+    ).resolved(tmp_path)
+    assert r.moe_probe_batch == str(tmp_path / "assets/probe/dev.npz")
+    assert r.moe_probe_dir == str(tmp_path / "probes")
 
 
 def test_pretrain_config_module_imports_no_torch():

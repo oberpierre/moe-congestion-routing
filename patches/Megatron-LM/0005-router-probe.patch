@@ -1,0 +1,159 @@
+# Patch: Router probe (per-layer router-state capture on a pre-registered schedule)
+# ==================================
+# Problem: SwapGap, the potential gap Phi, the balance-affinity frontier and every congestion
+#   cost-shape choice need the router's own logits, combine weights, assignment and bias at
+#   arbitrary post-hoc cost families and lambdas. Computing them inside the training loop commits
+#   every run to one cost family forever. The probe instead dumps the raw router state on a fixed
+#   token batch (assets/probe/*.npz, extracted and validated by our own package) on a
+#   pre-registered schedule, so every downstream metric becomes an offline computation over
+#   <run_dir>/probes/*.npz.
+#
+# What this patch does:
+#   - router.py: TopKRouter.forward captures this layer's pre-bias logits, combine weights,
+#     assignment and expert bias via a local import of
+#     moe_congestion_routing.metrics.router_probe.active_capture(), immediately before its
+#     `return probs, routing_map`.
+#   - arguments.py: adds --moe-probe-batch, --moe-probe-coarse-interval,
+#     --moe-probe-dense-interval, --moe-probe-dense-windows, --moe-probe-seqs and --moe-probe-dir
+#     to _add_moe_args. --moe-probe-coarse-interval is the on-switch: 0 (the default) disables the
+#     probe and every config emits an unchanged command line.
+#   - training.py: two insertions in train(), both gated on args.moe_probe_coarse_interval and
+#     both a function-local import of moe_congestion_routing.training.probe_forward, so neither
+#     the router hunk nor these two add an import-time dependency on our package:
+#       - immediately before the training while-loop: validate_probe_setup(args) once, then the
+#         init-state dump (iter_0000000.npz) when args.iteration == 0 (a fresh run, not a resume).
+#         Megatron's iteration counter starts at 1, so iteration 0 would be unreachable.
+#       - immediately after the eval block ends (its own get_moe_metrics_tracker().clear() call):
+#         probe_fires() decides whether this iteration is due, and run_probe() drives the forward.
+#         run_probe() reproduces eval's disable-forward-pre-hook / eval-mode / rerun-state-machine 
+#         / no-grad shape inside the probe, so its not part of the patch itself.
+#
+# Where in the code:
+#   File: megatron/core/transformer/moe/router.py
+#   Function: TopKRouter.forward()
+#   Location: immediately before `return probs, routing_map` (~line 1027). Landed clear of
+#     patch 0001's `_record_*` block in routing() (~50 lines earlier in a different method).
+#
+#   File: megatron/training/arguments.py
+#   Function: _add_moe_args()
+#   Location: the end of the function, before `return parser` (~line 3148).
+#
+#   File: megatron/training/training.py
+#   Function: train()
+#   Location: immediately before `while iteration < args.train_iters:` (~line 3419), and
+#     immediately after the eval block's `get_moe_metrics_tracker().clear()` (~line 3761), before
+#     the "Miscellaneous post-training-step functions" comment.
+#
+# How to fix if this patch breaks on a future Megatron version:
+#   Search router.py's TopKRouter.forward() for its `return probs, routing_map` after previous
+#   patches have been applied and re-insert the active_capture()/record() block immediately before
+#   it, verifying the variable names `logits`, `probs`, etc. are still consistent.
+#   In arguments.py, re-add the six --moe-probe-* flags to _add_moe_args() (or wherever MoE CLI
+#   flags now live). In training.py, re-find train()'s eval block (the one guarding
+#   get_moe_metrics_tracker().clear() on `args.num_experts is not None`) and re-insert the two
+#   guarded blocks: one before the training while-loop, one immediately after that block ends.
+#
+# Known limitations:
+#   - The probe never runs in a pipeline-parallel (PP > 1) or context-parallel (CP > 1) rank
+#     split, and tensor-parallel (TP > 1) shards tokens across ranks. pretrain_config.py refuses
+#     TP/PP/CP > 1 whenever the probe is enabled before this patch's code ever runs.
+#   - run_probe() assumes every data-parallel rank feeds the identical probe batch and only global
+#     rank 0 writes. A future data-parallel sharding of `probe_micro_batches` output would need
+#     this patch's forward()-side capture unchanged but run_probe() itself revisited.
+#
+# Applied to: Megatron-LM core_v0.18.0
+#
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 67bcf68fa..f2bf874f9 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -1024,6 +1024,22 @@ class TopKRouter(Router):
+ 
+         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+ 
++        # Router probe capture (moe_congestion_routing patch): records this layer's pre-bias
++        # logits, combine weights, assignment and expert bias for the offline metrics the probe
++        # feeds. active_capture() returns None on every ordinary training/eval step, which is
++        # what keeps this a cheap no-op off the probe schedule.
++        from moe_congestion_routing.metrics.router_probe import active_capture
++
++        capture = active_capture()
++        if capture is not None:
++            capture.record(
++                self.layer_number,
++                logits.reshape(-1, self.config.num_moe_experts),
++                probs,
++                routing_map,
++                self.expert_bias,
++            )
++
+         return probs, routing_map
+ 
+     def _load_from_state_dict(self, *args, **kwargs):
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 06ed16a55..96bc8ff32 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -3145,6 +3145,21 @@ def _add_moe_args(parser):
+     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
+                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
+                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
++    # Router probe arguments (moe_congestion_routing patch): a no-grad forward on a frozen batch,
++    # dumped on its own schedule for offline computations. moe-probe-coarse-interval is the
++    # on-switch: 0 (the default) disables the probe and every flag below is unread.
++    group.add_argument('--moe-probe-batch', type=str, default=None,
++                       help='Path to a frozen probe-batch asset (assets/probe/*.npz, moe_congestion_routing patch). Required whenever --moe-probe-coarse-interval is nonzero.')
++    group.add_argument('--moe-probe-coarse-interval', type=int, default=0,
++                       help='Probe every N iterations, identically across every run and arm (moe_congestion_routing patch). 0 disables the probe entirely.')
++    group.add_argument('--moe-probe-dense-interval', type=int, default=0,
++                       help='Probe cadence inside a --moe-probe-dense-windows window (moe_congestion_routing patch). Must be > 0 whenever a window is given.')
++    group.add_argument('--moe-probe-dense-windows', type=str, nargs='+', default=None,
++                       help='Inclusive "start:end" step ranges probed at --moe-probe-dense-interval, anchored at each window\'s own start (moe_congestion_routing patch), e.g. "0:500" "3200:3450".')
++    group.add_argument('--moe-probe-seqs', type=int, default=8,
++                       help='Number of sequences from the probe asset forwarded per probe step (moe_congestion_routing patch). --micro-batch-size must divide it evenly, so the probe batch splits into a whole number of microbatches.')
++    group.add_argument('--moe-probe-dir', type=str, default=None,
++                       help='Directory probe dumps are written to (moe_congestion_routing patch), one iter_%%07d.npz per probed step.')
+     return parser
+ 
+ def _add_mla_args(parser):
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 86a41126e..94f739dde 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -3414,6 +3414,15 @@ def train(
+             optimizers=[optimizer],
+         )
+ 
++    # Router probe (moe_congestion_routing patch): validate the schedule once at process start and
++    # fire the init-state dump for iteration 0 as Megatron's iteration counter starts at 1.
++    if args.moe_probe_coarse_interval:
++        from moe_congestion_routing.training.probe_forward import run_probe, validate_probe_setup
++
++        validate_probe_setup(args)
++        if args.iteration == 0:
++            run_probe(model, forward_step_func, 0)
++
+     # Run training iterations till done.
+     buffered_rollouts = None
+     while iteration < args.train_iters:
+@@ -3760,6 +3771,20 @@ def train(
+             if args.num_experts is not None:
+                 get_moe_metrics_tracker().clear()
+ 
++        # Router probe (moe_congestion_routing patch): a no-grad forward on the frozen probe
++        # batch, dumped on its own schedule rather than the eval block's
++        if args.moe_probe_coarse_interval:
++            from moe_congestion_routing.probe_windows import parse_windows
++            from moe_congestion_routing.training.probe_forward import probe_fires, run_probe
++
++            if probe_fires(
++                iteration,
++                args.moe_probe_coarse_interval,
++                args.moe_probe_dense_interval,
++                parse_windows(args.moe_probe_dense_windows or []),
++            ):
++                run_probe(model, forward_step_func, iteration)
++
+         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
+         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
+         # (it is reset inside the callback after logging).

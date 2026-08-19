@@ -58,6 +58,16 @@ moe_grouped_gemm: true
 moe_per_layer_logging: true
 log_throughput: true
 
+# router probe: a coarse grid every arm shares, plus a dense window over the warmup/early-
+# saturation phase. moe_probe_batch does not exist yet -- extract it from ClimbMix small's held-
+# out document tail on the cluster and commit the result before a cluster run; the standing probe
+# must be a git-tracked asset, so a run refuses to start otherwise, which is intended.
+moe_probe_coarse_interval: 250
+moe_probe_dense_interval: 25
+moe_probe_dense_windows: ["0:500"]
+moe_probe_seqs: 8
+moe_probe_batch: assets/probe/standing_climbmix_small_16x2048.npz
+
 # Set the project name and WANDB_API_KEY in the env (see config.sh.example) to enable W&B logging.
 # WANDB_MODE=offline skips the upload for quick runs.
 wandb_project: moe-congestion-routing
