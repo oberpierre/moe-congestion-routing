@@ -6,16 +6,24 @@ comparison (the theorem's hypothesis test) and three deployed comparisons at the
 Both modes are needed because a fixed step size orbits a limit cycle rather than converging, so
 only the annealed one tests the theorem's hypothesis.
 
+The grid's cells are independent, so `--jobs` runs them across worker processes. Parallelism
+cannot shrink a single cell, though: one cell is `bias_{t+1} = f(bias_t)`, strictly sequential,
+and on this grid a cell's cost is 99% that loop against the LP solve, so wall clock across any
+number of jobs is bounded below by the slowest single cell.
+
 Usage:
     uv run python scripts/run_game_comparison.py --out artifacts/game/alf_lb_vs_lp.csv
     uv run python scripts/run_game_comparison.py --out artifacts/game/quick.csv --quick
+    uv run python scripts/run_game_comparison.py --out artifacts/game/full.csv --jobs 8
 """
 
 import argparse
 import csv
 import dataclasses
+import os
 import time
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from moe_congestion_routing.game.compare import Comparison, compare
@@ -32,6 +40,8 @@ _ANNEALED_STEPS = 40000
 _DEPLOYED_ETAS = [1e-3, 1e-2, 1e-1]
 _DEPLOYED_STEPS = 2000
 
+_Cell = tuple[Instance, str, float, int]
+
 
 def _grid(quick: bool) -> list[Instance]:
     shapes = [_SHAPES[0]] if quick else _SHAPES
@@ -44,7 +54,7 @@ def _grid(quick: bool) -> list[Instance]:
     ]
 
 
-def _cells(quick: bool) -> list[tuple[Instance, str, float, int]]:
+def _cells(quick: bool) -> list[_Cell]:
     """One (instance, mode, eta, steps) tuple per CSV row."""
     cells = []
     for inst in _grid(quick):
@@ -52,6 +62,59 @@ def _cells(quick: bool) -> list[tuple[Instance, str, float, int]]:
         for eta in _DEPLOYED_ETAS:
             cells.append((inst, "deployed", eta, _DEPLOYED_STEPS))
     return cells
+
+
+def _run_cell(cell: _Cell) -> tuple[Comparison, float]:
+    """Score one grid cell against the LP oracle. Module-level so a process pool can pickle it.
+
+    A cell's own ALF-LB loop is what dominates its cost, not the work done here, so this
+    function is the unit of parallelism even though it cannot make any single cell faster.
+    """
+    inst, mode, eta, steps = cell
+    start = time.perf_counter()
+    a = affinities(inst)
+    c = compare(a, inst.k, eta=eta, steps=steps, mode=mode)
+    elapsed = time.perf_counter() - start
+    return c, elapsed
+
+
+def _run_serial(cells: list[_Cell]) -> list[Comparison]:
+    """Run every cell in one process, in cell order. This is the `--jobs 1` path."""
+    rows: list[Comparison] = []
+    for i, (inst, mode, eta, steps) in enumerate(cells, start=1):
+        c, elapsed = _run_cell((inst, mode, eta, steps))
+        print(
+            f"[cell {i}/{len(cells)}] n={inst.n} e={inst.e} k={inst.k} "
+            f"separation={inst.separation} seed={inst.seed} mode={mode} eta={eta} "
+            f"tier={c.tier} done in {elapsed:.1f}s",
+            flush=True,
+        )
+        rows.append(c)
+    return rows
+
+
+def _run_parallel(cells: list[_Cell], jobs: int) -> list[Comparison]:
+    """Run the grid across `jobs` worker processes.
+
+    Results are written into a list pre-sized to the grid and indexed by each cell's own
+    position, never by completion order, so the CSV a caller writes afterward does not depend
+    on which worker happens to finish first.
+    """
+    rows: list[Comparison | None] = [None] * len(cells)
+    with ProcessPoolExecutor(max_workers=jobs) as executor:
+        future_to_index = {executor.submit(_run_cell, cell): i for i, cell in enumerate(cells)}
+        for done, future in enumerate(as_completed(future_to_index), start=1):
+            i = future_to_index[future]
+            inst, mode, eta, steps = cells[i]
+            c, elapsed = future.result()
+            print(
+                f"[cell {i + 1}/{len(cells)}] n={inst.n} e={inst.e} k={inst.k} "
+                f"separation={inst.separation} seed={inst.seed} mode={mode} eta={eta} "
+                f"tier={c.tier} done in {elapsed:.1f}s ({done}/{len(cells)} complete)",
+                flush=True,
+            )
+            rows[i] = c
+    return rows  # type: ignore[return-value]
 
 
 def main() -> None:
@@ -62,6 +125,17 @@ def main() -> None:
         action="store_true",
         help="only the (512, 8, 2) shape and seed 0, for a fast smoke run",
     )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=os.cpu_count() or 1,
+        help=(
+            "worker processes for the cell grid (default: os.cpu_count()). --jobs 1 runs the "
+            "original single-process path and skips the process pool entirely. Cells are "
+            "independent but each one's ALF-LB loop is sequential and dominates its own cost, "
+            "so wall clock is bounded below by the slowest cell regardless of --jobs."
+        ),
+    )
     args = parser.parse_args()
 
     cells = _cells(args.quick)
@@ -71,27 +145,17 @@ def main() -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows: list[Comparison] = []
-    instances: list[Instance] = []
+    rows = _run_serial(cells) if args.jobs == 1 else _run_parallel(cells, args.jobs)
+
+    instances = [cell[0] for cell in cells]
+
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
-        for i, (inst, mode, eta, steps) in enumerate(cells, start=1):
-            start = time.perf_counter()
-            a = affinities(inst)
-            c = compare(a, inst.k, eta=eta, steps=steps, mode=mode)
-            elapsed = time.perf_counter() - start
-            print(
-                f"[cell {i}/{len(cells)}] n={inst.n} e={inst.e} k={inst.k} "
-                f"separation={inst.separation} seed={inst.seed} mode={mode} eta={eta} "
-                f"tier={c.tier} done in {elapsed:.1f}s",
-                flush=True,
-            )
+        for inst, c in zip(instances, rows, strict=True):
             writer.writerow(
                 [getattr(inst, name) for name in instance_fields] + list(c._asdict().values())
             )
-            rows.append(c)
-            instances.append(inst)
 
     tier_counts = Counter(c.tier for c in rows)
     print(f"\ntier counts: {dict(tier_counts)}")
