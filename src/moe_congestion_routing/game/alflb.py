@@ -36,8 +36,11 @@ class AlfResult(NamedTuple):
     closest_approach: BalancePoint  # trajectory step minimizing (max_load asc, objective
     # desc, step asc). Always present given steps >= 1 (iterate refuses steps=0), and
     # equal to the settling step when one exists
-    worst_phase: BalancePoint | None  # the detected cycle's most overloaded iterate,
+    cycle_worst: BalancePoint | None  # the detected cycle's most overloaded iterate,
     # tie-broken by lowest objective then earliest step, and None when no cycle was found
+    cycle_best: BalancePoint | None  # the cycle's iterate under closest_approach's own key
+    # (max_load asc, objective desc, step asc), restricted to the cycle. None when no
+    # cycle was found. The gap between this and cycle_worst is the orbit's swing.
 
 
 def bias_update(load: np.ndarray, balanced_load: float, eta: float) -> np.ndarray:
@@ -105,7 +108,7 @@ def _band_width_over(biases: list[np.ndarray]) -> float:
     return float(np.max(np.ptp(stacked, axis=0)))
 
 
-def _worst_phase_key(
+def _cycle_worst_key(
     item: tuple[int, tuple[np.ndarray, np.ndarray, float]],
 ) -> tuple[int, float, int]:
     """Sort key for the cycle's worst iterate: largest max_load, tie-broken by lowest
@@ -113,6 +116,15 @@ def _worst_phase_key(
     alone is negated rather than reversing the whole comparison."""
     offset, (_bias, load, objective) = item
     return (-int(load.max()), objective, offset)
+
+
+def _cycle_best_key(
+    item: tuple[int, tuple[np.ndarray, np.ndarray, float]],
+) -> tuple[int, float, int]:
+    """Sort key for the cycle's best iterate: closest_approach's own key, restricted to the
+    cycle. Least loaded, tie-broken by highest objective then earliest step."""
+    offset, (_bias, load, objective) = item
+    return (int(load.max()), -objective, offset)
 
 
 def iterate(
@@ -220,21 +232,34 @@ def iterate(
         cycle_objective_mean = float(np.mean([o for _, _, o in cycle]))
         cycle_max_load = int(max(load_e.max() for _, load_e, _ in cycle))
 
-        # worst_phase uses the opposite tie-break from closest_approach because this is the
+        # cycle_worst uses the opposite tie-break from closest_approach because this is the
         # cycle's worst iterate rather than its best. x is not stored per trajectory step,
         # because that would cost O(cycle_length * N * E) memory for no benefit, so it is
-        # recomputed once for the single winning step.
+        # recomputed once for each of the two winning steps.
         worst_offset, (worst_bias, worst_load, worst_objective) = min(
-            enumerate(cycle), key=_worst_phase_key
+            enumerate(cycle), key=_cycle_worst_key
         )
         worst_idx = top_k_map(a + worst_bias, k)
         worst_x = _assignment_from_top_k(worst_idx, num_experts)
-        worst_phase = BalancePoint(
+        cycle_worst = BalancePoint(
             step=cycle_start + worst_offset,
             max_load=int(worst_load.max()),
             objective=worst_objective,
             x=worst_x,
             bias=worst_bias,
+        )
+
+        best_offset, (best_bias, best_load, best_objective) = min(
+            enumerate(cycle), key=_cycle_best_key
+        )
+        best_idx = top_k_map(a + best_bias, k)
+        best_x = _assignment_from_top_k(best_idx, num_experts)
+        cycle_best = BalancePoint(
+            step=cycle_start + best_offset,
+            max_load=int(best_load.max()),
+            objective=best_objective,
+            x=best_x,
+            bias=best_bias,
         )
     else:
         cycle_length = None
@@ -242,7 +267,8 @@ def iterate(
         band_width = _band_width_over(biases[len(biases) // 2 :])
         cycle_objective_mean = float("nan")
         cycle_max_load = max_load
-        worst_phase = None
+        cycle_worst = None
+        cycle_best = None
 
     return AlfResult(
         x=x,
@@ -256,5 +282,6 @@ def iterate(
         cycle_max_load=cycle_max_load,
         settled_at=settled_at,
         closest_approach=closest_approach,
-        worst_phase=worst_phase,
+        cycle_worst=cycle_worst,
+        cycle_best=cycle_best,
     )

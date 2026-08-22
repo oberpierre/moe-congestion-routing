@@ -116,7 +116,7 @@ def test_per_expert_cap_vector_stays_integral_and_scores_no_higher_than_the_unif
     a = affinities(N512_E8_K2_SEP2_SEED1)
     cap0 = default_cap(n, k, e)
     alf = iterate(a, k=k, eta=1e-2, steps=2000, mode="deployed")
-    load_e = alf.worst_phase.x.sum(axis=0)
+    load_e = alf.cycle_worst.x.sum(axis=0)
     per_expert_cap = np.maximum(load_e, cap0)
 
     per_expert = solve(a, k, cap=per_expert_cap)

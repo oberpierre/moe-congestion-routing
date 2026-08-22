@@ -61,7 +61,7 @@ def test_deployed_objective_is_the_worst_phase_not_the_cycle_mean():
 
     assert c.objective == pytest.approx(875.990285, abs=1e-6)
     assert c.cycle_objective_mean == pytest.approx(876.015190, abs=1e-6)
-    assert c.basis == "worst_phase"
+    assert c.basis == "cycle_worst"
     assert c.basis_step == 17
 
 
@@ -321,4 +321,81 @@ def test_deployed_run_that_settles_produces_a_row_not_an_error():
     c = compare(a, 2, eta=0.1, steps=5, mode="deployed")
 
     assert c.tier == "settled"
-    assert c.basis == "closest_approach"
+    assert c.basis == "trajectory_closest"
+    assert c.cycle_best_step is None
+    assert c.cycle_best_max_load is None
+    assert np.isnan(c.cycle_best_objective)
+    assert np.isnan(c.cycle_best_gap_at_matched_cap)
+    assert np.isnan(c.cycle_best_gap_over_span)
+
+
+# ---------------------------------------------------------------------------------------------
+# Both cycle ends land at the values the spec measured, at the SAME matched capacity, and the
+# gap family is recoverable by subtraction from the unprefixed columns alone.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_cycle_best_and_cycle_worst_at_the_shared_yardstick_separation_2():
+    a = affinities(Instance(n=512, e=8, k=2, separation=2.0, seed=0))
+    c = compare(a, 2, eta=1e-3, steps=2000, mode="deployed")
+
+    assert c.matched_lp_objective == pytest.approx(877.104203, abs=1e-6)
+    assert c.span == pytest.approx(0.344926, abs=1e-6)
+
+    assert c.basis == "cycle_worst"
+    assert c.basis_step == 20
+    assert c.max_load == 130
+    assert c.objective == pytest.approx(876.948953, abs=1e-6)
+    assert c.gap_at_matched_cap == pytest.approx(0.155251, abs=1e-6)
+    assert c.gap_over_span == pytest.approx(0.450099, abs=1e-6)
+
+    assert c.cycle_best_step == 22
+    assert c.cycle_best_max_load == 129
+    assert c.cycle_best_objective == pytest.approx(876.972394, abs=1e-6)
+    assert c.cycle_best_gap_at_matched_cap == pytest.approx(0.131810, abs=1e-6)
+    assert c.cycle_best_gap_over_span == pytest.approx(0.382140, abs=1e-6)
+
+    assert c.cycle_best_gap_at_matched_cap == pytest.approx(
+        c.gap_at_matched_cap - (c.cycle_best_objective - c.objective), abs=1e-9
+    )
+
+
+def test_cycle_best_and_cycle_worst_at_the_shared_yardstick_separation_0_2():
+    # A second instance so the identity above is not a fixture coincidence.
+    a = affinities(Instance(n=512, e=8, k=2, separation=0.2, seed=0))
+    c = compare(a, 2, eta=1e-3, steps=2000, mode="deployed")
+
+    assert c.matched_lp_objective == pytest.approx(569.187007, abs=1e-6)
+    assert c.span == pytest.approx(0.059842, abs=1e-6)
+
+    assert c.basis_step == 6
+    assert c.max_load == 131
+    assert c.objective == pytest.approx(569.134450, abs=1e-6)
+    assert c.gap_over_span == pytest.approx(0.878268, abs=1e-6)
+
+    assert c.cycle_best_step == 8
+    assert c.cycle_best_max_load == 130
+    assert c.cycle_best_objective == pytest.approx(569.144318, abs=1e-6)
+    assert c.cycle_best_gap_over_span == pytest.approx(0.713353, abs=1e-6)
+
+    assert c.cycle_best_gap_at_matched_cap == pytest.approx(
+        c.gap_at_matched_cap - (c.cycle_best_objective - c.objective), abs=1e-9
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# An annealed row has no cycle, so cycle_best_* stay unset even though the run's basis is
+# trajectory_closest for a different reason than the settled-deployed case above.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_annealed_row_has_no_cycle_best():
+    a = affinities(N512_E8_K2_SEP2_SEED1)
+    c = compare(a, 2, eta=1e-2, steps=2000, mode="annealed")
+
+    assert c.basis == "trajectory_closest"
+    assert c.cycle_best_step is None
+    assert c.cycle_best_max_load is None
+    assert np.isnan(c.cycle_best_objective)
+    assert np.isnan(c.cycle_best_gap_at_matched_cap)
+    assert np.isnan(c.cycle_best_gap_over_span)

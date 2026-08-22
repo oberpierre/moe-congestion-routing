@@ -28,7 +28,7 @@ class Comparison(NamedTuple):
     # only) its cycle. Everything in this group comes from ONE basis point, named by `basis`.
     steps_run: int  # AlfResult.steps
     settled_at: int | None
-    basis: str  # "closest_approach" (annealed, or deployed if it settled) | "worst_phase"
+    basis: str  # "trajectory_closest" (annealed, or deployed if it settled) | "cycle_worst"
     basis_step: int  # the step of whichever BalancePoint the basis names
     objective: float
     max_load: int
@@ -52,10 +52,18 @@ class Comparison(NamedTuple):
     span: float  # vanilla_objective - lp_objective, the price of capacity
     gap_at_default_cap: float  # lp_objective - objective, NaN iff max_load > default_cap
     matched_cap: int  # max(max_load, default_cap)
+    matched_lp_objective: float  # oracle at matched_cap, NaN iff matched_lp_unconstrained
     gap_at_matched_cap: float  # NaN iff matched_lp_unconstrained
     gap_at_per_expert_cap: float  # re-solve at maximum(load_e, default_cap), NaN likewise
     gap_over_span: float  # gap_at_matched_cap / span, THE headline
     matched_lp_unconstrained: bool  # matched_cap >= vanilla_max_load, voids the two matched gaps
+    # The cycle's other end, deployed only: scored at the SAME matched_cap as the basis point
+    # above so the two gaps are comparable and the whole family is recoverable by subtraction.
+    cycle_best_step: int | None
+    cycle_best_max_load: int | None
+    cycle_best_objective: float
+    cycle_best_gap_at_matched_cap: float  # matched_lp_objective - cycle_best_objective
+    cycle_best_gap_over_span: float
     set_agreement: float  # fraction of tokens whose expert set equals the oracle's
     untied_set_agreement: float  # the same over untied tokens only
     tied_tokens: int  # pooled over both rankings
@@ -146,18 +154,18 @@ def compare(a: np.ndarray, k: int, *, eta: float, steps: int, mode: str = "annea
     result = alflb.iterate(a, k, eta=eta, steps=steps, mode=mode)
 
     if mode == "annealed":
-        basis = "closest_approach"
+        basis = "trajectory_closest"
         basis_point = result.closest_approach
     elif mode == "deployed":
-        if result.worst_phase is not None:
-            basis = "worst_phase"
-            basis_point = result.worst_phase
+        if result.cycle_worst is not None:
+            basis = "cycle_worst"
+            basis_point = result.cycle_worst
         else:
             # No cycle was detected, which happens when the run settles: the settle check
             # runs before the next iteration's cycle hash is taken, so a fixed point exits
-            # with no cycle and no worst_phase. Its closest approach IS the fixed point, so
+            # with no cycle and no cycle_worst. Its closest approach IS the fixed point, so
             # this is a valid row rather than an error that would abort a grid mid-write.
-            basis = "closest_approach"
+            basis = "trajectory_closest"
             basis_point = result.closest_approach
     else:
         raise ValueError(f"mode must be 'annealed' or 'deployed', got {mode!r}")
@@ -182,11 +190,13 @@ def compare(a: np.ndarray, k: int, *, eta: float, steps: int, mode: str = "annea
         # The matched LP is unconstrained here, so nothing about balancing is left to measure.
         # gap_at_default_cap is untouched by this guard: it depends only on its own cap and
         # stays exactly computable, including the degenerate case where it is exactly 0.0.
+        matched_lp_objective = float("nan")
         gap_at_matched_cap = float("nan")
         gap_at_per_expert_cap = float("nan")
     else:
         matched_result = oracle if matched_cap == cap0 else lp.solve(a, k, cap=matched_cap)
-        gap_at_matched_cap = matched_result.objective - objective
+        matched_lp_objective = matched_result.objective
+        gap_at_matched_cap = matched_lp_objective - objective
 
         per_expert_cap = np.maximum(load_e, cap0)
         per_expert_result = lp.solve(a, k, cap=per_expert_cap)
@@ -202,6 +212,30 @@ def compare(a: np.ndarray, k: int, *, eta: float, steps: int, mode: str = "annea
         gap_over_span = float("nan")
     else:
         gap_over_span = gap_at_matched_cap / span
+
+    # cycle_best is the orbit's other end: chosen structurally by the same (max_load,
+    # objective) key closest_approach uses, restricted to the cycle, never by the gap
+    # itself. It is scored at the SAME matched_cap as the basis point above so the gap
+    # family stays recoverable by subtraction rather than confounding a tighter ceiling
+    # with a better phase.
+    if result.cycle_best is not None:
+        cycle_best_step = result.cycle_best.step
+        cycle_best_max_load = result.cycle_best.max_load
+        cycle_best_objective = result.cycle_best.objective
+        if matched_lp_unconstrained:
+            cycle_best_gap_at_matched_cap = float("nan")
+        else:
+            cycle_best_gap_at_matched_cap = matched_lp_objective - cycle_best_objective
+        if matched_lp_unconstrained or span_negligible:
+            cycle_best_gap_over_span = float("nan")
+        else:
+            cycle_best_gap_over_span = cycle_best_gap_at_matched_cap / span
+    else:
+        cycle_best_step = None
+        cycle_best_max_load = None
+        cycle_best_objective = float("nan")
+        cycle_best_gap_at_matched_cap = float("nan")
+        cycle_best_gap_over_span = float("nan")
 
     excess_tokens = int(np.sum(np.maximum(load_e - cap0, 0)))
 
@@ -278,10 +312,16 @@ def compare(a: np.ndarray, k: int, *, eta: float, steps: int, mode: str = "annea
         span=span,
         gap_at_default_cap=gap_at_default_cap,
         matched_cap=matched_cap,
+        matched_lp_objective=matched_lp_objective,
         gap_at_matched_cap=gap_at_matched_cap,
         gap_at_per_expert_cap=gap_at_per_expert_cap,
         gap_over_span=gap_over_span,
         matched_lp_unconstrained=matched_lp_unconstrained,
+        cycle_best_step=cycle_best_step,
+        cycle_best_max_load=cycle_best_max_load,
+        cycle_best_objective=cycle_best_objective,
+        cycle_best_gap_at_matched_cap=cycle_best_gap_at_matched_cap,
+        cycle_best_gap_over_span=cycle_best_gap_over_span,
         set_agreement=set_agreement,
         untied_set_agreement=untied_set_agreement,
         tied_tokens=tied_tokens,

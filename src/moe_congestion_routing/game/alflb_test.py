@@ -11,7 +11,11 @@ from moe_congestion_routing.game.alflb import (
     tie_margins,
     top_k_map,
 )
-from moe_congestion_routing.game.ensemble import N512_E8_K2_SEP2_SEED1, affinities
+from moe_congestion_routing.game.ensemble import (
+    N512_E8_K2_SEP2_SEED1,
+    Instance,
+    affinities,
+)
 
 
 def _sigmoid(z: np.ndarray) -> np.ndarray:
@@ -233,27 +237,53 @@ def test_tie_margins_zero_on_a_row_of_equal_values():
 
 
 # ---------------------------------------------------------------------------------------------
-# closest_approach and worst_phase.
+# closest_approach and cycle_worst / cycle_best.
 # ---------------------------------------------------------------------------------------------
 
 
-def test_closest_approach_and_worst_phase_pull_opposite_ways_on_the_same_cycle():
+def test_closest_approach_and_cycle_worst_pull_opposite_ways_on_the_same_cycle():
     # Both cycle phases carry the same max load (130), so only the objective term in each key
     # decides which phase each field reports: closest_approach keeps the higher-objective phase,
-    # worst_phase keeps the lower-objective one. Dropping either key's objective term would let
+    # cycle_worst keeps the lower-objective one. Dropping either key's objective term would let
     # the two fields agree, which this pins against.
     a = affinities(N512_E8_K2_SEP2_SEED1)
     result = iterate(a, k=2, eta=1e-3, steps=2000, mode="deployed")
 
-    assert result.worst_phase is not None
-    assert result.closest_approach.objective > result.worst_phase.objective
+    assert result.cycle_worst is not None
+    assert result.closest_approach.objective > result.cycle_worst.objective
 
 
-def test_worst_phase_is_none_when_no_cycle_was_found():
-    # Annealed mode never runs cycle detection, so it can never report a worst_phase.
+def test_cycle_worst_and_cycle_best_are_none_when_no_cycle_was_found():
+    # Annealed mode never runs cycle detection, so it can never report either cycle phase.
     a = affinities(N512_E8_K2_SEP2_SEED1)
     result = iterate(a, k=2, eta=1e-2, steps=2000, mode="annealed")
-    assert result.worst_phase is None
+    assert result.cycle_worst is None
+    assert result.cycle_best is None
+
+
+def test_cycle_best_and_cycle_worst_span_the_orbit_at_the_measured_amplitude():
+    # Reconciled against the spec's reference table: a 512x8 top-2 instance whose fixed-eta
+    # cycle is [19, 23), where the gap swings 3x between the two phases the CSV reports.
+    a = affinities(Instance(n=512, e=8, k=2, separation=2.0, seed=0))
+    result = iterate(a, k=2, eta=1e-3, steps=2000, mode="deployed")
+
+    assert result.cycle_worst is not None
+    assert result.cycle_best is not None
+    assert result.cycle_worst.step == 20
+    assert result.cycle_worst.max_load == 130
+    assert result.cycle_worst.objective == pytest.approx(876.948953, abs=1e-6)
+    assert result.cycle_best.step == 22
+    assert result.cycle_best.max_load == 129
+    assert result.cycle_best.objective == pytest.approx(876.972394, abs=1e-6)
+
+
+def test_cycle_best_is_never_worse_than_cycle_worst_by_the_shared_key():
+    # cycle_best and cycle_worst are chosen structurally from (max_load, objective), never by
+    # the gap itself, so cycle_best's max_load must never exceed cycle_worst's on any cycle.
+    a = affinities(N512_E8_K2_SEP2_SEED1)
+    result = iterate(a, k=2, eta=1e-3, steps=2000, mode="deployed")
+
+    assert result.cycle_best.max_load <= result.cycle_worst.max_load
 
 
 def test_closest_approach_step_matches_settled_at_when_the_run_settles():
