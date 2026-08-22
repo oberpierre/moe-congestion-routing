@@ -4,6 +4,7 @@ import sys
 import numpy as np
 import pytest
 
+from moe_congestion_routing.game.ensemble import N512_E8_K2_SEP2_SEED1, affinities
 from moe_congestion_routing.game.lp import default_cap, solve
 from moe_congestion_routing.game.reference import enumerate_optimal
 
@@ -48,7 +49,7 @@ def test_k_greater_than_e_raises():
 
 def test_capacity_too_small_raises():
     a = np.random.default_rng(0).random((5, 3))
-    with pytest.raises(ValueError, match="cap\\*e"):
+    with pytest.raises(ValueError, match="sum\\(cap\\)"):
         solve(a, k=2, cap=1)
 
 
@@ -103,3 +104,25 @@ def test_divisible_false_when_default_cap_rounds_up():
     assert cap * e != n * k
     result = solve(np.random.default_rng(3).random((n, e)), k=k, cap=cap)
     assert not result.divisible
+
+
+def test_per_expert_cap_vector_stays_integral_and_scores_no_higher_than_the_uniform_cap():
+    # A per-expert vector hands the oracle less slack than the uniform cap that bounds it
+    # (uniform capacity at every expert, not only the loaded ones), so its objective can only be
+    # lower or equal, never higher.
+    from moe_congestion_routing.game.alflb import iterate
+
+    n, e, k = N512_E8_K2_SEP2_SEED1.n, N512_E8_K2_SEP2_SEED1.e, N512_E8_K2_SEP2_SEED1.k
+    a = affinities(N512_E8_K2_SEP2_SEED1)
+    cap0 = default_cap(n, k, e)
+    alf = iterate(a, k=k, eta=1e-2, steps=2000, mode="deployed")
+    load_e = alf.worst_phase.x.sum(axis=0)
+    per_expert_cap = np.maximum(load_e, cap0)
+
+    per_expert = solve(a, k, cap=per_expert_cap)
+    uniform = solve(a, k, cap=int(per_expert_cap.max()))
+
+    assert per_expert.max_fractional_deviation == 0.0
+    assert per_expert.objective <= uniform.objective
+    assert per_expert.objective == pytest.approx(876.1654466091404)
+    assert uniform.objective == pytest.approx(876.1905057465385)

@@ -27,7 +27,7 @@ from scipy.optimize import linprog
 class LpResult(NamedTuple):
     x: np.ndarray  # bool [N, E], exactly K True per row
     objective: float  # (a * x).sum() at x
-    cap: int  # the capacity actually solved with
+    cap: int | np.ndarray  # the capacity actually solved with, as given: a scalar or an [E] vector
     max_load: int  # x.sum(axis=0).max()
     max_fractional_deviation: float  # max|x_lp - round(x_lp)| before rounding
     capacity_duals: np.ndarray  # float64 [E], res.ineqlin.marginals, sign as reported
@@ -45,11 +45,12 @@ def default_cap(n: int, k: int, e: int) -> int:
     return -(-n * k // e)
 
 
-def solve(a: np.ndarray, k: int, cap: int | None = None) -> LpResult:
+def solve(a: np.ndarray, k: int, cap: int | np.ndarray | None = None) -> LpResult:
     """Solve the capacity-constrained top-K assignment LP and return it with its duals.
 
-    Raises ``ValueError`` when the instance is infeasible by counting alone (``k > e``, or
-    ``cap * e < n * k``).
+    ``cap`` is either a scalar applied to every expert or an integer ``[E]`` vector of
+    per-expert capacities. Raises ``ValueError`` when the instance is infeasible by counting
+    alone (``k > e``, or ``sum(cap) < n * k``).
     """
     a = np.asarray(a, dtype=np.float64)
     n, e = a.shape
@@ -57,8 +58,12 @@ def solve(a: np.ndarray, k: int, cap: int | None = None) -> LpResult:
         raise ValueError(f"infeasible: k={k} > e={e}, cannot choose {k} experts out of {e}")
     if cap is None:
         cap = default_cap(n, k, e)
-    if cap * e < n * k:
-        raise ValueError(f"infeasible: cap*e={cap * e} < n*k={n * k}")
+    # Broadcast a scalar to a uniform [E] vector so the rest of the solve is one code path
+    # regardless of whether the caller passed a single capacity or a per-expert one.
+    cap_vec = np.broadcast_to(np.asarray(cap, dtype=np.float64), (e,))
+    total_cap = float(cap_vec.sum())
+    if total_cap < n * k:
+        raise ValueError(f"infeasible: sum(cap)={total_cap} < n*k={n * k}")
 
     num_vars = n * e
     # Flatten x[i, e] to column index i*e + expert, matching a.ravel()'s row-major order so
@@ -77,7 +82,7 @@ def solve(a: np.ndarray, k: int, cap: int | None = None) -> LpResult:
         (np.ones(num_vars), (expert_of, columns)),
         shape=(e, num_vars),
     )
-    b_ub = np.full(e, cap, dtype=np.float64)
+    b_ub = cap_vec
 
     c = -a.ravel()
     res = linprog(
@@ -111,13 +116,15 @@ def solve(a: np.ndarray, k: int, cap: int | None = None) -> LpResult:
             f"have counts {experts_per_token[bad_tokens].tolist()}, expected k={k}"
         )
 
-    # axis=0 sums across tokens for one expert, so this is that expert's load.
+    # axis=0 sums across tokens for one expert, so this is that expert's load. Compared against
+    # cap_vec rather than the raw cap so this check is elementwise for a per-expert vector too.
     load_per_expert = x.sum(axis=0)
-    overloaded = np.flatnonzero(load_per_expert > cap)
+    overloaded = np.flatnonzero(load_per_expert > cap_vec)
     if overloaded.size:
         raise ValueError(
             f"rounded assignment violates the capacity constraint: experts {overloaded.tolist()} "
-            f"have loads {load_per_expert[overloaded].tolist()}, exceeding cap={cap}"
+            f"have loads {load_per_expert[overloaded].tolist()}, exceeding "
+            f"cap={cap_vec[overloaded].tolist()}"
         )
 
     return LpResult(
@@ -128,5 +135,5 @@ def solve(a: np.ndarray, k: int, cap: int | None = None) -> LpResult:
         max_fractional_deviation=max_fractional_deviation,
         capacity_duals=np.asarray(res.ineqlin.marginals, dtype=np.float64),
         token_duals=np.asarray(res.eqlin.marginals, dtype=np.float64),
-        divisible=(cap * e == n * k),
+        divisible=(total_cap == n * k),
     )

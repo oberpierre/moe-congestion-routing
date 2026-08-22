@@ -11,6 +11,7 @@ from moe_congestion_routing.game.alflb import (
     tie_margins,
     top_k_map,
 )
+from moe_congestion_routing.game.ensemble import N512_E8_K2_SEP2_SEED1, affinities
 
 
 def _sigmoid(z: np.ndarray) -> np.ndarray:
@@ -114,8 +115,7 @@ def test_band_width_equals_eta_exactly_for_a_period_two_cycle():
     # A period-2 cycle forces this: each expert's two sign steps over one period must
     # cancel to close the loop, so a moving expert takes one +eta step and one -eta step,
     # and the peak-to-peak of those two points is exactly eta.
-    rng = np.random.default_rng(1)
-    a = _sigmoid(2 * rng.standard_normal((512, 8)))
+    a = affinities(N512_E8_K2_SEP2_SEED1)
     for eta in (1e-3, 1e-2):
         result = iterate(a, k=2, eta=eta, steps=5000, mode="deployed")
         assert result.cycle_length == 2
@@ -126,8 +126,7 @@ def test_cycle_max_load_grows_with_eta():
     # Unlike band_width, the realized load overflow is not an identity of the cycle
     # length: it depends on how far the affinities let the bias push loads before the
     # sign flips, so this is where the fixed-step oscillation actually shows up.
-    rng = np.random.default_rng(1)
-    a = _sigmoid(2 * rng.standard_normal((512, 8)))
+    a = affinities(N512_E8_K2_SEP2_SEED1)
     small = iterate(a, k=2, eta=1e-3, steps=5000, mode="deployed")
     large = iterate(a, k=2, eta=1e-2, steps=5000, mode="deployed")
     assert large.cycle_max_load > small.cycle_max_load
@@ -171,8 +170,7 @@ def test_annealed_bias_reaches_a_hand_computed_endpoint():
 def test_annealing_converges_where_a_fixed_step_orbits_forever():
     # The substantive difference between the modes, on one instance. A fixed step keeps the load
     # off balance forever inside a band of eta, whereas a decaying step reaches exact balance.
-    rng = np.random.default_rng(1)
-    a = _sigmoid(2 * rng.standard_normal((512, 8)))
+    a = affinities(N512_E8_K2_SEP2_SEED1)
     steps = 3000
     deployed = iterate(a, k=2, eta=1e-2, steps=steps, mode="deployed")
     annealed = iterate(a, k=2, eta=1e-2, steps=steps, mode="annealed")
@@ -204,6 +202,7 @@ def test_settled_at_is_none_when_exact_balance_is_unreachable():
         ({"k": 2, "eta": 0.0, "steps": 5}, "eta must be positive"),
         ({"k": 2, "eta": -1e-2, "steps": 5}, "eta must be positive"),
         ({"k": 2, "eta": 1e-2, "steps": 5, "mode": "deploye"}, "mode must be one of"),
+        ({"k": 2, "eta": 1e-2, "steps": 0}, "steps must be >= 1"),
     ],
 )
 def test_iterate_refuses_inputs_it_cannot_honour(kwargs, match):
@@ -231,6 +230,74 @@ def test_tie_margins_shape_and_nonnegativity():
 def test_tie_margins_zero_on_a_row_of_equal_values():
     y = np.array([[1.0, 1.0, 1.0, 1.0]])
     assert tie_margins(y, k=2)[0] == 0.0
+
+
+# ---------------------------------------------------------------------------------------------
+# closest_approach and worst_phase.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_closest_approach_and_worst_phase_pull_opposite_ways_on_the_same_cycle():
+    # Both cycle phases carry the same max load (130), so only the objective term in each key
+    # decides which phase each field reports: closest_approach keeps the higher-objective phase,
+    # worst_phase keeps the lower-objective one. Dropping either key's objective term would let
+    # the two fields agree, which this pins against.
+    a = affinities(N512_E8_K2_SEP2_SEED1)
+    result = iterate(a, k=2, eta=1e-3, steps=2000, mode="deployed")
+
+    assert result.worst_phase is not None
+    assert result.closest_approach.objective > result.worst_phase.objective
+
+
+def test_worst_phase_is_none_when_no_cycle_was_found():
+    # Annealed mode never runs cycle detection, so it can never report a worst_phase.
+    a = affinities(N512_E8_K2_SEP2_SEED1)
+    result = iterate(a, k=2, eta=1e-2, steps=2000, mode="annealed")
+    assert result.worst_phase is None
+
+
+def test_closest_approach_step_matches_settled_at_when_the_run_settles():
+    a = affinities(N512_E8_K2_SEP2_SEED1)
+    result = iterate(a, k=2, eta=1e-2, steps=2000, mode="annealed")
+    assert result.settled_at is not None
+    assert result.closest_approach.step == result.settled_at
+
+
+def test_closest_approach_breaks_ties_by_objective_not_earliest_step():
+    # Steps 1, 2, 3 and 4 all tie at the minimum max load of 2, and only step 2's objective
+    # term in the sort key is highest: token 3 stays on expert 1 at affinity 0.9 there, where
+    # steps 1 and 3 send it to expert 2 at 0.8. Dropping the objective term from the key would
+    # select step 1, the earliest tied step, instead.
+    a = np.array(
+        [
+            [0.8, 0.9, 0.0],
+            [0.0, 0.7, 0.3],
+            [0.6, 0.1, 0.9],
+            [0.4, 0.9, 0.8],
+        ]
+    )
+    result = iterate(a, k=1, eta=0.1, steps=5, mode="deployed")
+    assert result.closest_approach.step == 2
+    assert result.closest_approach.objective == pytest.approx(3.3)
+
+
+def test_a_run_that_starts_balanced_settles_at_step_zero_without_moving_the_bias():
+    # The fixed-point check runs before the update, so a perfectly balanced start must settle
+    # immediately and the bias must never move.
+    a = np.array(
+        [
+            [0.9, 0.8, 0.1, 0.0],
+            [0.9, 0.8, 0.1, 0.0],
+            [0.0, 0.1, 0.8, 0.9],
+            [0.0, 0.1, 0.8, 0.9],
+        ]
+    )
+    result = iterate(a, k=2, eta=1e-1, steps=5, mode="deployed")
+    assert result.settled_at == 0
+    assert result.steps == 1
+    np.testing.assert_array_equal(result.bias, [0.0, 0.0, 0.0, 0.0])
+    np.testing.assert_array_equal(result.x.sum(axis=0), [2, 2, 2, 2])
+    assert result.closest_approach.step == 0
 
 
 # ---------------------------------------------------------------------------------------------

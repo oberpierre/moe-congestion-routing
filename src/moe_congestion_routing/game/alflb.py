@@ -11,6 +11,14 @@ from typing import NamedTuple
 import numpy as np
 
 
+class BalancePoint(NamedTuple):
+    step: int  # the step attaining it
+    max_load: int  # load.max() there
+    objective: float  # (a * x).sum() there
+    x: np.ndarray  # bool [N, E], the assignment there
+    bias: np.ndarray  # float64 [E], the bias there
+
+
 class AlfResult(NamedTuple):
     x: np.ndarray  # bool [N, E], the final iterate's assignment
     bias: np.ndarray  # float64 [E], the final bias
@@ -25,6 +33,11 @@ class AlfResult(NamedTuple):
     settled_at: int | None  # step at which the load hit exact balance and the bias froze
     # None if that never happened, which for annealed mode means the convergence
     # hypothesis was not reached inside the step budget
+    closest_approach: BalancePoint  # trajectory step minimizing (max_load asc, objective
+    # desc, step asc). Always present given steps >= 1 (iterate refuses steps=0), and
+    # equal to the settling step when one exists
+    worst_phase: BalancePoint | None  # the detected cycle's most overloaded iterate,
+    # tie-broken by lowest objective then earliest step, and None when no cycle was found
 
 
 def bias_update(load: np.ndarray, balanced_load: float, eta: float) -> np.ndarray:
@@ -92,6 +105,16 @@ def _band_width_over(biases: list[np.ndarray]) -> float:
     return float(np.max(np.ptp(stacked, axis=0)))
 
 
+def _worst_phase_key(
+    item: tuple[int, tuple[np.ndarray, np.ndarray, float]],
+) -> tuple[int, float, int]:
+    """Sort key for the cycle's worst iterate: largest max_load, tie-broken by lowest
+    objective then earliest step. Only max_load wants descending order, which is why it
+    alone is negated rather than reversing the whole comparison."""
+    offset, (_bias, load, objective) = item
+    return (-int(load.max()), objective, offset)
+
+
 def iterate(
     a: np.ndarray,
     k: int,
@@ -112,6 +135,10 @@ def iterate(
         raise ValueError(f"mode must be one of {sorted(_MODES)}, got {mode!r}")
     if eta_schedule is not None and mode != "annealed":
         raise ValueError("eta_schedule requires mode='annealed'")
+    # A zero-step run has no trajectory to minimize closest_approach over, which the docstring
+    # documents as always present.
+    if steps < 1:
+        raise ValueError(f"steps must be >= 1 to have a trajectory to minimize over, got {steps}")
     # eta scales the lattice the cycle hash is taken on, so eta <= 0 collapses it: at 0 the
     # coordinate is 0/0 = nan, which casts to a platform-defined int and reports a bogus cycle.
     if not eta > 0:
@@ -134,6 +161,10 @@ def iterate(
 
     cycle_start = None
     settled_at = None
+    # Running best for closest_approach, updated from the same (load, objective) the loop
+    # already computes so no extra pass over the trajectory is needed.
+    closest_key = None
+    closest_approach = None
     t = 0
     for t in range(steps):
         if detect_cycle:
@@ -152,6 +183,16 @@ def iterate(
         load = x.sum(axis=0)
         objective = float((a * x).sum())
         trajectory.append((bias.copy(), load, objective))
+
+        max_load_t = int(load.max())
+        # The lexicographic key (max_load asc, objective desc, step asc) is compared as a tuple.
+        # Negating the objective as tuple comparison is ascending on every field.
+        key = (max_load_t, -objective, t)
+        if closest_key is None or key < closest_key:
+            closest_key = key
+            closest_approach = BalancePoint(
+                step=t, max_load=max_load_t, objective=objective, x=x.copy(), bias=bias.copy()
+            )
 
         direction = bias_update(load, balanced_load, 1.0)
         # Every sign zero means every expert carries exactly balanced_load. This is an exact
@@ -178,12 +219,30 @@ def iterate(
         band_width = _band_width_over([b for b, _, _ in cycle])
         cycle_objective_mean = float(np.mean([o for _, _, o in cycle]))
         cycle_max_load = int(max(load_e.max() for _, load_e, _ in cycle))
+
+        # worst_phase uses the opposite tie-break from closest_approach because this is the
+        # cycle's worst iterate rather than its best. x is not stored per trajectory step,
+        # because that would cost O(cycle_length * N * E) memory for no benefit, so it is
+        # recomputed once for the single winning step.
+        worst_offset, (worst_bias, worst_load, worst_objective) = min(
+            enumerate(cycle), key=_worst_phase_key
+        )
+        worst_idx = top_k_map(a + worst_bias, k)
+        worst_x = _assignment_from_top_k(worst_idx, num_experts)
+        worst_phase = BalancePoint(
+            step=cycle_start + worst_offset,
+            max_load=int(worst_load.max()),
+            objective=worst_objective,
+            x=worst_x,
+            bias=worst_bias,
+        )
     else:
         cycle_length = None
         biases = [b for b, _, _ in trajectory] + [bias]
         band_width = _band_width_over(biases[len(biases) // 2 :])
         cycle_objective_mean = float("nan")
         cycle_max_load = max_load
+        worst_phase = None
 
     return AlfResult(
         x=x,
@@ -196,4 +255,6 @@ def iterate(
         cycle_objective_mean=cycle_objective_mean,
         cycle_max_load=cycle_max_load,
         settled_at=settled_at,
+        closest_approach=closest_approach,
+        worst_phase=worst_phase,
     )
