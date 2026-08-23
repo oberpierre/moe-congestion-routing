@@ -13,8 +13,8 @@ sequential, and on this grid a cell's cost is 99% that loop against the LP solve
 across any number of jobs is bounded below by the slowest single cell.
 
 Rows are written to the output CSV as a contiguous prefix, flushed as soon as a cell and every
-cell before it have finished, so a cell that fails still leaves every earlier row on disk
-instead of discarding the whole grid.
+cell before it have been collected, so a cell that fails or a run that is interrupted still
+leaves every earlier row on disk instead of discarding the whole grid.
 
 Usage:
     uv run python scripts/run_game_comparison.py --out artifacts/game/alf_lb_vs_lp.csv
@@ -25,26 +25,25 @@ Usage:
 import argparse
 import csv
 import dataclasses
-import multiprocessing
 import os
-import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import IO, Any
 
-from moe_congestion_routing.game.compare import Comparison, compare
-from moe_congestion_routing.game.ensemble import Instance, affinities
+from moe_congestion_routing.game.compare import Comparison
+from moe_congestion_routing.game.ensemble import Instance
+from moe_congestion_routing.game.grid import Cell, Row, run_grid
 
 _SHAPES = [(512, 8, 2), (2048, 64, 8)]
 _SEPARATIONS = [2.0, 0.2]
 _SEEDS = [0, 1, 2]
 _ANNEALED_ETA = 1e-2
+# Half this budget would look like a safe saving but is not, because the one large-shape
+# (n=2048, e=64, k=8) cell that settles at all does not do so until step 25582. A smaller
+# annealed budget would silently turn that row from "settled" into "unconverged", and that row
+# is the one the ALF-LB-versus-LP-optimum theorem test rests on.
 _ANNEALED_STEPS = 40000
 _DEPLOYED_ETAS = [1e-3, 1e-2, 1e-1]
 _DEPLOYED_STEPS = 2000
-
-_Cell = tuple[Instance, str, float, int]
 
 
 def _grid(quick: bool) -> list[Instance]:
@@ -58,117 +57,14 @@ def _grid(quick: bool) -> list[Instance]:
     ]
 
 
-def _cells(quick: bool) -> list[_Cell]:
-    """One (instance, mode, eta, steps) tuple per CSV row."""
+def _cells(quick: bool) -> list[Cell]:
+    """One cell per CSV row."""
     cells = []
     for inst in _grid(quick):
-        cells.append((inst, "annealed", _ANNEALED_ETA, _ANNEALED_STEPS))
+        cells.append(Cell(inst, "annealed", _ANNEALED_ETA, _ANNEALED_STEPS))
         for eta in _DEPLOYED_ETAS:
-            cells.append((inst, "deployed", eta, _DEPLOYED_STEPS))
+            cells.append(Cell(inst, "deployed", eta, _DEPLOYED_STEPS))
     return cells
-
-
-def _run_cell(cell: _Cell) -> tuple[Comparison, float]:
-    """Score one grid cell against the LP oracle. Module-level so a process pool can pickle it,
-    and because parallelism cannot shrink what one cell costs.
-    """
-    inst, mode, eta, steps = cell
-    start = time.perf_counter()
-    a = affinities(inst)
-    c = compare(a, inst.k, eta=eta, steps=steps, mode=mode)
-    elapsed = time.perf_counter() - start
-    return c, elapsed
-
-
-def _flush_prefix(
-    writer: Any,
-    f: IO[str],
-    instance_fields: list[str],
-    cells: list[_Cell],
-    rows: list[Comparison | None],
-    next_to_write: int,
-) -> int:
-    """Write and flush every row from `next_to_write` onward that is already filled in `rows`,
-    stopping at the first gap so the file always holds a contiguous prefix of `cells`.
-    """
-    while next_to_write < len(rows) and rows[next_to_write] is not None:
-        inst = cells[next_to_write][0]
-        c = rows[next_to_write]
-        assert c is not None  # narrows for the type checker, already checked above
-        writer.writerow(
-            [getattr(inst, name) for name in instance_fields] + list(c._asdict().values())
-        )
-        f.flush()
-        next_to_write += 1
-    return next_to_write
-
-
-def _run_serial(
-    cells: list[_Cell], writer: Any, f: IO[str], instance_fields: list[str]
-) -> list[Comparison]:
-    """Run every cell in one process, in cell order. This is the `--jobs 1` path.
-
-    Every cell finishes in submission order here, so the contiguous-prefix write below
-    advances on every iteration, which is the same as writing each row as it finishes.
-    """
-    rows: list[Comparison | None] = [None] * len(cells)
-    next_to_write = 0
-    for i, (inst, mode, eta, steps) in enumerate(cells, start=1):
-        c, elapsed = _run_cell((inst, mode, eta, steps))
-        print(
-            f"[cell {i}/{len(cells)}] n={inst.n} e={inst.e} k={inst.k} "
-            f"separation={inst.separation} seed={inst.seed} mode={mode} eta={eta} "
-            f"tier={c.tier} done in {elapsed:.1f}s",
-            flush=True,
-        )
-        rows[i - 1] = c
-        next_to_write = _flush_prefix(writer, f, instance_fields, cells, rows, next_to_write)
-    return rows  # type: ignore[return-value]
-
-
-def _run_parallel(
-    cells: list[_Cell],
-    jobs: int,
-    writer: Any,
-    f: IO[str],
-    instance_fields: list[str],
-) -> list[Comparison]:
-    """Run the grid across `jobs` worker processes.
-
-    Results are recorded into a list pre-sized to the grid and indexed by each cell's own
-    position, never by completion order, so the CSV row order matches `cells` regardless of
-    which worker happens to finish first.
-    """
-    rows: list[Comparison | None] = [None] * len(cells)
-    next_to_write = 0
-    # spawn re-execs a fresh interpreter per worker instead of forking this process, which
-    # already has numpy and scipy loaded. Forking a process with C-extension state and
-    # whatever threads those libraries keep alive can deadlock the child at the fork boundary.
-    ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as executor:
-        future_to_index = {executor.submit(_run_cell, cell): i for i, cell in enumerate(cells)}
-        try:
-            for done, future in enumerate(as_completed(future_to_index), start=1):
-                i = future_to_index[future]
-                inst, mode, eta, steps = cells[i]
-                c, elapsed = future.result()
-                print(
-                    f"[cell {i + 1}/{len(cells)}] n={inst.n} e={inst.e} k={inst.k} "
-                    f"separation={inst.separation} seed={inst.seed} mode={mode} eta={eta} "
-                    f"tier={c.tier} done in {elapsed:.1f}s ({done}/{len(cells)} complete)",
-                    flush=True,
-                )
-                rows[i] = c
-                next_to_write = _flush_prefix(
-                    writer, f, instance_fields, cells, rows, next_to_write
-                )
-        except Exception:
-            # Every row up to the failure is already flushed by the loop above. Cancelling
-            # here means only the futures already running when the failure hit still have to
-            # finish before shutdown returns, not every one of the remaining cells.
-            executor.shutdown(wait=True, cancel_futures=True)
-            raise
-    return rows  # type: ignore[return-value]
 
 
 def _default_jobs() -> int:
@@ -183,6 +79,19 @@ def _default_jobs() -> int:
     return os.cpu_count() or 1
 
 
+def _positive_int(value: str) -> int:
+    """argparse `type=` for `--jobs`: reject anything below 1 before any file is touched.
+
+    Left to `concurrent.futures` itself, `--jobs 0` opens and truncates the output file, writes
+    the header, and only then dies with a message that never names `--jobs`, so a typo destroys
+    an existing CSV. Rejecting it here happens during `parse_args`, before `main` opens anything.
+    """
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"--jobs must be >= 1, got {value}")
+    return parsed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, help="output CSV path")
@@ -193,7 +102,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--jobs",
-        type=int,
+        type=_positive_int,
         default=_default_jobs(),
         help=(
             "worker processes for the cell grid (default: CPUs available to this process, "
@@ -206,24 +115,50 @@ def main() -> None:
     cells = _cells(args.quick)
     instance_fields = [f.name for f in dataclasses.fields(Instance)]
     header = instance_fields + list(Comparison._fields)
-
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows: list[Row] = []
 
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         f.flush()
-        if args.jobs == 1:
-            rows = _run_serial(cells, writer, f, instance_fields)
-        else:
-            rows = _run_parallel(cells, args.jobs, writer, f, instance_fields)
 
-    instances = [cell[0] for cell in cells]
+        def emit(row: Row) -> None:
+            inst = row.cell.instance
+            writer.writerow(
+                [getattr(inst, name) for name in instance_fields]
+                + list(row.comparison._asdict().values())
+            )
+            f.flush()
+            rows.append(row)
 
-    tier_counts = Counter(c.tier for c in rows)
+        # Progress prints from on_complete rather than from emit, because emit fires in grid
+        # order once the prefix reaches a cell. Printing there makes the counter jump around
+        # and go silent for as long as the slowest early cell takes, whereas a cell finishing
+        # is what an operator is actually watching for.
+        done = 0
+
+        def on_complete(row: Row) -> None:
+            nonlocal done
+            done += 1
+            inst = row.cell.instance
+            print(
+                f"[cell {row.index + 1}/{len(cells)}] n={inst.n} e={inst.e} k={inst.k} "
+                f"separation={inst.separation} seed={inst.seed} mode={row.cell.mode} "
+                f"eta={row.cell.eta} tier={row.comparison.tier} done in {row.elapsed:.1f}s "
+                f"({done}/{len(cells)} complete)",
+                flush=True,
+            )
+
+        run_grid(cells, args.jobs, emit, on_complete)
+
+    tier_counts = Counter(row.comparison.tier for row in rows)
     print(f"\ntier counts: {dict(tier_counts)}")
-    for inst, c in zip(instances, rows, strict=True):
+    for row in rows:
+        c = row.comparison
+        inst = row.cell.instance
         if c.tier in ("settled", "tie_slack"):
             # gap_at_matched_cap is printed alongside max_load rather than gap_over_span
             # alone, because a gap without the realized max load next to it hides the
