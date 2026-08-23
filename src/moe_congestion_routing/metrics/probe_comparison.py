@@ -28,9 +28,9 @@ from moe_congestion_routing.metrics.probe_series import (
 
 # Below this ratio the stored bias's position within its own +/-eta orbit spans more than a
 # quarter of the dual spread, so a correlation against one batch's duals would report the phase
-# of a limit cycle rather than a property of the bias. Measured empirically on the synthetic
-# ensemble: every eta=1e-3 instance clears 10.32 and every eta=1e-2 instance falls below 2.63,
-# so nothing inside this repository's real configurations sits near the boundary.
+# of a limit cycle rather than a property of the bias. The constant rests on that argument
+# alone. The synthetic ensemble runs continuously from 4.22 to 29.43 at the shipped bias rate,
+# so moving this threshold changes which instances are refused rather than being free.
 DUAL_SPREAD_GATE = 8.0
 
 

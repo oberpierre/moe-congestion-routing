@@ -8,10 +8,15 @@ plus the resolvability gate that says whether the comparison means anything. The
 rather than one file with a "table" column, because they answer different questions and one of
 them has no pass value.
 
-Budget: at the real shape (N=16384, E=64, K=8) one LP solve is about 21s and the annealed
-iterator is roughly 7 minutes per 20000 steps, so one 8-layer dump at the default
-``--annealed-steps 40000`` budget is on the order of an hour and a half. Use ``--layers`` and
-``--annealed-steps`` to shrink that for a quick check.
+Budget, measured on this tree at the real shape (N=16384, E=64, K=8) rather than estimated: the
+annealed iterator costs about 24ms per step, so 40000 steps is roughly 16 minutes per layer, and
+one 8-layer dump is over two hours once its two LP solves per layer are counted. Use ``--layers``
+and ``--annealed-steps`` to shrink that for a quick check.
+
+Do not expect ``--annealed-steps 40000`` to reach a settled tier at this shape. Measured at 20000
+steps it does not settle at either 1e-3 or 1e-2, and max load moves by one token between 2000 and
+20000 steps, so the run has plateaued rather than converged slowly. The dual correlation is near 1
+long before that, which is the quantity the theorem is about.
 
 Usage:
     uv run python scripts/run_probe_comparison.py RUNDIR --bias-update-rate 1.0e-3 \\
@@ -21,6 +26,7 @@ Usage:
 
 import argparse
 import csv
+import math
 from pathlib import Path
 
 from moe_congestion_routing.game.compare import Comparison
@@ -115,6 +121,21 @@ def main() -> None:
 
     print(f"wrote {len(verification)} verification rows to {args.out_verification}")
     print(f"wrote {len(internalization)} internalization rows to {args.out_internalization}")
+
+    # The range and not a single layer, because internalization varies strongly with depth. On
+    # the first real checkpoint it ran from 0.367 to 0.871 across eight layers, so quoting any
+    # one of them alone overstates or understates the result by up to a factor of two.
+    quotable = [
+        row.dual_correlation for row in internalization if not math.isnan(row.dual_correlation)
+    ]
+    if quotable:
+        print(
+            f"internalization correlation over {len(quotable)} resolvable layers: "
+            f"{min(quotable):.3f} to {max(quotable):.3f}, mean {sum(quotable) / len(quotable):.3f}"
+        )
+    masked = len(internalization) - len(quotable)
+    if masked:
+        print(f"{masked} row(s) fell below the resolvability gate and carry no correlation")
 
 
 if __name__ == "__main__":

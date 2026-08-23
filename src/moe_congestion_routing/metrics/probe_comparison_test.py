@@ -100,6 +100,19 @@ def test_gate_masks_correlation_below_the_ratio_but_not_at_or_above_it():
     assert corr_above == pytest.approx(1.0)
 
 
+def test_the_gate_admits_a_ratio_of_exactly_eight():
+    # The boundary itself, which 4.0 and 10.0 straddle without pinning. The rule is "refuse
+    # below 8", so exactly 8 is admitted, and without this a `<` weakened to `<=` passes.
+    bias = numpy.array([1.0, 3.0])
+    at_gate = numpy.array([0.0, 8.0])
+
+    spread, correlation, _ = gated_dual_agreement(bias, at_gate, bias_update_rate=1.0)
+
+    assert spread == pytest.approx(DUAL_SPREAD_GATE)
+    assert not numpy.isnan(correlation)
+    assert correlation == pytest.approx(1.0)
+
+
 def test_gate_constant_is_eight():
     # Pinned so the boundary test above stays meaningful if the constant ever moves: the two
     # constructed ratios (4.0, 10.0) must keep straddling it.
@@ -246,3 +259,34 @@ def test_unknown_layer_raises(tmp_path):
     series = read_series(tmp_path)
     with pytest.raises(ValueError, match="layers \\[99\\]"):
         verification_rows(series, bias_update_rate=1e-2, layers=[99])
+
+
+def test_internalization_rows_actually_apply_the_gate(tmp_path):
+    """The wiring, not the branch. `gated_dual_agreement` is tested directly above, but nothing
+    checked that `internalization_rows` calls it, so dropping the call went uncaught.
+
+    A huge bias update rate drives the ratio under the gate whatever the duals are, which makes
+    this a property of the wiring rather than of a hand-tuned affinity matrix.
+    """
+    # Five of eight tokens want expert 0 while its capacity is two, so that constraint binds and
+    # its shadow price separates from the rest. A dump whose duals are all equal has zero spread
+    # and would sit under the gate whatever the rate is, proving nothing about the wiring.
+    crowded = [[4.0, 0.0, 0.0, 0.0]] * 5
+    spread_out = [[0.0, 3.0, 0.0, 0.0], [0.0, 0.0, 2.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+    logits = numpy.array([crowded + spread_out], dtype=numpy.float32)
+    # A varying bias, because a constant one has no variance and correlates as NaN whatever the
+    # gate does, which would make the masked case below indistinguishable from the unmasked one.
+    bias = numpy.array([[-0.03, 0.01, 0.0, 0.02]], dtype=numpy.float32)
+    _write_dump(tmp_path / "probes", step=0, logits=logits, expert_bias=bias, topk=1)
+    series = read_series(tmp_path)
+
+    resolvable = internalization_rows(series, bias_update_rate=1e-9)
+    swamped = internalization_rows(series, bias_update_rate=1e9)
+
+    # Same duals both times, so only the rate moved the row across the gate.
+    assert resolvable[0].dual_spread_over_eta > DUAL_SPREAD_GATE
+    assert not numpy.isnan(resolvable[0].dual_correlation)
+    assert swamped[0].dual_spread_over_eta < DUAL_SPREAD_GATE
+    assert numpy.isnan(swamped[0].dual_correlation)
+    # The ratio is reported either way, because a masked correlation without it says nothing.
+    assert swamped[0].dual_spread_over_eta > 0.0

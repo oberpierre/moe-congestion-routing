@@ -3,6 +3,7 @@ import json
 import numpy
 import pytest
 
+from moe_congestion_routing.game.alflb import top_k_map
 from moe_congestion_routing.metrics.probe_series import (
     IncomparableProbes,
     ProbeDump,
@@ -377,3 +378,34 @@ def test_conformance_separates_a_tied_disagreement_from_a_real_one(tmp_path):
     # The one that matters: the tied token is excused and the clear-winner token is not.
     assert row.untied_disagreements == 1
     assert row.exact_ties == 1
+
+
+def test_top_k_survives_the_ulp_disagreement_between_numpy_and_torch(tmp_path):
+    """The property `affinities` actually needs, measured rather than assumed.
+
+    Its docstring does not claim bit-identity with the model's sigmoid, because there is none.
+    What it claims is that the selection is insensitive to the difference, so assert exactly
+    that, on logits spread widely enough that ULP-level disagreement is common.
+    """
+    torch = pytest.importorskip("torch")
+    rng = numpy.random.default_rng(0)
+    logits = rng.standard_normal((1, 4096, 16)).astype(numpy.float32) * 4.0
+    routing_map = numpy.zeros((1, 4096, 16), dtype=bool)
+    path = _write_dump(
+        tmp_path / "probes",
+        step=0,
+        routing_map=routing_map,
+        topk=4,
+        logits=logits,
+        expert_bias=numpy.zeros((1, 16), dtype=numpy.float32),
+    )
+
+    ours = read_dump(path).affinities()[0].astype(numpy.float32)
+    theirs = torch.sigmoid(torch.from_numpy(logits[0])).numpy()
+
+    # The premise of the test: the two really do disagree, so the assertion below is not vacuous.
+    assert not numpy.array_equal(ours, theirs)
+    assert numpy.abs(ours.view(numpy.int32) - theirs.view(numpy.int32)).max() <= 4
+    ours_selected = numpy.sort(top_k_map(ours, 4), axis=1)
+    theirs_selected = numpy.sort(top_k_map(theirs, 4), axis=1)
+    assert numpy.array_equal(ours_selected, theirs_selected)

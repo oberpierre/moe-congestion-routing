@@ -124,9 +124,13 @@ class ProbeDump:
     def affinities(self) -> numpy.ndarray:
         """``[L, N, E]`` float64: the quantity the router adds its bias to.
 
-        Evaluated in float32, the arithmetic the model used, then widened losslessly, because
-        the offline kit works in float64 whereas a disagreement with the model must not come
-        from us having used wider arithmetic than it did.
+        Evaluated in float32, the width the model used, then widened losslessly, so a
+        disagreement with the model cannot come from us having used wider arithmetic than it did.
+
+        This is not bit-identical to the model's own sigmoid and does not need to be. Numpy and
+        torch differ on up to 4 ULP on about a third of the elements in a real dump, and the
+        model ran on a GPU besides, so the property that matters is that top-K is insensitive to
+        that: `selection_conformance` measures it directly rather than assuming it.
         """
         if self.score_function != "sigmoid":
             raise IncomparableProbes(
