@@ -11,6 +11,7 @@ from moe_congestion_routing.metrics.probe_series import (
     read_dump,
     read_series,
     saturation_rows,
+    selection_conformance,
 )
 from moe_congestion_routing.metrics.router_probe import ROUTING_MAP_BITORDER
 
@@ -25,6 +26,9 @@ def _write_dump(
     coarse_interval=6,
     layer_numbers=None,
     topk=2,
+    logits=None,
+    expert_bias=None,
+    score_function="sigmoid",
 ):
     """A synthetic ``.npz`` dump with the metadata keys ``probe_series.py`` reads.
 
@@ -37,7 +41,14 @@ def _write_dump(
     if layer_numbers is None:
         layer_numbers = list(range(2, 2 + num_layers))
     packed = numpy.packbits(routing_map, axis=-1, bitorder=ROUTING_MAP_BITORDER)
+    arrays = {"routing_map": packed}
+    if logits is not None:
+        arrays["logits"] = numpy.asarray(logits, dtype=numpy.float32)
+    if expert_bias is not None:
+        arrays["expert_bias"] = numpy.asarray(expert_bias, dtype=numpy.float32)
     meta = {
+        "moe_router_score_function": score_function,
+        "has_expert_bias": expert_bias is not None,
         "iteration": step,
         "token_sha256": token_sha256,
         "role": role,
@@ -47,7 +58,7 @@ def _write_dump(
         "K": topk,
     }
     path = probes_dir / f"iter_{step:07d}.npz"
-    numpy.savez(path, routing_map=packed, metadata=numpy.array(json.dumps(meta)))
+    numpy.savez(path, **arrays, metadata=numpy.array(json.dumps(meta)))
     return path
 
 
@@ -289,3 +300,80 @@ def test_probe_series_properties_delegate_to_the_first_dump(tmp_path):
     assert series.role == dump.role
     assert series.coarse_interval == dump.coarse_interval
     assert isinstance(dump, ProbeDump)
+
+
+# ---------------------------------------------------------------------------------------------
+# Affinities, the expert bias, and whether the offline replica selects what the model selected.
+# ---------------------------------------------------------------------------------------------
+
+
+def _conformance_dump(tmp_path, *, stored_selections, **kwargs):
+    """A one-layer dump whose logits give token 1 an exact tie between experts 0 and 1.
+
+    Token 0 and token 2 have a clear winner, so any disagreement they show is a real one, and
+    token 1's two leading scores are equal in float32, so which of them wins is decided by a tie
+    rule rather than by the affinities.
+    """
+    logits = numpy.array(
+        [[[3.0, 1.0, 0.5, 0.0], [1.0, 1.0, 0.0, 0.0], [0.0, 0.5, 1.0, 3.0]]],
+        dtype=numpy.float32,
+    )
+    routing_map = _one_hot_map(stored_selections, 4)[numpy.newaxis, :, :]
+    return _write_dump(
+        tmp_path / "probes",
+        step=0,
+        routing_map=routing_map,
+        topk=1,
+        logits=logits,
+        expert_bias=numpy.zeros((1, 4), dtype=numpy.float32),
+        **kwargs,
+    )
+
+
+def test_affinities_are_the_float32_sigmoid_of_the_stored_logits(tmp_path):
+    path = _conformance_dump(tmp_path, stored_selections=[[0], [0], [3]])
+    dump = read_dump(path)
+
+    logits = dump.logits()
+    expected = 1.0 / (1.0 + numpy.exp(-logits.astype(numpy.float32)))
+    # Equality rather than a tolerance, because the point of evaluating in float32 is that the
+    # replica sees exactly the numbers the model saw.
+    assert numpy.array_equal(dump.affinities(), expected.astype(numpy.float64))
+
+
+def test_affinities_refuse_a_dump_that_was_not_scored_with_sigmoid(tmp_path):
+    path = _conformance_dump(tmp_path, stored_selections=[[0], [0], [3]], score_function="softmax")
+    with pytest.raises(IncomparableProbes, match="softmax"):
+        read_dump(path).affinities()
+
+
+def test_expert_bias_refuses_a_run_that_carried_none(tmp_path):
+    routing_map = _one_hot_map([[0], [1]], 4)[numpy.newaxis, :, :]
+    path = _write_dump(tmp_path / "probes", step=0, routing_map=routing_map, topk=1)
+    with pytest.raises(IncomparableProbes, match="no expert_bias"):
+        read_dump(path).expert_bias()
+
+
+def test_conformance_is_clean_when_the_stored_map_is_the_replica_s_own_choice(tmp_path):
+    # Expert 0 wins token 1 under the lowest-index tie rule, so this is the map a conforming
+    # run would have stored.
+    path = _conformance_dump(tmp_path, stored_selections=[[0], [0], [3]])
+
+    (row,) = selection_conformance(read_dump(path))
+
+    assert row.disagreeing_tokens == 0
+    assert row.untied_disagreements == 0
+    assert row.exact_ties == 1
+
+
+def test_conformance_separates_a_tied_disagreement_from_a_real_one(tmp_path):
+    # Token 1 is stored as expert 1, which the tie rule is entitled to differ on. Token 2 is
+    # stored as expert 0 against a clear winner of expert 3, which nothing excuses.
+    path = _conformance_dump(tmp_path, stored_selections=[[0], [1], [0]])
+
+    (row,) = selection_conformance(read_dump(path))
+
+    assert row.disagreeing_tokens == 2
+    # The one that matters: the tied token is excused and the clear-winner token is not.
+    assert row.untied_disagreements == 1
+    assert row.exact_ties == 1

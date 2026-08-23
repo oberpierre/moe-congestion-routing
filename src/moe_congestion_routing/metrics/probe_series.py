@@ -28,11 +28,22 @@ from typing import Any
 
 import numpy
 
+from moe_congestion_routing.game.alflb import tie_margins, top_k_map
 from moe_congestion_routing.metrics.router_probe import ROUTING_MAP_BITORDER
 
 
 class IncomparableProbes(ValueError):
-    """Two dumps or two runs that must never be placed on one axis."""
+    """Two dumps or two runs that must never be placed on one axis, or a dump we cannot read."""
+
+
+def _sigmoid(x: numpy.ndarray) -> numpy.ndarray:
+    """Elementwise logistic, evaluated entirely in the input's own dtype.
+
+    The constant is materialized at that dtype rather than left a Python float, so the whole
+    expression stays float32 for a float32 input regardless of how numpy is promoting scalars.
+    """
+    one = numpy.asarray(1.0, dtype=x.dtype)
+    return one / (one + numpy.exp(-x))
 
 
 @dataclass(frozen=True)
@@ -73,6 +84,15 @@ class ProbeDump:
     def topk(self) -> int:
         return self.meta["K"]
 
+    @property
+    def score_function(self) -> str:
+        """Megatron's ``moe_router_score_function`` for the run that wrote this dump."""
+        return self.meta["moe_router_score_function"]
+
+    @property
+    def has_expert_bias(self) -> bool:
+        return bool(self.meta["has_expert_bias"])
+
     def routing_map(self) -> numpy.ndarray:
         """``[L, N, E]`` bool: which experts each token selected, unpacked from the stored bits."""
         with numpy.load(self.path) as data:
@@ -80,6 +100,42 @@ class ProbeDump:
         return numpy.unpackbits(
             packed, axis=-1, count=self.num_experts, bitorder=ROUTING_MAP_BITORDER
         ).astype(bool)
+
+    def logits(self) -> numpy.ndarray:
+        """``[L, N, E]`` float32: the router's pre-bias output, as the model produced it."""
+        with numpy.load(self.path) as data:
+            return data["logits"]
+
+    def expert_bias(self) -> numpy.ndarray:
+        """``[L, E]`` float32: the ALF-LB bias this dump was routed with.
+
+        Raises rather than returning zeros when the run carried no bias, because a zero bias and
+        an absent one give the same arithmetic and completely different conclusions about a
+        balancing method that is supposed to be doing something.
+        """
+        if not self.has_expert_bias:
+            raise IncomparableProbes(
+                f"{self.path}: this run has no expert_bias, so there is no ALF-LB price vector "
+                "to read. Megatron maintains one only for a sigmoid or sqrtsoftplus arm"
+            )
+        with numpy.load(self.path) as data:
+            return data["expert_bias"]
+
+    def affinities(self) -> numpy.ndarray:
+        """``[L, N, E]`` float64: the quantity the router adds its bias to.
+
+        Evaluated in float32, the arithmetic the model used, then widened losslessly, because
+        the offline kit works in float64 whereas a disagreement with the model must not come
+        from us having used wider arithmetic than it did.
+        """
+        if self.score_function != "sigmoid":
+            raise IncomparableProbes(
+                f"{self.path}: score function is {self.score_function!r}, and only 'sigmoid' is "
+                "supported. Top-K of sigmoid(z) + b is not top-K of z + b, so reading a "
+                "softmax dump here would answer a different question without failing"
+            )
+        logits = self.logits().astype(numpy.float32, copy=False)
+        return _sigmoid(logits).astype(numpy.float64)
 
 
 def read_dump(path: Path | str) -> ProbeDump:
@@ -245,4 +301,54 @@ def saturation_rows(
     rows = []
     for one in series:
         rows.extend(_series_rows(one, multi=multi, reference_step=reference_step))
+    return rows
+
+
+@dataclass(frozen=True)
+class ConformanceRow:
+    """One layer's answer to whether the offline replica selects what the model selected."""
+
+    step: int
+    layer: int
+    num_tokens: int
+    disagreeing_tokens: int
+    untied_disagreements: int
+    exact_ties: int
+
+
+def selection_conformance(dump: ProbeDump) -> list[ConformanceRow]:
+    """Per layer, check that top-K of ``sigmoid(logits) + expert_bias`` is the dump's own map.
+
+    This is what makes every later offline number about this dump worth reading, because it is
+    the only check that the replica routes the way the model routed rather than merely
+    plausibly. ``untied_disagreements`` is the one that must be zero: a token whose K-th and
+    (K+1)-th scores are exactly equal was decided by a tie rule rather than by the affinities,
+    and two implementations are free to disagree there.
+
+    Scores are compared in float32, the arithmetic the model used. A tolerance would be wrong
+    here rather than merely unnecessary: any nonzero float32 margin is an ordering both
+    implementations see identically, so only an exact tie leaves the choice to the rule.
+    """
+    affinities = dump.affinities()
+    bias = dump.expert_bias()
+    stored = dump.routing_map()
+    k = dump.topk
+
+    rows = []
+    for axis_index, layer_number in enumerate(dump.layer_numbers):
+        scores = affinities[axis_index].astype(numpy.float32) + bias[axis_index]
+        replica = numpy.zeros_like(stored[axis_index])
+        numpy.put_along_axis(replica, top_k_map(scores, k), True, axis=1)
+        disagrees = ~numpy.all(replica == stored[axis_index], axis=1)
+        tied = tie_margins(scores, k) == 0.0
+        rows.append(
+            ConformanceRow(
+                step=dump.step,
+                layer=layer_number,
+                num_tokens=int(stored.shape[1]),
+                disagreeing_tokens=int(disagrees.sum()),
+                untied_disagreements=int((disagrees & ~tied).sum()),
+                exact_ties=int(tied.sum()),
+            )
+        )
     return rows
