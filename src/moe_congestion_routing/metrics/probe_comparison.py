@@ -137,7 +137,10 @@ def verification_rows(
         affinities = dump.affinities()
         for axis_index, layer_number in _select_layers(dump, layers):
             comparison = compare(
-                affinities[axis_index],
+                # Narrowed back to the width the model computed in, which is lossless because
+                # `affinities()` widened float32 values, so `compare` reports its tie margins in
+                # units of one float32 step rather than of the float64 they are carried in.
+                affinities[axis_index].astype(np.float32),
                 dump.topk,
                 eta=bias_update_rate,
                 steps=annealed_steps,

@@ -124,18 +124,13 @@ def test_unsettled_annealed_row_is_monotone_in_the_budget():
 
 
 @pytest.mark.parametrize(
-    "settled_at, min_tie_margin, excess_tokens, n, k, expected",
-    [
-        (None, 6.250e-10, 5, 2048, 8, "tie_slack"),
-        (None, 6.250e-10, 20, 2048, 8, "unconverged"),  # excess > 0.001 * 2048 * 8 = 16.384
-        (None, 6.046e-09, 5, 2048, 8, "unconverged"),  # margin above TIE_TOLERANCE
-        (100, 1.0, 999999, 2048, 8, "settled"),  # settled_at wins regardless of the rest
-    ],
+    "settled_at, expected",
+    [(None, "unconverged"), (0, "settled"), (100, "settled")],
 )
-def test_classify_tier_on_measured_boundary_cases(
-    settled_at, min_tie_margin, excess_tokens, n, k, expected
-):
-    assert classify_tier(settled_at, min_tie_margin, excess_tokens, n, k) == expected
+def test_classify_tier_reads_only_whether_the_run_settled(settled_at, expected):
+    # `0` is here because a run that settles on its very first step is falsy, so an
+    # `if settled_at:` would call it unconverged.
+    assert classify_tier(settled_at) == expected
 
 
 # ---------------------------------------------------------------------------------------------
@@ -269,13 +264,13 @@ def test_tied_token_mask_unions_across_rankings():
 
 
 # ---------------------------------------------------------------------------------------------
-# The tier gate reads the trajectory ranking alone: pooling with the oracle ranking makes the
-# minimum identically zero, because optimal capacity duals manufacture ties on the oracle side
-# on essentially every instance, which would make the settled/tie_slack gate constant-true.
+# The reported margins read the trajectory ranking alone: pooling with the oracle ranking makes
+# the minimum identically zero, because optimal capacity duals manufacture ties on the oracle
+# side on essentially every instance, so a pooled minimum would carry no information at all.
 # ---------------------------------------------------------------------------------------------
 
 
-def test_tier_gate_reads_the_trajectory_ranking_not_the_pooled_minimum():
+def test_reported_margins_read_the_trajectory_ranking_not_the_pooled_minimum():
     inst = Instance(n=512, e=8, k=2, separation=2.0, seed=0)
     a = affinities(inst)
     c = compare(a, 2, eta=1e-2, steps=2000, mode="annealed")
@@ -283,6 +278,55 @@ def test_tier_gate_reads_the_trajectory_ranking_not_the_pooled_minimum():
     assert c.min_tie_margin > 0
     assert c.oracle_min_margin == 0.0
     assert c.oracle_exact_ties == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# Tie margins in units of the arithmetic that produced the scores.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_margin_in_ulp_tracks_the_width_the_caller_passed():
+    """The same values in float32 and in float64 give the same absolute margin, and a ULP count
+    differing by the ratio of the two widths' precision.
+
+    This is the whole point of the column: an absolute margin cannot say whether a decision was
+    close, because how many representable values fit inside it depends on the arithmetic.
+    """
+    inst = Instance(n=512, e=8, k=2, separation=2.0, seed=0)
+    a64 = affinities(inst)
+    a32 = a64.astype(np.float32).astype(np.float64).astype(np.float32)
+
+    c64 = compare(a64, 2, eta=1e-2, steps=200, mode="annealed")
+    c32 = compare(a32, 2, eta=1e-2, steps=200, mode="annealed")
+
+    # float64 carries 29 more mantissa bits than float32, so a fixed gap spans about 2**29 times
+    # as many representable values there. Asserted as a wide band rather than a point, because the
+    # two runs rank slightly different values and the minimum is taken over different rows.
+    assert c64.min_tie_margin_ulp / c32.min_tie_margin_ulp > 1e6
+    assert c32.min_tie_margin_ulp > 1.0
+    assert c32.median_tie_margin_ulp > c32.min_tie_margin_ulp
+
+
+def test_margin_in_ulp_is_the_absolute_margin_divided_by_a_float32_step():
+    """Pins the unit, not merely that the column moves with the margin.
+
+    The k-th score is not reported, so the check brackets it: the ratio must lie between the
+    margin divided by the largest float32 step anywhere in the score range and the margin divided
+    by the smallest. The bracket is four orders of magnitude wide and still fails any conversion
+    that used float64 steps, no conversion at all, or a step from the wrong quantity.
+    """
+    inst = Instance(n=256, e=8, k=2, separation=2.0, seed=3)
+    a = affinities(inst).astype(np.float32)
+    c = compare(a, 2, eta=1e-2, steps=200, mode="annealed")
+
+    # Scores are affinity plus a bias of magnitude at most eta * steps, so the reachable range is
+    # bounded by the affinity range widened by that, and the step is monotone in the magnitude.
+    reach = 1e-2 * 200
+    coarsest = float(np.spacing(np.float32(abs(a).max() + reach)))
+    finest = float(np.spacing(np.float32(abs(a).min())))
+
+    assert c.min_tie_margin > 0
+    assert c.min_tie_margin / coarsest <= c.min_tie_margin_ulp <= c.min_tie_margin / finest
 
 
 # ---------------------------------------------------------------------------------------------

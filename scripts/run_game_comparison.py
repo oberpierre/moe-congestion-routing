@@ -159,7 +159,7 @@ def main() -> None:
     for row in rows:
         c = row.comparison
         inst = row.cell.instance
-        if c.tier in ("settled", "tie_slack"):
+        if c.tier == "settled":
             # gap_at_matched_cap is printed alongside max_load rather than gap_over_span
             # alone, because a gap without the realized max load next to it hides the
             # capacity violation that produced it.

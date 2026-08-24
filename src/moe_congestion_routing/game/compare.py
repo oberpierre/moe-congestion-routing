@@ -12,6 +12,10 @@ import numpy as np
 
 from moe_congestion_routing.game import alflb, lp
 
+# Used only by `tied_token_mask`, whose job is to catch the oracle ranking's *exact* ties, which
+# optimal capacity duals manufacture on essentially every instance. On a real dump all 61 tokens it
+# selects have margin exactly zero, so the constant is doing no near-tie work and no ULP conversion
+# would change the answer. The tier gate that once read it is gone: see `classify_tier`.
 TIE_TOLERANCE = 1e-9
 
 
@@ -67,12 +71,19 @@ class Comparison(NamedTuple):
     set_agreement: float  # fraction of tokens whose expert set equals the oracle's
     untied_set_agreement: float  # the same over untied tokens only
     tied_tokens: int  # pooled over both rankings
-    median_tie_margin: float  # trajectory ranking (a + bias) alone, the tier gate's own signal
+    median_tie_margin: float  # trajectory ranking (a + bias) alone
     min_tie_margin: float  # trajectory ranking (a + bias) alone
+    # The same two margins counted in float steps of the width `a` was passed in, which for a
+    # router dump is the width the model routes in. So the question they answer is "would a
+    # router working in this arithmetic see these two scores as distinct", not "did our own
+    # arithmetic distinguish them": the simulated bias is accumulated in float64 whatever `a`
+    # was, so the ranking these are taken from is always a float64 quantity.
+    median_tie_margin_ulp: float
+    min_tie_margin_ulp: float
     oracle_min_margin: float  # oracle ranking (a + capacity_duals) alone, an instance property
     oracle_exact_ties: int  # count of exactly-zero margins on the oracle ranking
     excess_tokens: int  # sum(max(load_e - default_cap, 0)), the residual size
-    tier: str  # "settled" | "tie_slack" | "unconverged"
+    tier: str  # "settled" | "unconverged", exactly `settled_at is not None`
     dual_correlation: float  # NaN if not divisible
     dual_linf: float  # NaN if not divisible
 
@@ -112,23 +123,18 @@ def tied_token_mask(*rankings: np.ndarray, k: int, tol: float = TIE_TOLERANCE) -
     return mask
 
 
-def classify_tier(
-    settled_at: int | None,
-    min_tie_margin: float,
-    excess_tokens: float,
-    n: int,
-    k: int,
-) -> str:
-    """Sort a row into settled / tie_slack / unconverged from the mechanism, not the gap.
+def classify_tier(settled_at: int | None) -> str:
+    """Sort a row into settled / unconverged from the mechanism, not the gap.
 
-    Reading no gap column here is deliberate, because it is what keeps "tie_slack rows land
-    near the optimum" a finding instead of a definition.
+    There was a third tier, ``tie_slack``, for a row that failed to settle while its minimum tie
+    margin sat under an absolute tolerance, on the theory that the theorem's no-ties assumption
+    had failed there. It is gone because the verdict was decided by a constant with no defensible
+    value: on the step-500 dump the absolute rule called two of eight layers tie-limited, while
+    the same eight margins expressed in float32 steps put seven of eight below one step. A binary
+    label that moves that far with the unit says less than the number it was computed from, so
+    ``min_tie_margin_ulp`` is reported and no tier is derived from it.
     """
-    if settled_at is not None:
-        return "settled"
-    if min_tie_margin <= TIE_TOLERANCE and excess_tokens <= 0.001 * n * k:
-        return "tie_slack"
-    return "unconverged"
+    return "settled" if settled_at is not None else "unconverged"
 
 
 def _vanilla_stats(a: np.ndarray, k: int) -> tuple[float, int]:
@@ -140,6 +146,11 @@ def _vanilla_stats(a: np.ndarray, k: int) -> tuple[float, int]:
 
 
 def compare(a: np.ndarray, k: int, *, eta: float, steps: int, mode: str = "annealed") -> Comparison:
+    # The float width `a` arrives in, kept before the widening below, because an absolute tie
+    # margin is not interpretable on its own: the same number is 69 float32 steps near affinity
+    # 0.0002 and 0.017 of one step near 0.8. A caller holding float32 router affinities in a
+    # float64 array must narrow them back first, or its margins are counted in the wrong unit.
+    score_width = np.asarray(a).dtype
     a = np.asarray(a, dtype=np.float64)
     n, e = a.shape
     balanced_load = n * k / e
@@ -242,20 +253,31 @@ def compare(a: np.ndarray, k: int, *, eta: float, steps: int, mode: str = "annea
     alf_ranking = a + bias_basis
     oracle_ranking = a + oracle.capacity_duals
 
-    # Computed once each: alf_margins feeds both the pooled tie mask below and the tier
-    # gate, so a second alflb.tie_margins(alf_ranking, k) call is not needed to build either.
+    # Computed once each: alf_margins feeds both the pooled tie mask and the reported margins
+    # below, so a second alflb.tie_margins(alf_ranking, k) call is not needed to build either.
     alf_margins = alflb.tie_margins(alf_ranking, k)
     oracle_margins = alflb.tie_margins(oracle_ranking, k)
 
     # tied_tokens and untied_set_agreement pool both rankings, because agreement is a
-    # statement about both objects at once. The tier gate below reads alf_margins alone,
-    # because pooling would make its minimum identically zero: optimal capacity duals
+    # statement about both objects at once. The reported margins below take alf_margins alone,
+    # because pooling would make their minimum identically zero: optimal capacity duals
     # manufacture ties on the oracle side on essentially every instance.
     tied_mask = (alf_margins <= TIE_TOLERANCE) | (oracle_margins <= TIE_TOLERANCE)
     tied_tokens = int(tied_mask.sum())
 
     median_tie_margin = float(np.median(alf_margins))
     min_tie_margin = float(np.min(alf_margins))
+
+    # Divide each row's margin by one float step at that row's own k-th score, because floating
+    # point spacing doubles every binade, so the same absolute margin is a different number of
+    # distinguishable values depending on where in the range it sits. Only the trajectory ranking
+    # is converted: the oracle ranking carries float64 LP duals, and `oracle_exact_ties` already
+    # counts its ties exactly, which needs no unit at all.
+    kth_score = np.sort(alf_ranking, axis=1)[:, ::-1][:, k - 1]
+    step = np.spacing(kth_score.astype(score_width)).astype(np.float64)
+    alf_margins_ulp = alf_margins / step
+    median_tie_margin_ulp = float(np.median(alf_margins_ulp))
+    min_tie_margin_ulp = float(np.min(alf_margins_ulp))
 
     # The oracle-side zeros are not noise to discard: they measure degeneracy of the
     # instance's optimum, a property of the LP rather than of this run's convergence.
@@ -274,7 +296,7 @@ def compare(a: np.ndarray, k: int, *, eta: float, steps: int, mode: str = "annea
     else:
         dual_correlation, dual_linf = float("nan"), float("nan")
 
-    tier = classify_tier(result.settled_at, min_tie_margin, excess_tokens, n, k)
+    tier = classify_tier(result.settled_at)
 
     if mode == "deployed":
         cycle_length = result.cycle_length
@@ -327,6 +349,8 @@ def compare(a: np.ndarray, k: int, *, eta: float, steps: int, mode: str = "annea
         tied_tokens=tied_tokens,
         median_tie_margin=median_tie_margin,
         min_tie_margin=min_tie_margin,
+        median_tie_margin_ulp=median_tie_margin_ulp,
+        min_tie_margin_ulp=min_tie_margin_ulp,
         oracle_min_margin=oracle_min_margin,
         oracle_exact_ties=oracle_exact_ties,
         excess_tokens=excess_tokens,
