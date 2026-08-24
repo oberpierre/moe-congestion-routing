@@ -99,7 +99,15 @@ def dual_agreement(bias: np.ndarray, capacity_duals: np.ndarray) -> tuple[float,
     duals = np.asarray(capacity_duals, dtype=np.float64)
     bias_c = bias - bias.mean()
     duals_c = duals - duals.mean()
-    correlation = float(np.corrcoef(bias_c, duals_c)[0, 1])
+    # A vector with no variance correlates with nothing, and numpy reports that by dividing by a
+    # zero standard deviation, so it returns the right NaN behind a RuntimeWarning. Returning the
+    # NaN directly keeps the answer and drops the warning, which matters because this case is
+    # reached on every real series: ALF-LB's stored bias is identically zero before its first
+    # update, so eight warnings per run trained the reader to scroll past a warning from here.
+    if bias_c.any() and duals_c.any():
+        correlation = float(np.corrcoef(bias_c, duals_c)[0, 1])
+    else:
+        correlation = float("nan")
     linf = float(np.max(np.abs(bias_c - duals_c)))
     return correlation, linf
 

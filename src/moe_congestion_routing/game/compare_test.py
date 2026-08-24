@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import warnings
 
 import numpy as np
 import pytest
@@ -443,3 +444,25 @@ def test_annealed_row_has_no_cycle_best():
     assert np.isnan(c.cycle_best_objective)
     assert np.isnan(c.cycle_best_gap_at_matched_cap)
     assert np.isnan(c.cycle_best_gap_over_span)
+
+
+def test_a_constant_vector_correlates_as_nan_without_a_runtime_warning():
+    """Reached on every real series: the stored bias is zero before ALF-LB's first update.
+
+    The NaN is the right answer and was already returned. What this pins is that it arrives
+    without a RuntimeWarning, so a warning from this module would mean something.
+    """
+    duals = np.array([0.0, 1.0, 2.0, 3.0])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        zero_bias, linf_zero = dual_agreement(np.zeros(4), duals)
+        constant_bias, _ = dual_agreement(np.full(4, 0.5), duals)
+        both_constant, _ = dual_agreement(np.zeros(4), np.zeros(4))
+
+    assert np.isnan(zero_bias)
+    # A constant bias is the same case as a zero one, because centering sends both to zero.
+    assert np.isnan(constant_bias)
+    assert np.isnan(both_constant)
+    # The L-infinity distance is still a number, because it needs no variance to be defined.
+    assert linf_zero == pytest.approx(1.5)
