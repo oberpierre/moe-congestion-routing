@@ -4,6 +4,7 @@ import numpy
 import pytest
 
 from moe_congestion_routing.game.alflb import top_k_map
+from moe_congestion_routing.metrics.probe_dump_format import ROUTING_MAP_BITORDER
 from moe_congestion_routing.metrics.probe_series import (
     IncomparableProbes,
     ProbeDump,
@@ -14,7 +15,6 @@ from moe_congestion_routing.metrics.probe_series import (
     saturation_rows,
     selection_conformance,
 )
-from moe_congestion_routing.metrics.router_probe import ROUTING_MAP_BITORDER
 
 
 def _write_dump(
@@ -409,3 +409,22 @@ def test_top_k_survives_the_ulp_disagreement_between_numpy_and_torch(tmp_path):
     ours_selected = numpy.sort(top_k_map(ours, 4), axis=1)
     theirs_selected = numpy.sort(top_k_map(theirs, 4), axis=1)
     assert numpy.array_equal(ours_selected, theirs_selected)
+
+
+def test_reading_a_dump_does_not_pull_in_torch():
+    """The reader's whole point is that it runs where the writer cannot.
+
+    Asserted in a subprocess, because the rest of this suite imports torch, so an in-process
+    check would pass on an import some other test had already performed. This regressed once
+    already, through a single shared constant imported from the torch-side module.
+    """
+    import subprocess
+    import sys
+
+    source = (
+        "import sys;"
+        "import moe_congestion_routing.metrics.probe_comparison;"
+        "import moe_congestion_routing.metrics.probe_series;"
+        "sys.exit(1 if 'torch' in sys.modules else 0)"
+    )
+    assert subprocess.run([sys.executable, "-c", source], check=False).returncode == 0

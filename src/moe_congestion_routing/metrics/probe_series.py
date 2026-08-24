@@ -10,10 +10,9 @@ The reference is a *single* dump rather than each dump's predecessor, because th
 mixes a dense window with a coarse tail, so a step-to-step flip rate would have a denominator
 that changes along the series and could not be compared across arms.
 
-``numpy`` and stdlib only, so this loads on a login node with no CUDA and no process group,
-unlike ``router_probe.py``, which writes the dumps this module reads and needs ``torch``. Only
-``ROUTING_MAP_BITORDER`` is shared between the two, because the pack and the unpack must move
-together.
+``numpy`` and stdlib only, so this loads on a login node or a laptop with no CUDA, no process
+group and no torch installed, unlike ``router_probe.py``, which writes the dumps this module reads
+and does need ``torch``. What the two share is in ``probe_dump_format``, which imports neither.
 
 This module refuses three things outright rather than dropping rows or warning, because a
 silently smaller table is the failure it exists to rule out: pooling two instruments, scoring a
@@ -29,7 +28,7 @@ from typing import Any
 import numpy
 
 from moe_congestion_routing.game.alflb import tie_margins, top_k_map
-from moe_congestion_routing.metrics.router_probe import ROUTING_MAP_BITORDER
+from moe_congestion_routing.metrics.probe_dump_format import ROUTING_MAP_BITORDER
 
 
 class IncomparableProbes(ValueError):
@@ -88,7 +87,7 @@ class ProbeDump:
     def num_sequences(self) -> int:
         """How many probe sequences were forwarded, so a token row range can be cut on a
         sequence boundary. Rows are sequence-major (``row = sequence * seq_length + position``),
-        which ``router_probe.TOKEN_AXIS_CONVENTION`` pins and every dump is written in."""
+        which ``probe_dump_format.TOKEN_AXIS_CONVENTION`` pins and every dump is written in."""
         return int(self.meta["moe_probe_seqs"])
 
     @property

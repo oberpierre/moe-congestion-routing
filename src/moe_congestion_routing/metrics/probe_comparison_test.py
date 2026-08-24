@@ -12,8 +12,8 @@ from moe_congestion_routing.metrics.probe_comparison import (
     price_stability_rows_for_dump,
     verification_rows,
 )
+from moe_congestion_routing.metrics.probe_dump_format import ROUTING_MAP_BITORDER
 from moe_congestion_routing.metrics.probe_series import IncomparableProbes, read_series
-from moe_congestion_routing.metrics.router_probe import ROUTING_MAP_BITORDER
 
 
 def _sigmoid(z: numpy.ndarray) -> numpy.ndarray:
