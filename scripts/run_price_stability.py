@@ -186,6 +186,10 @@ def main() -> None:
     ):
         writer = csv.writer(handle)
         writer.writerow(PriceStabilityRow._fields)
+        # Flushed before the first result, because the first one can be many minutes away and an
+        # empty file reads as a crash. With the header down, the file says what it will contain.
+        handle.flush()
+        print(f"writing {len(jobs)} dumps to {out_path}", file=sys.stderr, flush=True)
         for rows in executor.map(_rows_for_path, jobs):
             for row in rows:
                 writer.writerow(row)
