@@ -15,10 +15,18 @@
 #   source config.sh
 #   sbatch scripts/make_probe_batch.sbatch                       # the standing ClimbMix asset
 #   sbatch scripts/make_probe_batch.sbatch skewed 16 2048 <prefix>
+#   SAMPLING=strided sbatch scripts/make_probe_batch.sbatch      # spread across the held-out split
 #
 # Args, all optional and positional: ROLE SEQUENCES SEQ_LENGTH DATA_PREFIX. --out is derived as
-# assets/probe/<role>_<blob>_<S>x<seq_length>.npz, where <blob> is DATA_PREFIX's basename, because
-# make_probe_batch.py refuses an --out basename that disagrees with --role.
+# assets/probe/<role>_<blob>[_<sampling>]_<S>x<seq_length>.npz, where <blob> is DATA_PREFIX's
+# basename, because make_probe_batch.py refuses an --out basename that disagrees with --role.
+#
+# Set SAMPLING=strided to spread the sampled documents across the whole held-out split instead of
+# taking the minimal run at the tail of the blob, which is a few dozen adjacent documents and so
+# samples one corpus neighbourhood. The default stays `tail` so an asset extracted before the flag
+# existed still re-extracts byte for byte. A strided asset is a DIFFERENT INSTRUMENT with its own
+# token_sha256, never a replacement, which is why the name carries the mode and the default does
+# not: renaming the existing assets would break every `moe_probe_batch` path pointing at them.
 #
 # Set FORCE=1 to overwrite an existing asset. Off by default: these are committed, frozen inputs
 # that every arm's dumps are keyed to, so replacing one silently invalidates cross-run comparison.
@@ -26,9 +34,10 @@
 # Two things to check with `--show` BEFORE committing the asset it writes:
 #   - `data_prefix` in the provenance is the EXPANDED path, so a ${DATA_STORE} that carries a
 #     username puts that username inside a committed .npz.
-#   - `tail_fraction` must sit inside the valid slice that the arm's `split` carves (base_cluster
-#     uses "99,1,0", so the last 1%). The script checks the tail against --max-tail-fraction, not
-#     against the split, and a probe drawn from train contaminates every measurement built on it.
+#   - The documents read must sit inside the valid slice that the arm's `split` carves
+#     (base_cluster uses "99,1,0", so the last 1%). Read `tail_fraction` on a tail asset and
+#     `span_fraction` on a strided one. The script checks against --max-tail-fraction, not against
+#     the split, and a probe drawn from train contaminates every measurement built on it.
 
 set -euo pipefail
 mkdir -p logs
@@ -49,8 +58,14 @@ else
   DATA_PREFIX="$DATA_STORE/datasets/nvidia/Nemotron-ClimbMix/climbmix_small/climbmix_small"
 fi
 
+SAMPLING="${SAMPLING:-tail}"
 BLOB="$(basename "$DATA_PREFIX")"
-OUT="assets/probe/${ROLE}_${BLOB}_${SEQUENCES}x${SEQ_LENGTH}.npz"
+# The mode is in the name only when it is not the default, so the assets extracted before the flag
+# existed keep the names every config already points at, and a reader who has nothing but a
+# filename can still tell two instruments apart.
+SAMPLING_TAG=""
+[ "$SAMPLING" != "tail" ] && SAMPLING_TAG="_${SAMPLING}"
+OUT="assets/probe/${ROLE}_${BLOB}${SAMPLING_TAG}_${SEQUENCES}x${SEQ_LENGTH}.npz"
 FORCE_FLAG=""
 [ "${FORCE:-0}" = "1" ] && FORCE_FLAG="--force"
 
@@ -88,7 +103,7 @@ srun --nodes=1 --ntasks=1 --environment=alps6 bash -c "
 srun --nodes=1 --ntasks=1 --environment=alps6 --cpus-per-task "$SLURM_CPUS_PER_TASK" bash -c "
   set -euo pipefail
   echo \"=== node \$(hostname) | \$(date) ===\"
-  echo \"=== role=$ROLE S=$SEQUENCES seq_length=$SEQ_LENGTH out=$OUT ===\"
+  echo \"=== role=$ROLE sampling=$SAMPLING S=$SEQUENCES seq_length=$SEQ_LENGTH out=$OUT ===\"
   $CACHE_ENV_EXPORT
   cd $WORKDIR
   set +u; source .venv/bin/activate; set -u
@@ -101,6 +116,7 @@ srun --nodes=1 --ntasks=1 --environment=alps6 --cpus-per-task "$SLURM_CPUS_PER_T
     --seq-length $SEQ_LENGTH \
     --sequences $SEQUENCES \
     --role $ROLE \
+    --sampling $SAMPLING \
     --out \"$OUT\" $FORCE_FLAG
 
   echo '=== provenance ==='
