@@ -8,6 +8,8 @@ from moe_congestion_routing.metrics.probe_comparison import (
     DUAL_SPREAD_GATE,
     gated_dual_agreement,
     internalization_rows,
+    part_indices,
+    price_stability_rows_for_dump,
     verification_rows,
 )
 from moe_congestion_routing.metrics.probe_series import IncomparableProbes, read_series
@@ -31,6 +33,7 @@ def _write_dump(
     token_sha256="cafe" * 16,
     role="standing",
     coarse_interval=6,
+    probe_seqs=1,
 ):
     """A synthetic probe dump whose routing map conforms to top-K of its own scores by default.
 
@@ -62,6 +65,7 @@ def _write_dump(
         "token_sha256": token_sha256,
         "role": role,
         "moe_probe_coarse_interval": coarse_interval,
+        "moe_probe_seqs": probe_seqs,
         "layer_numbers": layer_numbers,
         "E": num_experts,
         "K": topk,
@@ -290,3 +294,89 @@ def test_internalization_rows_actually_apply_the_gate(tmp_path):
     assert numpy.isnan(swamped[0].dual_correlation)
     # The ratio is reported either way, because a masked correlation without it says nothing.
     assert swamped[0].dual_spread_over_eta > 0.0
+
+
+# --- how a batch is cut into parts ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("split", ["sequence", "stride"])
+def test_part_indices_are_disjoint_and_cover_the_batch(split):
+    parts = part_indices(num_tokens=16, num_sequences=4, num_parts=4, split=split)
+
+    assert [len(p) for p in parts] == [4, 4, 4, 4]
+    pooled = numpy.concatenate(parts)
+    numpy.testing.assert_array_equal(numpy.sort(pooled), numpy.arange(16))
+
+
+def test_sequence_split_cuts_on_sequence_boundaries_and_stride_does_not():
+    # 4 sequences of 4 tokens, rows sequence-major, so sequence s owns rows 4s..4s+3.
+    sequence = part_indices(num_tokens=16, num_sequences=4, num_parts=2, split="sequence")
+    stride = part_indices(num_tokens=16, num_sequences=4, num_parts=2, split="stride")
+
+    numpy.testing.assert_array_equal(sequence[0], numpy.arange(0, 8))
+    numpy.testing.assert_array_equal(sequence[1], numpy.arange(8, 16))
+    # The stride part draws from every sequence, which is the whole reason both modes exist.
+    numpy.testing.assert_array_equal(stride[0], numpy.arange(0, 16, 2))
+    assert len({int(i) // 4 for i in stride[0]}) == 4
+
+
+def test_sequence_split_refuses_a_part_that_would_straddle_a_sequence():
+    # 3 sequences cannot be cut in two without splitting one of them down the middle.
+    with pytest.raises(ValueError, match="whole number of sequences"):
+        part_indices(num_tokens=12, num_sequences=3, num_parts=2, split="sequence")
+
+
+def test_part_indices_refuses_fewer_than_two_parts_and_an_unknown_split():
+    with pytest.raises(ValueError, match="at least 2"):
+        part_indices(num_tokens=16, num_sequences=4, num_parts=1, split="stride")
+    with pytest.raises(ValueError, match="split must be one of"):
+        part_indices(num_tokens=16, num_sequences=4, num_parts=2, split="random")
+
+
+# --- the price-stability row ----------------------------------------------------------------
+
+
+def test_price_stability_reports_pairwise_prices_without_the_gate_masking_them(tmp_path):
+    """The pairwise columns must survive a bias update rate that masks the bias columns.
+
+    Neither side of a pairwise comparison is a stored bias, so no eta orbit is involved and the
+    resolvability gate must not reach them. Without this, dropping the gate's scope went uncaught.
+    """
+    # Five of eight tokens want expert 0 against a capacity of two, so that constraint binds and
+    # its shadow price separates, which is what makes a correlation between parts meaningful.
+    crowded = [[4.0, 0.0, 0.0, 0.0]] * 5
+    spread_out = [[0.0, 3.0, 0.0, 0.0], [0.0, 0.0, 2.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+    logits = numpy.array([crowded + spread_out], dtype=numpy.float32)
+    bias = numpy.array([[-0.03, 0.01, 0.0, 0.02]], dtype=numpy.float32)
+    _write_dump(tmp_path / "probes", step=0, logits=logits, expert_bias=bias, topk=1)
+    dump = read_series(tmp_path).dumps[-1]
+
+    swamped = price_stability_rows_for_dump(
+        dump, bias_update_rate=1e9, num_parts=2, split="stride"
+    )[0]
+
+    assert numpy.isnan(swamped.bias_correlation_full)
+    assert numpy.isnan(swamped.mean_bias_correlation_parts)
+    assert not numpy.isnan(swamped.mean_pairwise_correlation)
+    assert swamped.part_tokens == 4
+    assert swamped.num_parts == 2 and swamped.split == "stride"
+
+
+def test_price_stability_refuses_a_dump_it_cannot_reproduce(tmp_path):
+    logits = numpy.array([[[5.0, -5.0, -5.0], [-5.0, 5.0, -5.0], [-5.0, -5.0, 5.0]]])
+    wrong_map = numpy.zeros((1, 3, 3), dtype=bool)
+    wrong_map[0, 0, 0] = True
+    wrong_map[0, 1, 1] = True
+    wrong_map[0, 2, 0] = True  # token 2's true top-1 is expert 2
+    _write_dump(
+        tmp_path / "probes",
+        step=10,
+        logits=logits,
+        expert_bias=numpy.zeros((1, 3)),
+        topk=1,
+        routing_map=wrong_map,
+        layer_numbers=[7],
+    )
+    dump = read_series(tmp_path).dumps[-1]
+    with pytest.raises(IncomparableProbes, match=r"layer 7 has 1 untied selection disagreement"):
+        price_stability_rows_for_dump(dump, bias_update_rate=1e-3, split="stride")

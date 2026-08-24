@@ -85,6 +85,13 @@ class ProbeDump:
         return self.meta["K"]
 
     @property
+    def num_sequences(self) -> int:
+        """How many probe sequences were forwarded, so a token row range can be cut on a
+        sequence boundary. Rows are sequence-major (``row = sequence * seq_length + position``),
+        which ``router_probe.TOKEN_AXIS_CONVENTION`` pins and every dump is written in."""
+        return int(self.meta["moe_probe_seqs"])
+
+    @property
     def score_function(self) -> str:
         """Megatron's ``moe_router_score_function`` for the run that wrote this dump."""
         return self.meta["moe_router_score_function"]

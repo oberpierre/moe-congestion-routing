@@ -179,3 +179,116 @@ def internalization_rows(
                 )
             )
     return rows
+
+
+# The two ways a batch can be cut into parts, which measure different things and are both worth
+# having. "sequence" takes contiguous blocks of whole sequences, the honest analogue of forming a
+# smaller training batch, so it carries the composition difference between one set of documents
+# and another. "stride" takes every m-th token, which spreads each part evenly over every sequence
+# and every position, so it isolates sampling noise with the composition difference removed. The
+# gap between the two is therefore itself the measurement: it is how much of the price's
+# batch-dependence comes from *which documents* were drawn rather than from how many tokens.
+SPLIT_MODES = ("sequence", "stride")
+
+
+class PriceStabilityRow(NamedTuple):
+    """One (step, layer): how much this batch's equilibrium prices depend on the batch."""
+
+    step: int
+    layer: int
+    split: str
+    num_parts: int
+    part_tokens: int
+    mean_pairwise_correlation: float
+    min_pairwise_correlation: float
+    mean_pairwise_linf: float
+    bias_correlation_full: float
+    mean_bias_correlation_parts: float
+
+
+def part_indices(
+    num_tokens: int, num_sequences: int, num_parts: int, split: str
+) -> list[np.ndarray]:
+    """Disjoint token-row index arrays covering the batch, one per part."""
+    if split not in SPLIT_MODES:
+        raise ValueError(f"split must be one of {SPLIT_MODES}, got {split!r}")
+    if num_parts < 2:
+        raise ValueError(f"num_parts must be at least 2 to have a pair to compare, got {num_parts}")
+    if split == "stride":
+        if num_tokens % num_parts != 0:
+            raise ValueError(f"num_parts {num_parts} does not divide num_tokens {num_tokens}")
+        return [np.arange(part, num_tokens, num_parts) for part in range(num_parts)]
+    # Cutting on a sequence boundary needs the sequence count to divide, not the token count:
+    # a part holding half of one sequence and half of another is not a smaller batch, it is a
+    # truncation, and position within a sequence is not exchangeable the way sequences are.
+    if num_sequences % num_parts != 0:
+        raise ValueError(
+            f"split 'sequence' needs num_parts {num_parts} to divide num_sequences "
+            f"{num_sequences}, because a part must be a whole number of sequences"
+        )
+    block = num_tokens // num_parts
+    return [np.arange(part * block, (part + 1) * block) for part in range(num_parts)]
+
+
+def price_stability_rows_for_dump(
+    dump: ProbeDump,
+    *,
+    bias_update_rate: float,
+    num_parts: int = 2,
+    split: str = "sequence",
+    layers: Sequence[int] | None = None,
+) -> list[PriceStabilityRow]:
+    """Table 3, per layer of one dump: the equilibrium price against itself on sub-batches.
+
+    Table 2 asks whether the stored bias matches this batch's price. It cannot tell a bias that
+    has stopped tracking the price from a price that has become batch-specific, because both
+    lower the same correlation. This asks the second question on its own, by comparing the price
+    of one part of the batch against the price of another at the same model, so no bias enters
+    the pairwise columns and no convergence assumption is made anywhere.
+    """
+    _check_conformance(dump)
+    affinities = dump.affinities()
+    bias = dump.expert_bias()
+    indices = part_indices(affinities.shape[1], dump.num_sequences, num_parts, split)
+
+    rows = []
+    for axis_index, layer_number in _select_layers(dump, layers):
+        layer_a = affinities[axis_index]
+        layer_bias = bias[axis_index]
+
+        full = lp.solve(layer_a, dump.topk)
+        _, bias_correlation_full, _ = gated_dual_agreement(
+            layer_bias, full.capacity_duals, bias_update_rate
+        )
+
+        part_duals = [lp.solve(layer_a[idx], dump.topk).capacity_duals for idx in indices]
+        # The bias comparisons keep the resolvability gate, because they read the stored bias and
+        # so inherit its eta orbit. The pairwise comparisons below do not, because neither side of
+        # them is a bias and no orbit is involved.
+        part_bias_correlations = [
+            gated_dual_agreement(layer_bias, duals, bias_update_rate)[1] for duals in part_duals
+        ]
+
+        pairwise = [
+            dual_agreement(part_duals[i], part_duals[j])
+            for i in range(num_parts)
+            for j in range(i + 1, num_parts)
+        ]
+        correlations = [c for c, _ in pairwise]
+        linfs = [linf for _, linf in pairwise]
+
+        rows.append(
+            PriceStabilityRow(
+                step=dump.step,
+                layer=layer_number,
+                split=split,
+                num_parts=num_parts,
+                part_tokens=int(len(indices[0])),
+                mean_pairwise_correlation=float(np.mean(correlations)),
+                min_pairwise_correlation=float(np.min(correlations)),
+                mean_pairwise_linf=float(np.mean(linfs)),
+                bias_correlation_full=bias_correlation_full,
+                mean_bias_correlation_parts=float(np.mean(part_bias_correlations)),
+            )
+        )
+    return rows
