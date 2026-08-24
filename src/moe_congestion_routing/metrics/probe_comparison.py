@@ -181,14 +181,21 @@ def internalization_rows(
     return rows
 
 
-# The two ways a batch can be cut into parts, which measure different things and are both worth
-# having. "sequence" takes contiguous blocks of whole sequences, the honest analogue of forming a
-# smaller training batch, so it carries the composition difference between one set of documents
-# and another. "stride" takes every m-th token, which spreads each part evenly over every sequence
-# and every position, so it isolates sampling noise with the composition difference removed. The
-# gap between the two is therefore itself the measurement: it is how much of the price's
-# batch-dependence comes from *which documents* were drawn rather than from how many tokens.
-SPLIT_MODES = ("sequence", "stride")
+# Three ways to cut a batch into parts, which measure different things.
+#
+# "sequence" takes contiguous blocks of whole sequences, the analogue of forming a smaller
+# training batch, so its parts share no document and it carries composition as well as sample size.
+#
+# "random" takes a seeded permutation, so each part is an unbiased subsample of the same documents
+# and only sample size is left. This is the sampling control.
+#
+# "stride" takes every m-th row. Rows are sequence-major and a sequence length is even, so a stride
+# of two selects by position parity, which puts almost every token next to its own neighbour in the
+# other part. Text is locally coherent, so those parts are far more alike than two independent
+# draws would be, which means stride *understates* sampling noise rather than measuring it. It is
+# kept because the gap between it and "random" is how much that pairing flatters the number, and
+# not because it is the control it looks like.
+SPLIT_MODES = ("sequence", "stride", "random")
 
 
 class PriceStabilityRow(NamedTuple):
@@ -197,23 +204,37 @@ class PriceStabilityRow(NamedTuple):
     step: int
     layer: int
     split: str
+    split_seed: int | None  # empty for the deterministic splits, which take no seed
     num_parts: int
     part_tokens: int
+    num_pairs: int
     mean_pairwise_correlation: float
     min_pairwise_correlation: float
+    # Population standard deviation over the pairs, so a single pair reports 0.0 rather than NaN.
+    # It is the only within-cell error bar here, and it needs num_parts > 2 to say anything.
+    stdev_pairwise_correlation: float
     mean_pairwise_linf: float
     bias_correlation_full: float
     mean_bias_correlation_parts: float
 
 
 def part_indices(
-    num_tokens: int, num_sequences: int, num_parts: int, split: str
+    num_tokens: int, num_sequences: int, num_parts: int, split: str, seed: int | None = None
 ) -> list[np.ndarray]:
     """Disjoint token-row index arrays covering the batch, one per part."""
     if split not in SPLIT_MODES:
         raise ValueError(f"split must be one of {SPLIT_MODES}, got {split!r}")
     if num_parts < 2:
         raise ValueError(f"num_parts must be at least 2 to have a pair to compare, got {num_parts}")
+    if split == "random":
+        if seed is None:
+            raise ValueError("split 'random' requires a seed, so the cut can be reproduced")
+        if num_tokens % num_parts != 0:
+            raise ValueError(f"num_parts {num_parts} does not divide num_tokens {num_tokens}")
+        shuffled = np.random.default_rng(seed).permutation(num_tokens)
+        return list(np.split(shuffled, num_parts))
+    if seed is not None:
+        raise ValueError(f"split {split!r} is deterministic and takes no seed, got seed={seed}")
     if split == "stride":
         if num_tokens % num_parts != 0:
             raise ValueError(f"num_parts {num_parts} does not divide num_tokens {num_tokens}")
@@ -236,6 +257,7 @@ def price_stability_rows_for_dump(
     bias_update_rate: float,
     num_parts: int = 2,
     split: str = "sequence",
+    split_seed: int | None = None,
     layers: Sequence[int] | None = None,
 ) -> list[PriceStabilityRow]:
     """Table 3, per layer of one dump: the equilibrium price against itself on sub-batches.
@@ -249,7 +271,7 @@ def price_stability_rows_for_dump(
     _check_conformance(dump)
     affinities = dump.affinities()
     bias = dump.expert_bias()
-    indices = part_indices(affinities.shape[1], dump.num_sequences, num_parts, split)
+    indices = part_indices(affinities.shape[1], dump.num_sequences, num_parts, split, split_seed)
 
     rows = []
     for axis_index, layer_number in _select_layers(dump, layers):
@@ -282,10 +304,13 @@ def price_stability_rows_for_dump(
                 step=dump.step,
                 layer=layer_number,
                 split=split,
+                split_seed=split_seed,
                 num_parts=num_parts,
                 part_tokens=int(len(indices[0])),
+                num_pairs=len(correlations),
                 mean_pairwise_correlation=float(np.mean(correlations)),
                 min_pairwise_correlation=float(np.min(correlations)),
+                stdev_pairwise_correlation=float(np.std(correlations)),
                 mean_pairwise_linf=float(np.mean(linfs)),
                 bias_correlation_full=bias_correlation_full,
                 mean_bias_correlation_parts=float(np.mean(part_bias_correlations)),

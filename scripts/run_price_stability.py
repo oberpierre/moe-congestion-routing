@@ -13,11 +13,19 @@ drifting away from a price the batch still represents well. Both falling togethe
 itself has become batch-specific and the bias is tracking a population the batch no longer stands
 in for.
 
-``--split sequence`` cuts into whole sequences, which is what forming a smaller training batch
-does, so it carries the composition difference between one set of documents and another.
-``--split stride`` takes every m-th token, spreading each part over every sequence and position,
-which leaves only sampling noise. Running both and subtracting is how much of the effect is
-composition rather than sample size.
+``--split sequence`` cuts into whole sequences, so its parts share no document and it carries
+composition as well as sample size. ``--split random SEED`` takes a seeded permutation, so each
+part is an unbiased subsample of the same documents and only sample size is left: that is the
+control, and sequence minus random is the composition effect.
+
+``--split stride`` takes every m-th row, which for an even sequence length selects by position
+parity and so puts nearly every token beside its own neighbour in the other part. Text is locally
+coherent, so it *understates* sampling noise rather than measuring it. Read it against ``random``
+to see by how much, and do not read it alone.
+
+``--parts 4`` costs less than ``--parts 2`` and says more: the LP runs at about n**1.9, so four
+solves at a quarter of the batch are cheaper than two at a half, and four parts give six pairs
+per cell instead of one, which is the only within-cell error bar there is.
 
 Usage:
     uv run python scripts/run_price_stability.py RUNDIR --bias-update-rate 1.0e-3 \\
@@ -55,24 +63,25 @@ def _default_jobs() -> int:
     return os.cpu_count() or 1
 
 
-def _rows_for_path(job: tuple[str, float, int, str, tuple[int, ...] | None]) -> list:
+def _rows_for_path(job: tuple) -> list:
     """One dump's rows, as a process-pool task.
 
     Takes a path rather than a ``ProbeDump`` and re-reads it here, because under ``spawn`` every
     argument is pickled and the dump's arrays should be read in the worker that uses them.
     """
-    path, bias_update_rate, num_parts, split, layers = job
+    path, bias_update_rate, num_parts, split, split_seed, layers = job
     dump = read_dump(path)
     return price_stability_rows_for_dump(
         dump,
         bias_update_rate=bias_update_rate,
         num_parts=num_parts,
         split=split,
+        split_seed=split_seed,
         layers=list(layers) if layers else None,
     )
 
 
-def _benchmark(run_dir: str, num_parts: int, split: str) -> None:
+def _benchmark(run_dir: str, num_parts: int, split: str, seed: int | None) -> None:
     """Time one full-batch LP solve and one part solve, so a machine can be compared to another.
 
     Prints the shapes alongside the seconds, because a solve time means nothing without them, and
@@ -88,7 +97,7 @@ def _benchmark(run_dir: str, num_parts: int, split: str) -> None:
     layer_a = affinities[0]
     n, e = layer_a.shape
     k = dump.topk
-    indices = part_indices(n, dump.num_sequences, num_parts, split)
+    indices = part_indices(n, dump.num_sequences, num_parts, split, seed)
 
     start = time.perf_counter()
     lp.solve(layer_a, k)
@@ -133,6 +142,12 @@ def main() -> None:
         "--split", choices=SPLIT_MODES, default="sequence", help="how to cut (default sequence)"
     )
     parser.add_argument(
+        "--split-seed",
+        type=int,
+        help="permutation seed, required by --split random and refused by the other two, so a "
+        "row that carries no seed is one whose cut needed none",
+    )
+    parser.add_argument(
         "--step",
         type=int,
         action="append",
@@ -153,7 +168,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.benchmark:
-        _benchmark(args.run_dir, args.parts, args.split)
+        _benchmark(args.run_dir, args.parts, args.split, args.split_seed)
         return
     if args.bias_update_rate is None or args.out is None:
         parser.error("--bias-update-rate and --out are required unless --benchmark is given")
@@ -169,7 +184,15 @@ def main() -> None:
 
     layers = tuple(args.layers) if args.layers else None
     jobs = [
-        (str(dump.path), args.bias_update_rate, args.parts, args.split, layers) for dump in dumps
+        (
+            str(dump.path),
+            args.bias_update_rate,
+            args.parts,
+            args.split,
+            args.split_seed,
+            layers,
+        )
+        for dump in dumps
     ]
 
     out_path = Path(args.out)

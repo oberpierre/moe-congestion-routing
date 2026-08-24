@@ -299,9 +299,9 @@ def test_internalization_rows_actually_apply_the_gate(tmp_path):
 # --- how a batch is cut into parts ---------------------------------------------------------
 
 
-@pytest.mark.parametrize("split", ["sequence", "stride"])
-def test_part_indices_are_disjoint_and_cover_the_batch(split):
-    parts = part_indices(num_tokens=16, num_sequences=4, num_parts=4, split=split)
+@pytest.mark.parametrize("split,seed", [("sequence", None), ("stride", None), ("random", 0)])
+def test_part_indices_are_disjoint_and_cover_the_batch(split, seed):
+    parts = part_indices(num_tokens=16, num_sequences=4, num_parts=4, split=split, seed=seed)
 
     assert [len(p) for p in parts] == [4, 4, 4, 4]
     pooled = numpy.concatenate(parts)
@@ -330,7 +330,7 @@ def test_part_indices_refuses_fewer_than_two_parts_and_an_unknown_split():
     with pytest.raises(ValueError, match="at least 2"):
         part_indices(num_tokens=16, num_sequences=4, num_parts=1, split="stride")
     with pytest.raises(ValueError, match="split must be one of"):
-        part_indices(num_tokens=16, num_sequences=4, num_parts=2, split="random")
+        part_indices(num_tokens=16, num_sequences=4, num_parts=2, split="shuffled")
 
 
 # --- the price-stability row ----------------------------------------------------------------
@@ -380,3 +380,54 @@ def test_price_stability_refuses_a_dump_it_cannot_reproduce(tmp_path):
     dump = read_series(tmp_path).dumps[-1]
     with pytest.raises(IncomparableProbes, match=r"layer 7 has 1 untied selection disagreement"):
         price_stability_rows_for_dump(dump, bias_update_rate=1e-3, split="stride")
+
+
+def test_random_split_is_reproducible_from_its_seed_and_moves_with_it():
+    same_a = part_indices(num_tokens=64, num_sequences=4, num_parts=2, split="random", seed=7)
+    same_b = part_indices(num_tokens=64, num_sequences=4, num_parts=2, split="random", seed=7)
+    other = part_indices(num_tokens=64, num_sequences=4, num_parts=2, split="random", seed=8)
+
+    numpy.testing.assert_array_equal(same_a[0], same_b[0])
+    assert not numpy.array_equal(same_a[0], other[0])
+
+
+def test_random_split_draws_from_every_sequence_unlike_the_sequence_split():
+    # 4 sequences of 16 tokens. The point of the control is that composition is held fixed, so
+    # each part must carry all four sequences rather than a subset of them.
+    parts = part_indices(num_tokens=64, num_sequences=4, num_parts=2, split="random", seed=0)
+
+    for part in parts:
+        assert {int(i) // 16 for i in part} == {0, 1, 2, 3}
+
+
+def test_a_seed_is_required_for_random_and_refused_for_the_others():
+    """Both directions, because either silence would lose the reproducibility this exists for:
+    a missing seed makes the cut unrepeatable, and an accepted-but-ignored seed makes a row
+    claim a seed decided its cut when nothing did."""
+    with pytest.raises(ValueError, match="requires a seed"):
+        part_indices(num_tokens=16, num_sequences=4, num_parts=2, split="random")
+    for deterministic in ("sequence", "stride"):
+        with pytest.raises(ValueError, match="takes no seed"):
+            part_indices(num_tokens=16, num_sequences=4, num_parts=2, split=deterministic, seed=0)
+
+
+def test_four_parts_give_six_pairs_and_a_spread_where_two_give_one_pair_and_zero(tmp_path):
+    crowded = [[4.0, 0.0, 0.0, 0.0]] * 5
+    spread_out = [[0.0, 3.0, 0.0, 0.0], [0.0, 0.0, 2.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+    logits = numpy.array([crowded + spread_out], dtype=numpy.float32)
+    bias = numpy.array([[-0.03, 0.01, 0.0, 0.02]], dtype=numpy.float32)
+    _write_dump(tmp_path / "probes", step=0, logits=logits, expert_bias=bias, topk=1)
+    dump = read_series(tmp_path).dumps[-1]
+
+    two = price_stability_rows_for_dump(
+        dump, bias_update_rate=1e-3, num_parts=2, split="random", split_seed=0
+    )[0]
+    four = price_stability_rows_for_dump(
+        dump, bias_update_rate=1e-3, num_parts=4, split="random", split_seed=0
+    )[0]
+
+    assert (two.num_pairs, two.part_tokens) == (1, 4)
+    assert (four.num_pairs, four.part_tokens) == (6, 2)
+    # One pair has no spread to report, which is exactly why four parts are worth the same money.
+    assert two.stdev_pairwise_correlation == 0.0
+    assert two.split_seed == 0 and four.split_seed == 0
