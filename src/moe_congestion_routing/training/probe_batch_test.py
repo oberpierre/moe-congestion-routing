@@ -7,8 +7,10 @@ import pytest
 
 from moe_congestion_routing.training.megatron_path import MegatronLMNotVendoredError, ensure_on_path
 from moe_congestion_routing.training.probe_batch import (
+    STRIDE_SPREAD,
     load_probe_batch,
     probe_micro_batches,
+    strided_window,
     tail_window,
 )
 
@@ -276,3 +278,87 @@ def test_probe_micro_batches_rejects_non_positive_num_sequences():
         probe_micro_batches(
             batch, micro_batch_size=4, num_sequences=0, seq_length=batch.seq_length, eod_token=0
         )
+
+
+# --- strided_window: a probe spread across the held-out split -------------------------------
+
+
+def _uniform_lengths(num_documents, length=500):
+    return numpy.full(num_documents, length, dtype=numpy.int64)
+
+
+def test_strided_window_spreads_over_the_split_while_reading_the_same_documents():
+    """The reason the mode exists, pinned as the property that does not depend on blob size.
+
+    Both rules read about the same number of documents. The contiguous one reads them from one
+    neighbourhood at the very end of the blob, and this one spreads them over the held-out split,
+    covering a 1/STRIDE_SPREAD share of it. How many times wider that is grows with the blob, so
+    it is not the thing to assert: it is 74x here and about 3700x on the primary blob, whose
+    48965906 documents and 65-document window are both recorded in the committed asset.
+    """
+    lengths = _uniform_lengths(1_000_000)
+    target = 32_784
+
+    start, end, tail_fraction = tail_window(lengths, target, 0.01)
+    indices, stride, span_fraction = strided_window(lengths, target, 0.01)
+
+    assert stride > 1
+    assert span_fraction == pytest.approx(0.01 / STRIDE_SPREAD, rel=0.05)
+    assert span_fraction > tail_fraction * 50
+    # Not at the cost of reading a different amount of the corpus.
+    assert abs(indices.size - (end - start)) <= 2
+
+
+def test_strided_window_stays_inside_the_held_out_split():
+    # The guard that matters: a sampled document outside the split is a training document, and
+    # the probe would then measure the router on data it was fit to.
+    num_documents = 1_000_000
+    lengths = _uniform_lengths(num_documents)
+
+    indices, _, _ = strided_window(lengths, 32_784, 0.01)
+
+    split_start = num_documents - int(0.01 * num_documents)
+    assert int(indices.min()) >= split_start
+    assert int(indices.max()) < num_documents
+
+
+def test_strided_window_is_evenly_spaced_and_deterministic():
+    lengths = _uniform_lengths(1_000_000)
+
+    first, stride, _ = strided_window(lengths, 32_784, 0.01)
+    again, stride_again, _ = strided_window(lengths, 32_784, 0.01)
+
+    numpy.testing.assert_array_equal(first, again)
+    assert stride == stride_again
+    # Even spacing, so the sample carries no structure of its own beyond the stride.
+    numpy.testing.assert_array_equal(numpy.diff(first), numpy.full(first.size - 1, stride))
+
+
+def test_strided_window_reaches_the_token_target_when_documents_run_short():
+    """Documents shorter than the split mean make the walk take more of them than estimated.
+
+    The stride is laid out with room for that, so this must return a longer sample rather than
+    running off the end of the split, which is the failure STRIDE_SPREAD exists to prevent.
+    """
+    num_documents = 1_000_000
+    lengths = _uniform_lengths(num_documents)
+    # Every document the stride will actually land on holds a fifth of the mean.
+    split_start = num_documents - int(0.01 * num_documents)
+    lengths[split_start::2] = 100
+
+    indices, _, _ = strided_window(lengths, 32_784, 0.01)
+
+    assert int(lengths[indices].sum()) >= 32_784
+    assert int(indices.max()) < num_documents
+
+
+def test_strided_window_refuses_a_split_that_cannot_supply_the_tokens():
+    lengths = _uniform_lengths(10_000, length=1)
+    with pytest.raises(ValueError, match="reaches only"):
+        strided_window(lengths, 32_784, 0.01)
+
+
+def test_strided_window_refuses_a_fraction_that_leaves_no_split():
+    lengths = _uniform_lengths(50)
+    with pytest.raises(ValueError, match="no held-out split"):
+        strided_window(lengths, 100, 0.001)

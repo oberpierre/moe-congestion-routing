@@ -29,6 +29,7 @@ from moe_congestion_routing.training.probe_batch import (
     PROBE_ASSET_VERSION,
     PROBE_ROLES,
     compute_provenance_sha256,
+    strided_window,
     tail_window,
 )
 
@@ -55,15 +56,33 @@ def _extract(args: argparse.Namespace) -> None:
     num_documents = ds.sequence_lengths.shape[0]
     target_tokens = args.sequences * (args.seq_length + 1)
 
+    # `sampling` decides which documents are read and nothing else, so both paths produce the
+    # same array shape and the same integrity fields below.
     try:
-        start, end, tail_fraction = tail_window(
-            ds.sequence_lengths, target_tokens, args.max_tail_fraction
-        )
+        if args.sampling == "strided":
+            indices, stride, span_fraction = strided_window(
+                ds.sequence_lengths, target_tokens, args.max_tail_fraction
+            )
+            window = {
+                "sampling": "strided",
+                "doc_stride": int(stride),
+                "doc_range": [int(indices[0]), int(indices[-1]) + 1],
+                "num_docs": int(indices.size),
+                "span_fraction": span_fraction,
+            }
+        else:
+            start, end, tail_fraction = tail_window(
+                ds.sequence_lengths, target_tokens, args.max_tail_fraction
+            )
+            indices = numpy.arange(start, end)
+            # No `sampling` key on this path, because adding one would change the provenance hash
+            # of every asset extracted before it existed, and byte-identical re-extraction is a
+            # property the format is meant to keep. Its absence therefore means "tail".
+            window = {"tail_doc_range": [int(start), int(end)], "tail_fraction": tail_fraction}
     except ValueError as e:
         sys.exit(f"error: {e}")
-    n_tail = end - start
 
-    pieces = [ds.get(i) for i in range(start, end)]
+    pieces = [ds.get(int(i)) for i in indices]
     concatenated = numpy.concatenate(pieces)[:target_tokens]
 
     int32_info = numpy.iinfo(numpy.int32)
@@ -87,8 +106,7 @@ def _extract(args: argparse.Namespace) -> None:
         "role": role,
         "data_prefix": data_prefix,
         "num_documents": int(num_documents),
-        "tail_doc_range": [int(start), int(end)],
-        "tail_fraction": tail_fraction,
+        **window,
         "max_tail_fraction": args.max_tail_fraction,
         "S": int(args.sequences),
         "seq_length": int(args.seq_length),
@@ -107,9 +125,12 @@ def _extract(args: argparse.Namespace) -> None:
     )
 
     print(f"documents: {num_documents}")
-    print(f"tail docs: {n_tail}")
-    print(f"doc range: [{start}, {end})")
-    print(f"tail_fraction: {tail_fraction:.6g}")
+    print(f"sampling: {args.sampling}")
+    print(f"documents used: {indices.size}")
+    print(f"doc range: [{int(indices[0])}, {int(indices[-1]) + 1})")
+    for key in ("tail_fraction", "span_fraction", "doc_stride"):
+        if key in window:
+            print(f"{key}: {window[key]:.6g}" if key != "doc_stride" else f"{key}: {window[key]}")
     print(f"wrote {out_path}: tokens {tokens.shape} {tokens.dtype}")
 
 
@@ -135,11 +156,23 @@ def main() -> None:
         "--label", type=int, default=None, help="cluster/domain id to broadcast into seq_labels"
     )
     parser.add_argument(
+        "--sampling",
+        choices=("tail", "strided"),
+        default="tail",
+        help="tail takes the minimal run of documents at the end of the blob, which is a few "
+        "dozen adjacent ones and so samples a single corpus neighbourhood. strided spreads the "
+        "same number of documents across the whole held-out split, which is what a training "
+        "batch sees. Default tail, so an asset extracted before this flag existed still "
+        "re-extracts byte for byte",
+    )
+    parser.add_argument(
         "--max-tail-fraction",
         type=float,
         default=0.01,
-        help="refuse if the tail documents needed exceed this fraction of the blob, the default "
-        "0.01 is the valid fraction of a 'split: \"99,1,0\"' training split and must move with it",
+        help="the held-out split, as a fraction of the blob. With --sampling tail this refuses a "
+        "window reaching further back than the fraction, and with strided it is the range the "
+        "sample is spread over. The default 0.01 is the valid fraction of a "
+        "'split: \"99,1,0\"' training split and must move with it",
     )
     parser.add_argument("--force", action="store_true", help="overwrite an existing --out")
     parser.add_argument(

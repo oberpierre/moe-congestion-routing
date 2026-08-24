@@ -61,6 +61,63 @@ def tail_window(
     return num_documents - n_tail, num_documents, tail_fraction
 
 
+# How many slots the strided sampler lays across the held-out split, as a multiple of the
+# documents it estimates it needs. At 1 a split whose sampled documents run shorter than the mean
+# would walk off the end and fail, whereas at 2 it can take twice the estimate and stay inside.
+# The cost is spanning about half the split rather than all of it when lengths are typical. That
+# is still about 3700 times the span of the contiguous rule on the primary blob, whose 48965906
+# documents and 65-document window the committed standing asset records.
+STRIDE_SPREAD = 2
+
+
+def strided_window(
+    sequence_lengths: numpy.ndarray, target_tokens: int, max_tail_fraction: float
+) -> tuple[numpy.ndarray, int, float]:
+    """Return ``(document_indices, stride, span_fraction)`` for a probe spread across the
+    held-out split, rather than taken from one contiguous run of documents at its end.
+
+    :func:`tail_window` takes the *minimal* tail, which on a real blob is a few dozen adjacent
+    documents. Adjacent documents in a web corpus can share a crawl, a domain or a topic, so
+    that instrument measures the router on one neighbourhood while the bias it is compared
+    against tracks batches Megatron draws from the whole corpus. Striding removes that mismatch
+    while keeping everything the contiguous rule bought: no seed, no shuffle index, no index
+    cache, a deterministic result, and every sampled document inside the held-out split.
+
+    ``max_tail_fraction`` still names the held-out split, but bounds a different thing here: not
+    how far back a window reaches, but that every sampled document lies within it.
+    """
+    num_documents = int(sequence_lengths.shape[0])
+    split_size = int(max_tail_fraction * num_documents)
+    if split_size < 1:
+        raise ValueError(
+            f"max_tail_fraction={max_tail_fraction} over {num_documents} documents leaves no "
+            "held-out split to sample from"
+        )
+    split_start = num_documents - split_size
+
+    mean_length = float(sequence_lengths[split_start:].mean())
+    if mean_length <= 0:
+        raise ValueError(f"the last {split_size} documents hold no tokens")
+    estimate = max(1, -(-target_tokens // int(mean_length)))
+    stride = max(1, split_size // (STRIDE_SPREAD * estimate))
+
+    indices = []
+    cumulative = 0
+    for index in range(split_start, num_documents, stride):
+        indices.append(index)
+        cumulative += int(sequence_lengths[index])
+        if cumulative >= target_tokens:
+            break
+    else:
+        raise ValueError(
+            f"striding the last {split_size} documents at stride {stride} reaches only "
+            f"{cumulative} tokens across {len(indices)} documents, need {target_tokens}"
+        )
+
+    span_fraction = (indices[-1] + 1 - indices[0]) / num_documents
+    return numpy.array(indices, dtype=numpy.int64), stride, span_fraction
+
+
 @dataclass(frozen=True)
 class ProbeBatch:
     """A frozen probe batch, loaded from an ``assets/probe/*.npz`` file."""
