@@ -324,6 +324,20 @@ class ConformanceRow:
     disagreeing_tokens: int
     untied_disagreements: int
     exact_ties: int
+    """Tokens whose K-th and (K+1)-th float32 scores are bit-identical. Zero on every real dump
+    measured so far, which is why the tie test is ULP-relative rather than exact."""
+
+    tied_tokens: int
+    """Tokens within ``CONFORMANCE_TIE_ULP`` float steps, so the replica's own arithmetic cannot
+    resolve the ordering. Their disagreements are excluded from ``untied_disagreements``."""
+
+
+# How many float steps of the model's own arithmetic count as a tie when checking that the offline
+# replica routes the way the router did. Four, because that is the largest disagreement measured
+# between numpy's sigmoid and torch's on a real dump, so a margin under it can be inverted by the
+# replica rather than by any defect. Measured on this tree, a threshold of four exempts between two
+# and eight tokens out of 262144 per dump, so the check keeps essentially all of its power.
+CONFORMANCE_TIE_ULP = 4
 
 
 def selection_conformance(dump: ProbeDump) -> list[ConformanceRow]:
@@ -335,9 +349,13 @@ def selection_conformance(dump: ProbeDump) -> list[ConformanceRow]:
     (K+1)-th scores are exactly equal was decided by a tie rule rather than by the affinities,
     and two implementations are free to disagree there.
 
-    Scores are compared in float32, the arithmetic the model used. A tolerance would be wrong
-    here rather than merely unnecessary: any nonzero float32 margin is an ordering both
-    implementations see identically, so only an exact tie leaves the choice to the rule.
+    Scores are compared in float32, the arithmetic the model used, and a token counts as tied
+    within :data:`CONFORMANCE_TIE_ULP` float steps rather than only at exact equality. An earlier
+    version required exact equality, arguing that any nonzero float32 margin is an ordering both
+    implementations see identically. That is false here, because our sigmoid is not the model's:
+    numpy and torch differ by up to 4 ULP on about a third of a real dump, so a margin of one step
+    can inverted by the replica alone. Exact equality also never occurred, so the exemption was
+    dead and every near-tie counted as a defect.
     """
     affinities = dump.affinities()
     bias = dump.expert_bias()
@@ -350,7 +368,10 @@ def selection_conformance(dump: ProbeDump) -> list[ConformanceRow]:
         replica = numpy.zeros_like(stored[axis_index])
         numpy.put_along_axis(replica, top_k_map(scores, k), True, axis=1)
         disagrees = ~numpy.all(replica == stored[axis_index], axis=1)
-        tied = tie_margins(scores, k) == 0.0
+        margins = tie_margins(scores, k)
+        kth = numpy.sort(scores, axis=1)[:, ::-1][:, k - 1]
+        step_at_kth = numpy.spacing(kth).astype(numpy.float64)
+        tied = margins.astype(numpy.float64) <= CONFORMANCE_TIE_ULP * step_at_kth
         rows.append(
             ConformanceRow(
                 step=dump.step,
@@ -358,7 +379,8 @@ def selection_conformance(dump: ProbeDump) -> list[ConformanceRow]:
                 num_tokens=int(stored.shape[1]),
                 disagreeing_tokens=int(disagrees.sum()),
                 untied_disagreements=int((disagrees & ~tied).sum()),
-                exact_ties=int(tied.sum()),
+                exact_ties=int((margins == 0.0).sum()),
+                tied_tokens=int(tied.sum()),
             )
         )
     return rows

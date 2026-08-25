@@ -428,3 +428,41 @@ def test_reading_a_dump_does_not_pull_in_torch():
         "sys.exit(1 if 'torch' in sys.modules else 0)"
     )
     assert subprocess.run([sys.executable, "-c", source], check=False).returncode == 0
+
+
+def test_conformance_tolerates_a_disagreement_within_one_float_step(tmp_path):
+    """A near-tie the replica cannot resolve must not be reported as a defect.
+
+    Two real dumps in this tree each carry exactly one disagreeing token, at 1.00 and 0.75 float32
+    steps, and the previous exact-equality test called both defects and refused the whole series.
+    Our sigmoid is not the model's, so a margin of a step or two can be inverted by the replica
+    alone rather than by anything being wrong.
+    """
+    # Experts 1 and 2 share a logit, so they share a sigmoid value exactly, and the bias then puts
+    # expert 2 one float step below expert 1. Building the gap in the bias rather than in the
+    # logits is deliberate: a sigmoid round trip cannot resolve two logits one step apart, so
+    # asking for adjacent affinities directly yields an exact tie instead of the near-tie wanted.
+    logits = numpy.array([[[5.0, 0.4, 0.4, -5.0], [5.0, 2.0, -2.0, -5.0]]], dtype=numpy.float32)
+    shared = numpy.float32(1.0) / (numpy.float32(1.0) + numpy.exp(numpy.float32(-0.4)))
+    bias = numpy.array([[0.0, 0.0, -float(numpy.spacing(shared)), 0.0]], dtype=numpy.float32)
+
+    # Token 0's stored map takes expert 2 where top-2 of our scores takes expert 1, across that
+    # one-step boundary. Token 1's scores are far apart and it agrees.
+    stored = numpy.zeros((1, 2, 4), dtype=bool)
+    stored[0, 0, [0, 2]] = True
+    stored[0, 1, [0, 1]] = True
+    _write_dump(
+        tmp_path / "probes",
+        step=0,
+        routing_map=stored,
+        role="dev",
+        logits=logits,
+        expert_bias=bias,
+    )
+
+    row = selection_conformance(read_series(tmp_path, allow_roles=("dev",)).dumps[-1])[0]
+
+    assert row.disagreeing_tokens == 1
+    assert row.exact_ties == 0  # the two scores are adjacent, not identical
+    assert row.tied_tokens == 1  # but within CONFORMANCE_TIE_ULP, so we cannot resolve them
+    assert row.untied_disagreements == 0
