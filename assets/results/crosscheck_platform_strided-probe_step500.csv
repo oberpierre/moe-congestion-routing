@@ -1,0 +1,2 @@
+step,layer,split,num_parts,part_tokens,mean_pairwise_correlation,min_pairwise_correlation,mean_pairwise_linf,bias_correlation_full,mean_bias_correlation_parts
+500,2,stride,2,8192,0.9974852887887233,0.9974852887887233,0.0069476544740609825,0.870967017811821,0.8713545110441187
