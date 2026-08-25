@@ -303,6 +303,13 @@ class MoEPretrainConfig:
     ckpt_step: int | None = None
     """Load this iteration from ``load`` instead of the newest (200 => ``iter_0000200/``)."""
 
+    finetune: bool = False
+    """Load the model weights but restart the iteration counter at zero, skipping the optimizer,
+    scheduler and RNG state in the checkpoint. Matches Megatron's own ``--finetune`` default of
+    off. The probe tier needs it: the init-state dump fires only when ``args.iteration == 0``, so
+    this is the one way to capture a saved checkpoint's router state without first taking an
+    optimizer step that moves the weights being measured."""
+
     # Transformer Engine, for its fused attention, LayerNorm and Linear kernels. Training and
     # inference must use the same implementation, because a checkpoint never crosses them: one
     # trained under `local` is not loadable into a TE model.
@@ -818,6 +825,8 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         args += ["--load", cfg.load]
     if cfg.ckpt_step:
         args += ["--ckpt-step", str(cfg.ckpt_step)]
+    if cfg.finetune:
+        args += ["--finetune"]
     if cfg.exit_on_missing_checkpoint:
         args += ["--exit-on-missing-checkpoint"]
     if cfg.exit_interval:

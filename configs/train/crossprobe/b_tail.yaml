@@ -1,0 +1,12 @@
+# Cell B-tail of the 2x2: run B's step-500 checkpoint, tail instrument.
+#
+# moe_probe_dir is pinned here rather than left to derive. With `load` set and no `--run-dir`,
+# the run dir resolves to the directory it loaded from, so the derived probe dir would be the
+# source run's own probes/ and the init dump would overwrite its iter_0000000.npz. Pass
+# `--run-dir` as well, because that is what keeps the logs out of the source run too.
+extends: _base.yaml
+
+load: artifacts/exp1/alflb/20260824-232033/checkpoints
+moe_probe_batch: assets/probe/standing_climbmix_small_16x2048.npz
+moe_probe_seqs: 8
+moe_probe_dir: artifacts/exp1/crossprobe/b_tail/probes
