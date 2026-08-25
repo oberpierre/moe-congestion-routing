@@ -1,4 +1,4 @@
-step,layer,bias_update_rate,dual_spread_over_eta,dual_correlation,dual_linf
+step,layer,bias_update_rate,dual_spread_over_eta,bias_price_correlation,bias_price_linf
 0,2,0.001,210.73031425476074,nan,0.12955243606120348
 0,3,0.001,214.84237909317017,nan,0.11021312512457371
 0,4,0.001,293.0775284767151,nan,0.16055953223258257
