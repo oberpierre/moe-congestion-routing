@@ -30,7 +30,6 @@ Usage:
 """
 
 import argparse
-import csv
 import multiprocessing
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -50,6 +49,8 @@ CELLS = {
     "a_strided": (RUN_A, None),
     "b_tail": (RUN_B, None),
     "b_strided": (RUN_B, f"{RUN_B}/probes/iter_0000500.npz"),
+    "a_tail16": (RUN_A, None),
+    "b_tail16": (RUN_B, None),
 }
 
 # Every reported effect here is 0.05 or larger, and the platform-to-platform agreement already
@@ -78,17 +79,6 @@ def _lp_correlations(path: str) -> dict:
         max_workers=8, mp_context=multiprocessing.get_context("spawn")
     ) as executor:
         return dict(executor.map(_one_layer_correlation, [(path, a) for a in range(layers)]))
-
-
-def _reference_correlations() -> dict:
-    """Training-time ``corr(b_train, p*)`` at step 500, from the committed table."""
-    path = "assets/results/internalization_tail-probe_all-steps.csv"
-    with open(path) as handle:
-        return {
-            int(row["layer"]): float(row["bias_price_correlation"])
-            for row in csv.DictReader(handle)
-            if int(row["step"]) == 500
-        }
 
 
 def check(cell: str, run_dir: str, reference: str | None, use_lp: bool) -> list:
@@ -131,7 +121,7 @@ def check(cell: str, run_dir: str, reference: str | None, use_lp: bool) -> list:
 
     gap = float(np.abs(fresh.affinities() - original.affinities()).max())
     if use_lp:
-        got, want = _lp_correlations(fresh_path), _reference_correlations()
+        got, want = _lp_correlations(fresh_path), _lp_correlations(reference)
         moved = {
             layer: abs(value - want[layer])
             for layer, value in got.items()
