@@ -62,8 +62,8 @@ CORR_TOLERANCE = 1e-3
 def _one_layer_correlation(job: tuple) -> tuple:
     """``(layer, corr(b_train, p*))`` for one layer, as a process-pool task.
 
-    Module level and taking a path rather than a dump, because the pool uses ``spawn`` (`0042`),
-    which pickles both the callable and its arguments.
+    Module level and taking a path rather than a dump, because the pool is a ``spawn`` pool, which
+    pickles both the callable and its arguments.
     """
     path, axis = job
     dump = read_dump(path)
