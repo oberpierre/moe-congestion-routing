@@ -33,6 +33,15 @@ from moe_congestion_routing.metrics.probe_series import (
 # so moving this threshold changes which instances are refused rather than being free.
 DUAL_SPREAD_GATE = 8.0
 
+# A price describes a batch the router treated as a sample. Above this ratio of the busiest expert's
+# deployed load to the balanced load L = n*K/E, it does not: on one probe half a single expert took
+# 64% of the tokens, so the LP priced it deeply negative to shed them and every correlation against
+# the stored bias collapsed. Calibrated on 344 screened units rather than on the failing case, the
+# observed separation is 3.26 (worst sound unit) against 4.04 (mildest distorted one), so 3.5
+# sits in the gap. It also refuses exactly the pre-balancing steps of both runs, which is why
+# there is no separate warmup constant.
+CONCENTRATION_LIMIT = 3.5
+
 
 class VerificationRow(NamedTuple):
     """One (step, layer) of Table 1: the annealed run against this dump's own affinities."""
@@ -423,3 +432,35 @@ def half_split_row(
         boot_resamples=resamples,
         kappa_boot_undefined=int(resamples - finite.size),
     )
+
+
+class BatchScreen(NamedTuple):
+    """Whether one token set's routing is concentrated enough to invalidate its prices."""
+
+    admissible: bool
+    max_load_over_balanced: float
+    dead_experts: int
+    reason: str
+
+
+def screen_batch(routing_map: np.ndarray, topk: int) -> BatchScreen:
+    """Refuse a token set whose deployed routing is too concentrated to price.
+
+    ``routing_map`` is ``[tokens, experts]`` boolean for **one layer** and exactly the token set
+    whose price is about to be computed. Screening the dump when a half is what gets scored misses
+    the concentration, because averaging over a sound half dilutes it by roughly half.
+
+    Two refusals, and both are about the oracle rather than the router. An expert the router left at
+    zero tokens is still assigned ``L`` tokens by the LP, because capacity is tight, so its price is
+    an artifact outright. And an expert the router loaded far above ``L`` forces a price that
+    describes that concentration rather than the population.
+    """
+    load = routing_map.sum(axis=0)
+    balanced = routing_map.shape[0] * topk / routing_map.shape[1]
+    ratio = float(load.max() / balanced)
+    dead = int((load == 0).sum())
+    if dead:
+        return BatchScreen(False, ratio, dead, f"{dead} experts received zero tokens")
+    if ratio > CONCENTRATION_LIMIT:
+        return BatchScreen(False, ratio, dead, f"busiest expert at {ratio:.2f}x balanced load")
+    return BatchScreen(True, ratio, dead, "")

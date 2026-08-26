@@ -22,13 +22,11 @@ from pathlib import Path
 
 import numpy as np
 
+from moe_congestion_routing.metrics.probe_comparison import CONCENTRATION_LIMIT
 from moe_congestion_routing.metrics.probe_series import read_dump, read_series
 
-# Above this, a batch's routing is concentrated enough that its equilibrium prices describe that
-# concentration rather than the population. Chosen from the measured separation (every sound batch
-# here reaches at most 2.44 and the anomalous one starts at 4.10 on its second layer), so it is a
-# gap in observed data rather than a round number, and it is a warning rather than a refusal.
-CONCENTRATION_WARN = 3.0
+# Single-sourced, so the screen this prints and the gate the analysis enforces cannot drift apart.
+CONCENTRATION_WARN = CONCENTRATION_LIMIT
 
 
 def rows_for_dump(path: str, halves: bool) -> list:

@@ -480,3 +480,39 @@ def test_half_split_row_reports_a_diluted_bias_below_one():
         p_bar + 1.0 * rng.normal(size=n), duals_a, duals_b, step=0, layer=2, resamples=400, seed=3
     )
     assert diluted.kappa < 0.9 < exact.kappa
+
+
+def test_screen_batch_refuses_concentration_and_dead_experts():
+    """Pin both refusals and the boundary, not just the happy branch.
+
+    The ratio case is built at a known multiple of the balanced load rather than at the constant's
+    current value, so the test states what the gate is for and survives a recalibration.
+    """
+    tokens, experts, topk = 640, 8, 2
+    balanced = tokens * topk / experts  # 160
+
+    even = numpy.zeros((tokens, experts), dtype=bool)
+    for i in range(tokens):
+        even[i, i % experts] = True
+        even[i, (i + 1) % experts] = True
+    assert probe_comparison.screen_batch(even, topk).admissible
+
+    # One expert taking every token's first slot is 4x the balanced load, above any sane limit.
+    hot = numpy.zeros((tokens, experts), dtype=bool)
+    hot[:, 0] = True
+    for i in range(tokens):
+        hot[i, 1 + i % (experts - 1)] = True
+    screened = probe_comparison.screen_batch(hot, topk)
+    assert not screened.admissible
+    assert screened.max_load_over_balanced == pytest.approx(tokens / balanced)
+    assert "balanced load" in screened.reason
+
+    # A dead expert is refused even when concentration alone would pass.
+    mild = even.copy()
+    mild[mild[:, 7], 6] = True
+    mild[:, 7] = False
+    dead = probe_comparison.screen_batch(mild, topk)
+    assert not dead.admissible
+    assert dead.dead_experts == 1
+    assert dead.max_load_over_balanced <= probe_comparison.CONCENTRATION_LIMIT
+    assert "zero tokens" in dead.reason
