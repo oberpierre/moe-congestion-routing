@@ -4,6 +4,7 @@ import numpy
 import pytest
 
 from moe_congestion_routing.game.alflb import top_k_map
+from moe_congestion_routing.metrics import probe_comparison
 from moe_congestion_routing.metrics.probe_comparison import (
     DUAL_SPREAD_GATE,
     gated_dual_agreement,
@@ -289,9 +290,9 @@ def test_internalization_rows_actually_apply_the_gate(tmp_path):
 
     # Same duals both times, so only the rate moved the row across the gate.
     assert resolvable[0].dual_spread_over_eta > DUAL_SPREAD_GATE
-    assert not numpy.isnan(resolvable[0].dual_correlation)
+    assert not numpy.isnan(resolvable[0].bias_price_correlation)
     assert swamped[0].dual_spread_over_eta < DUAL_SPREAD_GATE
-    assert numpy.isnan(swamped[0].dual_correlation)
+    assert numpy.isnan(swamped[0].bias_price_correlation)
     # The ratio is reported either way, because a masked correlation without it says nothing.
     assert swamped[0].dual_spread_over_eta > 0.0
 
@@ -431,3 +432,51 @@ def test_four_parts_give_six_pairs_and_a_spread_where_two_give_one_pair_and_zero
     # One pair has no spread to report, which is exactly why four parts are worth the same money.
     assert two.stdev_pairwise_correlation == 0.0
     assert two.split_seed == 0 and four.split_seed == 0
+
+
+def test_half_split_row_recovers_kappa_when_the_halves_have_very_unequal_noise():
+    """Build p_bar, two halves with 20x different noise, and a bias that IS p_bar, then read kappa.
+
+    The noise ratio is what gives this test its power. Under kappa = 1 the product form must return
+    1, while the same quantity built from the halves' *mean* is inflated by AM-GM, and the gap is
+    only large when the halves differ a lot. A gentler construction passes under both formulas and
+    so pins nothing.
+    """
+    rng = numpy.random.default_rng(7)
+    n = 64
+    p_bar = rng.normal(size=n)
+    duals_a = p_bar + 0.2 * rng.normal(size=n)
+    duals_b = p_bar + 4.0 * rng.normal(size=n)
+    bias = p_bar  # kappa = 1 by construction
+
+    row = probe_comparison.half_split_row(
+        bias, duals_a, duals_b, step=0, layer=2, resamples=400, seed=3
+    )
+    assert row.kappa == pytest.approx(1.0, abs=0.1)
+    assert row.kappa_boot_low < row.kappa < row.kappa_boot_high
+    assert row.rho_boot_low < row.rho < row.rho_boot_high
+    # Some resamples land on a non-positive rho once the halves are this unequal, which is the
+    # column's whole job: it says how much of the interval below is a real measurement.
+    assert 0 < row.kappa_boot_undefined < 0.1 * 400
+
+    # The statistic this replaced, on the same numbers: using the halves' mean in place of their
+    # product inflates it well past the tolerance above, which is what makes the assertion bite.
+    mean_based = numpy.sqrt(((row.corr_bias_a + row.corr_bias_b) / 2) ** 2 / row.rho)
+    assert mean_based > 1.2
+
+
+def test_half_split_row_reports_a_diluted_bias_below_one():
+    """A bias that is only partly the population price must come back with kappa < 1."""
+    rng = numpy.random.default_rng(11)
+    n = 64
+    p_bar = rng.normal(size=n)
+    duals_a = p_bar + 0.5 * rng.normal(size=n)
+    duals_b = p_bar + 1.5 * rng.normal(size=n)
+
+    exact = probe_comparison.half_split_row(
+        p_bar, duals_a, duals_b, step=0, layer=2, resamples=400, seed=3
+    )
+    diluted = probe_comparison.half_split_row(
+        p_bar + 1.0 * rng.normal(size=n), duals_a, duals_b, step=0, layer=2, resamples=400, seed=3
+    )
+    assert diluted.kappa < 0.9 < exact.kappa

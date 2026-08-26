@@ -44,14 +44,20 @@ class VerificationRow(NamedTuple):
 
 
 class InternalizationRow(NamedTuple):
-    """One (step, layer) of Table 2: the dump's stored bias against this batch's LP duals."""
+    """One (step, layer) of Table 2: the dump's stored bias against this batch's LP duals.
+
+    The correlation column is ``bias_price_correlation`` and NOT ``dual_correlation``, which
+    :class:`~moe_congestion_routing.game.compare.Comparison` already uses for the annealed
+    replica's bias against the same batch's oracle duals. Both land in CSVs, so one shared header
+    would let two different quantities be pooled with nothing failing.
+    """
 
     step: int
     layer: int
     bias_update_rate: float
     dual_spread_over_eta: float
-    dual_correlation: float
-    dual_linf: float
+    bias_price_correlation: float
+    bias_price_linf: float
 
 
 def _check_conformance(dump: ProbeDump) -> None:
@@ -103,7 +109,8 @@ def _select_layers(dump: ProbeDump, layers: Sequence[int] | None) -> list[tuple[
 def gated_dual_agreement(
     bias: np.ndarray, p_star: np.ndarray, bias_update_rate: float
 ) -> tuple[float, float, float]:
-    """Table 2's one comparison: ``(dual_spread_over_eta, dual_correlation, dual_linf)``.
+    """Table 2's one comparison, as
+    ``(dual_spread_over_eta, bias_price_correlation, bias_price_linf)``.
 
     The ratio is always returned because it is diagnostic on its own. The correlation comes
     back NaN below :data:`DUAL_SPREAD_GATE`, because below that ratio the stored bias's
@@ -317,3 +324,102 @@ def price_stability_rows_for_dump(
             )
         )
     return rows
+
+
+class HalfSplitRow(NamedTuple):
+    """One (step, layer): both halves' prices against each other and against the stored bias.
+
+    Carries intervals, not just point estimates, because every correlation here is over the 64
+    experts and a point estimate at that width is not separable from a nearby one.
+    """
+
+    step: int
+    layer: int
+    rho: float  # corr(p*(A), p*(B)), the two halves' prices against each other
+    corr_bias_a: float
+    corr_bias_b: float
+    kappa: float  # sqrt(corr_bias_a * corr_bias_b / rho) = corr(b_train, p_bar), NaN if <= 0
+    # Fisher-z on rho, the cheap first-order bar. It assumes i.i.d. bivariate-normal pairs, which
+    # 64 experts out of one LP solve are not, so read it as an order of magnitude and the bootstrap
+    # below as the interval.
+    rho_fisher_low: float
+    rho_fisher_high: float
+    # Percentile intervals from one joint resample of the experts, so kappa's interval carries the
+    # shared randomness between its numerator and denominator rather than combining two separate
+    # bars for quantities computed on the same 64 draws.
+    rho_boot_low: float
+    rho_boot_high: float
+    kappa_boot_low: float
+    kappa_boot_high: float
+    boot_resamples: int
+    kappa_boot_undefined: int  # resamples where corr_bias_a * corr_bias_b / rho was <= 0
+
+
+def _centred_corr(u: np.ndarray, v: np.ndarray) -> float:
+    """Correlation after mean-centering both vectors, matching :func:`dual_agreement`'s gauge."""
+    u = u - u.mean()
+    v = v - v.mean()
+    denom = float(np.linalg.norm(u) * np.linalg.norm(v))
+    return float(np.dot(u, v) / denom) if denom > 0 else float("nan")
+
+
+def half_split_row(
+    bias: np.ndarray,
+    duals_a: np.ndarray,
+    duals_b: np.ndarray,
+    *,
+    step: int,
+    layer: int,
+    resamples: int = 10000,
+    seed: int = 0,
+) -> HalfSplitRow:
+    """`rho`, both bias correlations and `kappa`, each with a joint-bootstrap interval.
+
+    The three correlations are recomputed together on every resample, because `kappa` is a ratio of
+    quantities measured on the same 64 experts and two independent intervals would describe a
+    quantity nobody computed. Experts are the resampling unit and the duals are held fixed, so this
+    covers uncertainty over which experts one is averaging and **not** over which tokens the batch
+    holds, because that is what the two halves are for.
+
+    Re-centering happens inside the resample rather than once outside it, because the gauge is a
+    property of the expert set being correlated and a resample is a different set.
+    """
+    rng = np.random.default_rng(seed)
+    n = bias.shape[0]
+    rho = _centred_corr(duals_a, duals_b)
+    c_a = _centred_corr(bias, duals_a)
+    c_b = _centred_corr(bias, duals_b)
+
+    draws = rng.integers(0, n, size=(resamples, n))
+    rhos = np.empty(resamples)
+    kappas = []
+    for i, idx in enumerate(draws):
+        r = _centred_corr(duals_a[idx], duals_b[idx])
+        rhos[i] = r
+        ratio = _centred_corr(bias[idx], duals_a[idx]) * _centred_corr(bias[idx], duals_b[idx])
+        kappas.append(np.sqrt(ratio / r) if r > 0 and ratio > 0 else np.nan)
+    kappas = np.asarray(kappas)
+    finite = kappas[np.isfinite(kappas)]
+
+    # Fisher's n - 3 counts the two fitted means and the correlation itself. It does not count the
+    # capacity constraint coupling the experts inside one LP solve, which is why it is the bar and
+    # the bootstrap is the interval.
+    z, se = np.arctanh(np.clip(rho, -0.999999, 0.999999)), 1.0 / np.sqrt(max(n - 3, 1))
+    ratio_point = c_a * c_b / rho if rho > 0 and c_a * c_b > 0 else float("nan")
+
+    return HalfSplitRow(
+        step=step,
+        layer=layer,
+        rho=rho,
+        corr_bias_a=c_a,
+        corr_bias_b=c_b,
+        kappa=float(np.sqrt(ratio_point)) if ratio_point == ratio_point else float("nan"),
+        rho_fisher_low=float(np.tanh(z - 1.96 * se)),
+        rho_fisher_high=float(np.tanh(z + 1.96 * se)),
+        rho_boot_low=float(np.percentile(rhos, 2.5)),
+        rho_boot_high=float(np.percentile(rhos, 97.5)),
+        kappa_boot_low=float(np.percentile(finite, 2.5)) if finite.size else float("nan"),
+        kappa_boot_high=float(np.percentile(finite, 97.5)) if finite.size else float("nan"),
+        boot_resamples=resamples,
+        kappa_boot_undefined=int(resamples - finite.size),
+    )

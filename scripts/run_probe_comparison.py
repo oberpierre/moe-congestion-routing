@@ -126,7 +126,9 @@ def main() -> None:
     # the first real checkpoint it ran from 0.367 to 0.871 across eight layers, so quoting any
     # one of them alone overstates or understates the result by up to a factor of two.
     quotable = [
-        row.dual_correlation for row in internalization if not math.isnan(row.dual_correlation)
+        row.bias_price_correlation
+        for row in internalization
+        if not math.isnan(row.bias_price_correlation)
     ]
     if quotable:
         print(
