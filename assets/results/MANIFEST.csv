@@ -21,5 +21,4 @@ price-stability_strided-probe_random_parts2.csv,superseded,,Sampling control for
 price-stability_tail-probe_sequence_parts2.csv,superseded,,Composition effect at parts 2.,superseded,price-stability_tail-probe_sequence_parts4.csv,artifacts/game/price_stability_sequence_mac.csv
 price-stability_tail-probe_stride_parts2.csv,superseded,,Stride split at parts 2.,superseded,price-stability_tail-probe_stride_parts4.csv,artifacts/game/price_stability_stride_linux.csv
 price-spread_both-probes_step500.csv,superseded,,Price spread at step 500 only.,superseded,price-spread_both-probes_trajectory.csv,artifacts/game/spread_500.csv
-synthetic-grid_serial-baseline_pinned.csv,superseded,,None. It is byte-identical to synthetic-grid_alflb-vs-lp_48-instances.csv under a name that claims otherwise.,duplicate,synthetic-grid_alflb-vs-lp_48-instances.csv,artifacts/game/full_serial_baseline.csv
 crossprobe_per-expert-prices_step500.csv,headline,5,What does one anomalous batch look like expert by expert?,current,,artifacts/game/crossprobe_duals.npz (exported)
