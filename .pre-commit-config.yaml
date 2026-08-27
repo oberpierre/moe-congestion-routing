@@ -16,7 +16,9 @@ repos:
       - id: check-yaml
       - id: check-toml
       - id: check-added-large-files
-        exclude: ^assets/tokenizer/gpt2/tokenizer.json$
+        # The executed analysis notebook carries its figures inline as base64 PNGs, which is the
+        # reason it is committed at all, so it sits above the default limit by design.
+        exclude: ^(assets/tokenizer/gpt2/tokenizer\.json|notebooks/.*\.ipynb)$
       - id: check-merge-conflict
       - id: mixed-line-ending
       - id: name-tests-test

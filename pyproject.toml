@@ -41,6 +41,16 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.15.20",
 ]
+# Offline figure and notebook work only. Kept out of the default install because a training node
+# never needs it, so `uv sync` on the cluster stays unchanged. Install with
+# `uv sync --inexact --group analysis`, because a plain `uv sync` prunes the Transformer Engine
+# stack that lives outside the lock. `ipykernel` is what an editor needs to run the notebook
+# against this `.venv`, and `nbconvert` re-executes it headlessly.
+analysis = [
+    "ipykernel>=6.29",
+    "matplotlib>=3.9",
+    "nbconvert>=7.16",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["src"]

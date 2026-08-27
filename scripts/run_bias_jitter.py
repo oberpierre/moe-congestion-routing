@@ -11,10 +11,13 @@ The point of measuring it is that a bias oscillating at its own step size cannot
 price more finely than that step size, which would put a floor under `kappa`. A floor that is
 uniform across layers cannot, however, explain a `kappa` decay that is not.
 
-**The detrending window is part of the estimate, not a detail.** The same series gives 3.5 to 8.1
-eta depending on how much low-frequency movement is called drift rather than jitter, so a jitter
-figure is meaningless unless the window is quoted with it. What survives every choice is the
-*ordering and spread across layers*, which is what a per-layer mechanism claim needs.
+**The single-number version is ill-posed, so the structure function is the reported object.** The
+same series gives 3.5 to 8.1 eta depending on how much low-frequency movement a detrending window
+calls drift rather than jitter, and quoting the window with the number papers over that rather than
+fixing it. `J(D) = sd(b(t+D) - b(t))` as a curve in `D` has no such freedom, and its *shape* is the
+diagnostic: band oscillation plateaus almost at once, a random walk grows as `sqrt(D)`, steady drift
+grows as `D`. The fitted exponent `alpha` from `log J` against `log D` names which. If a single
+number is ever needed downstream, pre-register it as `J` at one named `D`.
 
 Usage:
     uv run python scripts/run_bias_jitter.py RUNDIR [RUNDIR ...] --out artifacts/game/jitter.csv
@@ -29,6 +32,8 @@ import numpy as np
 from moe_congestion_routing.metrics.probe_series import read_series
 
 WINDOWS = (3, 5, 7)
+# Lags in dumps. The series is 21 dumps, so lag 16 is the longest with enough pairs to average.
+LAGS = (1, 2, 4, 8, 12, 16)
 
 
 def rows_for_run(run_dir: str, eta: float) -> list:
@@ -58,6 +63,15 @@ def rows_for_run(run_dir: str, eta: float) -> list:
                 [np.convolve(diffs[:, e], kernel, mode="same") for e in range(b.shape[1])], 1
             )
             row[f"jitter_detrended_w{k}"] = float(np.std(diffs - trend))
+        # The structure function, which is what the docstring argues should be reported instead of
+        # any one of the detrended numbers above.
+        for lag in LAGS:
+            row[f"J_lag{lag}"] = float(np.std((b[lag:] - b[:-lag]) / eta))
+        gap = int(gaps[0]) if gaps.size == 1 else 1
+        logd = np.log([lag * gap for lag in LAGS])
+        logj = np.log([row[f"J_lag{lag}"] for lag in LAGS])
+        row["structure_alpha"] = float(np.polyfit(logd, logj, 1)[0])
+
         t = np.arange(diffs.shape[0])
         design = np.vstack([t, np.ones_like(t)]).T
         fit = design @ np.linalg.lstsq(design, diffs, rcond=None)[0]
@@ -79,13 +93,21 @@ def main() -> None:
 
     gap = rows[0]["step_gap"]
     print(f"dump gap {gap} steps: memoryless floor {np.sqrt(gap):.1f} eta, pure drift {gap} eta\n")
-    print(f"{'run':<12} {'L':>2} {'raw':>6} {'w=5':>6} {'linear':>7} {'lag1':>6} {'|net|':>7}")
+    print(
+        f"{'run':<12} {'L':>2} {'w=5':>6} {'linear':>7} "
+        + " ".join(f"J({lag * gap}):".rjust(8) for lag in LAGS)
+        + f" {'alpha':>6} {'reading':>14}"
+    )
     for r in rows:
+        alpha = r["structure_alpha"]
+        reading = "plateau" if alpha < 0.2 else ("random walk" if alpha < 0.7 else "drift")
         print(
-            f"{Path(r['run']).name:<12} {r['layer']:2d} {r['jitter_raw']:6.2f} "
-            f"{r['jitter_detrended_w5']:6.2f} {r['jitter_detrended_linear']:7.2f} "
-            f"{r['lag1_autocorr']:6.3f} {r['net_displacement']:7.2f}"
+            f"{Path(r['run']).name:<12} {r['layer']:2d} {r['jitter_detrended_w5']:6.2f} "
+            f"{r['jitter_detrended_linear']:7.2f} "
+            + " ".join(f"{r[f'J_lag{lag}']:8.1f}" for lag in LAGS)
+            + f" {alpha:6.2f} {reading:>14}"
         )
+    print("\nA plateau in J would mean band oscillation. Growth means the bias is going somewhere.")
 
     if args.out:
         out = Path(args.out)
