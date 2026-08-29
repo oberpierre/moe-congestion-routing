@@ -134,6 +134,136 @@ def strided_window(
     return numpy.array(indices, dtype=numpy.int64), stride, span_fraction
 
 
+def spread_window(
+    sequence_lengths: numpy.ndarray,
+    target_tokens: int,
+    max_tail_fraction: float,
+    stride_offset: int = 0,
+) -> tuple[numpy.ndarray, int, float]:
+    """Return ``(document_indices, stride, span_fraction)`` for a grid laid across the
+    **entire** held-out split, rather than across the first ``1/STRIDE_SPREAD`` of it the way
+    :func:`strided_window` does.
+
+    ``span_fraction`` here is a fraction of the held-out split, not of the blob. The caller records
+    it as ``span_fraction_of_split`` for that reason, because a provenance reader comparing a bare
+    ``span_fraction`` across two assets would be comparing two different denominators. Unlike the
+    other two windows: every decision behind this sampler is stated in split units, so a
+    blob-fraction number here would read as a different, much smaller quantity next to them.
+
+    The caller must assemble the asset with :func:`water_fill`'s per-document allocation rather
+    than whole-document concatenation truncated to ``target_tokens``, or the span this grid
+    buys collapses back to a contiguous-looking prefix of it.
+    """
+    num_documents = int(sequence_lengths.shape[0])
+    split_size = int(max_tail_fraction * num_documents)
+    if split_size < 1:
+        raise ValueError(
+            f"max_tail_fraction={max_tail_fraction} over {num_documents} documents leaves no "
+            "held-out split to sample from"
+        )
+    split_start = num_documents - split_size
+
+    split_lengths = sequence_lengths[split_start:]
+    mean_length = float(split_lengths.mean())
+    if mean_length <= 0:
+        raise ValueError(f"the last {split_size} documents hold no tokens")
+    if int(split_lengths.sum()) < target_tokens:
+        raise ValueError(
+            f"the held-out split holds only {int(split_lengths.sum())} tokens across "
+            f"{split_size} documents, need {target_tokens}"
+        )
+
+    # Scanning from n_docs=1 lets the search settle on whatever tiny grid happens to land on a
+    # long document: on the primary blob that is a 2-document grid at stride 9940, feasible only
+    # because one of the two holds 79,798 tokens. Starting from the split-mean-based estimate
+    # forbids that degenerate case, so a future "simplification" that drops this floor would
+    # silently reintroduce it.
+    n_docs = max(1, -(-target_tokens // int(mean_length)))
+
+    # Exhaustive over every n_docs it visits and returns the first feasible one. Grids at n_docs
+    # and n_docs + 1 are not nested, so there is no monotonicity property in feasibility to lean
+    # on, only the arithmetic fact that split_size // n_docs shrinks as n_docs grows.
+    while True:
+        stride = split_size // n_docs
+        if stride < 1:
+            raise ValueError(
+                f"no stride fits {n_docs} documents into a held-out split of {split_size} documents"
+            )
+        # The stride is only known once computed above, so the offset can only be validated
+        # here. Because stride shrinks (or holds) as n_docs grows, a failure here recurs for
+        # every larger n_docs too, so there is no point continuing the scan past it.
+        if not 0 <= stride_offset < stride:
+            raise ValueError(
+                f"stride_offset={stride_offset} must satisfy 0 <= stride_offset < stride, "
+                f"where stride={stride} for this blob and these arguments"
+            )
+        indices = split_start + stride_offset + numpy.arange(n_docs, dtype=numpy.int64) * stride
+        if int(sequence_lengths[indices].sum()) >= target_tokens:
+            break
+        n_docs += 1
+
+    # n_docs slots at stride split_size // n_docs cover the split by construction, so the
+    # smallest feasible n_docs is also the largest stride among grids that span the whole split.
+    # That is why no STRIDE_SPREAD-like margin is needed here: that constant exists in
+    # strided_window to stop its walk running off the end, and this grid cannot run off the end
+    # because it is built to fit.
+    span_fraction = (int(indices[-1]) + 1 - int(indices[0])) / split_size
+    return indices, stride, span_fraction
+
+
+def water_fill(lengths: numpy.ndarray, target_tokens: int) -> tuple[numpy.ndarray, int]:
+    """Return ``(allocation, cap)``: take ``min(length, cap)`` tokens from each document in
+    ``lengths``, with the smallest integer ``cap`` such that the allocations sum to at least
+    ``target_tokens``, then trim the overshoot from the largest allocations (ties by lowest
+    index) so the sum is exactly ``target_tokens`` and no document drops to zero.
+
+    ``sum(min(length, q))`` is non-decreasing in ``q``, because raising the cap can only add
+    allocation, never remove it. That is a provable property of this function rather than the
+    empirical, hole-riddled one the stride scan in :func:`spread_window` cannot claim, so
+    bisecting on ``q`` here is exact where bisecting on a stride was not.
+    """
+    lengths = numpy.asarray(lengths, dtype=numpy.int64)
+    total = int(lengths.sum())
+    if total < target_tokens:
+        raise ValueError(
+            f"lengths sum to {total} tokens across {lengths.size} documents, need {target_tokens}"
+        )
+
+    lo, hi = 0, int(lengths.max())
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if int(numpy.minimum(lengths, mid).sum()) >= target_tokens:
+            hi = mid
+        else:
+            lo = mid + 1
+    cap = lo
+
+    allocation = numpy.minimum(lengths, cap)
+    excess = int(allocation.sum()) - target_tokens
+    if excess > 0:
+        # The largest allocations are exactly the capped ones (every length >= cap ties at cap),
+        # so trimming there first is what keeps q a real bound on any single document's share.
+        # lexsort's last key is primary, so this orders by allocation descending, index ascending.
+        order = numpy.lexsort((numpy.arange(lengths.size), -allocation))
+        allocation = allocation.copy()
+        remaining = excess
+        for i in order:
+            if remaining <= 0:
+                break
+            take = min(int(allocation[i]) - 1, remaining)
+            if take <= 0:
+                continue
+            allocation[i] -= take
+            remaining -= take
+        if remaining > 0:
+            raise ValueError(
+                f"cannot trim {excess} excess tokens down to target_tokens={target_tokens} "
+                "without reducing some document to zero"
+            )
+
+    return allocation.astype(numpy.int64), cap
+
+
 @dataclass(frozen=True)
 class ProbeBatch:
     """A frozen probe batch, loaded from an ``assets/probe/*.npz`` file."""

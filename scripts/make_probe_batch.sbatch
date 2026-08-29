@@ -15,26 +15,37 @@
 #   source config.sh
 #   sbatch scripts/make_probe_batch.sbatch                       # the standing ClimbMix asset
 #   sbatch scripts/make_probe_batch.sbatch skewed 16 2048 <prefix>
-#   SAMPLING=strided sbatch scripts/make_probe_batch.sbatch      # spread across the held-out split
+#   SAMPLING=strided sbatch scripts/make_probe_batch.sbatch      # spread across half the held-out split
+#   SAMPLING=spread sbatch scripts/make_probe_batch.sbatch       # spread across the ENTIRE held-out split
 #   SAMPLING=strided STRIDE_OFFSET=1912 sbatch scripts/make_probe_batch.sbatch   # a second draw
 #
 # Args, all optional and positional: ROLE SEQUENCES SEQ_LENGTH DATA_PREFIX. --out is derived as
 # assets/probe/<role>_<blob>[_<sampling>][_off<N>]_<S>x<seq_length>.npz, where <blob> is DATA_PREFIX's
 # basename, because make_probe_batch.py refuses an --out basename that disagrees with --role.
 #
-# Set SAMPLING=strided to spread the sampled documents across the whole held-out split instead of
-# taking the minimal run at the tail of the blob, which is a few dozen adjacent documents and so
-# samples one corpus neighbourhood. The default stays `tail` so an asset extracted before the flag
-# existed still re-extracts byte for byte. A strided asset is a DIFFERENT INSTRUMENT with its own
-# token_sha256, never a replacement, which is why the name carries the mode and the default does
-# not: renaming the existing assets would break every `moe_probe_batch` path pointing at them.
+# Set SAMPLING=strided to spread the sampled documents across the first half of the held-out
+# split instead of taking the minimal run at the tail of the blob, which is a few dozen adjacent
+# documents and so samples one corpus neighbourhood. Set SAMPLING=spread to lay a grid across the
+# ENTIRE held-out split instead, water-filling each document's share so all of them contribute
+# (a strided draw covers only the first half of the split, which on this corpus is a code-dense
+# region, and the draw taken from it was refused by the screen). The default stays `tail` so an
+# asset extracted before these flags existed
+# still re-extracts byte for byte. Each mode is a DIFFERENT INSTRUMENT with its own token_sha256,
+# never a replacement, which is why the name carries the mode and the default does not: renaming
+# the existing assets would break every `moe_probe_batch` path pointing at them.
 #
-# Set STRIDE_OFFSET=N to phase-shift a strided draw, which is how a SECOND strided asset is drawn
-# from the same blob. The sampled documents are split_start + N + j*stride, so two draws at
-# different offsets in [0, stride) share no document and the disjointness needs no checking. The
-# offset goes in the name too, so a rejected candidate and an accepted one can never collide.
-# Leave it 0 with SAMPLING=tail: make_probe_batch.py refuses that combination rather than dropping
-# the flag, and this script passes it through so the refusal is the one you see.
+# Set STRIDE_OFFSET=N to phase-shift a strided or spread draw, which is how a SECOND asset in
+# that mode is drawn from the same blob. The sampled documents are split_start + N + j*stride, so
+# two draws at different offsets in [0, stride) share no document and the disjointness needs no
+# checking. The offset goes in the name too, so a rejected candidate and an accepted one can
+# never collide. Leave it 0 with SAMPLING=tail: make_probe_batch.py refuses that combination
+# rather than dropping the flag, and this script passes it through so the refusal is the one you
+# see.
+#
+# Set DISJOINT_FROM to a space-separated list of committed assets the new draw must not share a
+# document with. Each becomes a --disjoint-from flag, and the extraction refuses before writing on
+# any overlap, so a colliding draw costs a job rather than a silent duplicate. Shift by one
+# document (STRIDE_OFFSET=1) and resubmit when that happens.
 #
 # Set FORCE=1 to overwrite an existing asset. Off by default: these are committed, frozen inputs
 # that every arm's dumps are keyed to, so replacing one silently invalidates cross-run comparison.
@@ -76,6 +87,11 @@ SAMPLING_TAG=""
 # Same rule for the offset: absent at 0 so the committed strided asset keeps the name every config
 # already points at, present otherwise so two draws from one blob cannot share a filename.
 STRIDE_OFFSET="${STRIDE_OFFSET:-0}"
+DISJOINT_FLAGS=""
+for asset in ${DISJOINT_FROM:-}; do
+  DISJOINT_FLAGS+=" --disjoint-from $asset"
+done
+
 OFFSET_TAG=""
 OFFSET_FLAG=""
 if [ "$STRIDE_OFFSET" != "0" ]; then
@@ -141,7 +157,7 @@ srun --nodes=1 --ntasks=1 --environment=alps6 --cpus-per-task "$SLURM_CPUS_PER_T
     --seq-length $SEQ_LENGTH \
     --sequences $SEQUENCES \
     --role $ROLE \
-    --sampling $SAMPLING $OFFSET_FLAG \
+    --sampling $SAMPLING $OFFSET_FLAG$DISJOINT_FLAGS \
     --out \"$OUT\" $FORCE_FLAG
 
   echo '=== provenance ==='

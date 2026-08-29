@@ -12,7 +12,8 @@ Usage:
         --role standing|skewed|dev \\
         --out assets/probe/<role>_<blob>_<S>x<seq_length>.npz \\
         [--label <int>] [--max-tail-fraction 0.01] [--force] \\
-        [--sampling tail|strided] [--stride-offset <int>, strided only]
+        [--sampling tail|strided|spread] [--stride-offset <int>, strided/spread only] \\
+        [--disjoint-from PATH ...]
     uv run python scripts/make_probe_batch.py --show assets/probe/<name>.npz
 """
 
@@ -30,18 +31,37 @@ from moe_congestion_routing.training.probe_batch import (
     PROBE_ASSET_VERSION,
     PROBE_ROLES,
     compute_provenance_sha256,
+    spread_window,
     strided_window,
     tail_window,
+    water_fill,
 )
+
+
+def _committed_indices(path: str) -> set[int]:
+    """Reconstruct another asset's document index set from its committed provenance, so a new
+    draw can be checked against it for shared documents rather than just overlapping ranges,
+    which two disjoint-document grids can do.
+    """
+    with numpy.load(path, allow_pickle=False) as data:
+        provenance = json.loads(str(data["provenance"]))
+
+    if "tail_doc_range" in provenance:
+        start, end = provenance["tail_doc_range"]
+        return set(range(start, end))
+    start = provenance["doc_range"][0]
+    stride = provenance["doc_stride"]
+    num_docs = provenance["num_docs"]
+    return {start + j * stride for j in range(num_docs)}
 
 
 def _extract(args: argparse.Namespace) -> None:
     role = args.role  # argparse's choices= refuses anything outside PROBE_ROLES
 
-    if args.sampling != "strided" and args.stride_offset:
+    if args.sampling not in ("strided", "spread") and args.stride_offset:
         sys.exit(
             f"error: --stride-offset {args.stride_offset} only applies with --sampling "
-            f"strided, got --sampling {args.sampling!r}"
+            f"strided or spread, got --sampling {args.sampling!r}"
         )
 
     out_path = Path(args.out)
@@ -101,6 +121,32 @@ def _extract(args: argparse.Namespace) -> None:
                 "span_fraction": span_fraction,
                 "stride_offset": int(args.stride_offset),
             }
+            allocation = None
+        elif args.sampling == "spread":
+            indices, stride, span_fraction = spread_window(
+                ds.sequence_lengths, target_tokens, args.max_tail_fraction, args.stride_offset
+            )
+
+            # Same defense-in-depth guard as the strided path: evidence the arithmetic in
+            # spread_window regressed, not evidence of anything by itself.
+            split_size = int(args.max_tail_fraction * num_documents)
+            split_start = num_documents - split_size
+            if int(indices.min()) < split_start or int(indices.max()) >= num_documents:
+                sys.exit(
+                    f"error: sampled indices [{int(indices.min())}, {int(indices.max())}] "
+                    f"escape the held-out split [{split_start}, {num_documents})"
+                )
+
+            allocation, cap = water_fill(ds.sequence_lengths[indices], target_tokens)
+            window = {
+                "sampling": "spread",
+                "doc_stride": int(stride),
+                "doc_range": [int(indices[0]), int(indices[-1]) + 1],
+                "num_docs": int(indices.size),
+                "span_fraction_of_split": span_fraction,
+                "stride_offset": int(args.stride_offset),
+                "per_doc_cap": int(cap),
+            }
         else:
             start, end, tail_fraction = tail_window(
                 ds.sequence_lengths, target_tokens, args.max_tail_fraction
@@ -110,11 +156,43 @@ def _extract(args: argparse.Namespace) -> None:
             # of every asset extracted before it existed, and byte-identical re-extraction is a
             # property the format is meant to keep. Its absence therefore means "tail".
             window = {"tail_doc_range": [int(start), int(end)], "tail_fraction": tail_fraction}
+            allocation = None
     except ValueError as e:
         sys.exit(f"error: {e}")
 
-    pieces = [ds.get(int(i)) for i in indices]
+    for disjoint_path in args.disjoint_from:
+        other = _committed_indices(disjoint_path)
+        overlap = {int(i) for i in indices} & other
+        if overlap:
+            sys.exit(
+                f"error: this draw shares {len(overlap)} document(s) with {disjoint_path}: "
+                f"{sorted(overlap)[:5]}"
+            )
+
+    if allocation is None:
+        pieces = [ds.get(int(i)) for i in indices]
+    else:
+        # Each document supplies exactly its water-filled share, so no tail truncation happens:
+        # the [:target_tokens] slice below is then a no-op kept only for uniformity with the
+        # other two sampling paths.
+        pieces = [
+            ds.get(int(i))[: int(alloc)] for i, alloc in zip(indices, allocation, strict=True)
+        ]
     concatenated = numpy.concatenate(pieces)[:target_tokens]
+
+    if args.sampling == "spread":
+        # Computed after the final truncation, not from the allocation, because this assertion
+        # exists to catch exactly the case where truncation clipped the tail of the grid.
+        piece_lengths = numpy.array([len(p) for p in pieces])
+        cumulative_before = numpy.concatenate(([0], numpy.cumsum(piece_lengths)[:-1]))
+        docs_contributing = int((cumulative_before < target_tokens).sum())
+        window["docs_contributing"] = docs_contributing
+        if docs_contributing != window["num_docs"]:
+            sys.exit(
+                f"error: only {docs_contributing} of {window['num_docs']} sampled documents "
+                "contribute tokens after truncation to target_tokens, because a clipped spread "
+                "draw would silently underweight the end of its grid"
+            )
 
     int32_info = numpy.iinfo(numpy.int32)
     if concatenated.min() < int32_info.min or concatenated.max() > int32_info.max:
@@ -159,9 +237,17 @@ def _extract(args: argparse.Namespace) -> None:
     print(f"sampling: {args.sampling}")
     print(f"documents used: {indices.size}")
     print(f"doc range: [{int(indices[0])}, {int(indices[-1]) + 1})")
-    for key in ("tail_fraction", "span_fraction", "doc_stride"):
+    for key in (
+        "tail_fraction",
+        "span_fraction",
+        "span_fraction_of_split",
+        "doc_stride",
+        "docs_contributing",
+        "per_doc_cap",
+    ):
         if key in window:
-            print(f"{key}: {window[key]:.6g}" if key != "doc_stride" else f"{key}: {window[key]}")
+            value = window[key]
+            print(f"{key}: {value:.6g}" if isinstance(value, float) else f"{key}: {value}")
     print(f"wrote {out_path}: tokens {tokens.shape} {tokens.dtype}")
 
 
@@ -188,30 +274,39 @@ def main() -> None:
     )
     parser.add_argument(
         "--sampling",
-        choices=("tail", "strided"),
+        choices=("tail", "strided", "spread"),
         default="tail",
         help="tail takes the minimal run of documents at the end of the blob, which is a few "
         "dozen adjacent ones and so samples a single corpus neighbourhood. strided spreads the "
-        "same number of documents across the whole held-out split, which is what a training "
-        "batch sees. Default tail, so an asset extracted before this flag existed still "
-        "re-extracts byte for byte",
+        "same number of documents across the first half of the held-out split. spread lays a "
+        "grid across the ENTIRE held-out split and water-fills each document's share so every "
+        "sampled document contributes. Default tail, so an asset extracted before this flag "
+        "existed still re-extracts byte for byte",
     )
     parser.add_argument(
         "--max-tail-fraction",
         type=float,
         default=0.01,
         help="the held-out split, as a fraction of the blob. With --sampling tail this refuses a "
-        "window reaching further back than the fraction, and with strided it is the range the "
-        "sample is spread over. The default 0.01 is the valid fraction of a "
+        "window reaching further back than the fraction, and with strided or spread it is the "
+        "range the sample is spread over. The default 0.01 is the valid fraction of a "
         "'split: \"99,1,0\"' training split and must move with it",
     )
     parser.add_argument(
         "--stride-offset",
         type=int,
         default=0,
-        help="phase offset in [0, stride) for --sampling strided, so a second strided draw on "
+        help="phase offset in [0, stride) for --sampling strided or spread, so a second draw on "
         "the same blob samples a document set disjoint from an offset-0 draw. Rejected with "
         "--sampling tail unless left at its default 0",
+    )
+    parser.add_argument(
+        "--disjoint-from",
+        metavar="PATH",
+        action="append",
+        default=[],
+        help="an existing asset's .npz path (repeatable), so the new draw exits non-zero, "
+        "before writing, if it shares any document with it",
     )
     parser.add_argument("--force", action="store_true", help="overwrite an existing --out")
     parser.add_argument(
