@@ -113,7 +113,15 @@ srun --nodes=1 --ntasks=1 --environment=alps6 bash -c "
   # megatron-core 0.18 needs nvidia-resiliency-ext>=0.6; the NGC image ships 0.5.x. Newer wheel
   # into the venv (shadows the container copy), --no-deps so it can't pull a conflicting torch.
   uv pip install --no-deps 'nvidia-resiliency-ext>=0.6.0'
-  # No apply-patches.sh here, unlike the training job since this reads IndexedDataset only
+  # Needed for the RESET, not for the patches. This job reads IndexedDataset only and no patch
+  # touches it, but importing megatron.core at all requires the submodule to be AT ITS PIN, and
+  # apply-patches.sh is the only thing that guarantees that (it hard-resets, then errors naming
+  # `git submodule update --init` when the pinned commit is absent). A checkout that is present
+  # but incomplete otherwise fails deep inside megatron's own import chain, because
+  # ensure_on_path() only checks that the directory exists. Like the train/eval/infer jobs, this
+  # resets both submodules, so do not run it beside a job mid-import (fetch_flame_checkpoint.sbatch
+  # documents that hazard and is exempt because it imports no megatron).
+  ./scripts/apply-patches.sh
   echo '[env] build complete'
 "
 
