@@ -16,9 +16,10 @@
 #   sbatch scripts/make_probe_batch.sbatch                       # the standing ClimbMix asset
 #   sbatch scripts/make_probe_batch.sbatch skewed 16 2048 <prefix>
 #   SAMPLING=strided sbatch scripts/make_probe_batch.sbatch      # spread across the held-out split
+#   SAMPLING=strided STRIDE_OFFSET=1912 sbatch scripts/make_probe_batch.sbatch   # a second draw
 #
 # Args, all optional and positional: ROLE SEQUENCES SEQ_LENGTH DATA_PREFIX. --out is derived as
-# assets/probe/<role>_<blob>[_<sampling>]_<S>x<seq_length>.npz, where <blob> is DATA_PREFIX's
+# assets/probe/<role>_<blob>[_<sampling>][_off<N>]_<S>x<seq_length>.npz, where <blob> is DATA_PREFIX's
 # basename, because make_probe_batch.py refuses an --out basename that disagrees with --role.
 #
 # Set SAMPLING=strided to spread the sampled documents across the whole held-out split instead of
@@ -27,6 +28,13 @@
 # existed still re-extracts byte for byte. A strided asset is a DIFFERENT INSTRUMENT with its own
 # token_sha256, never a replacement, which is why the name carries the mode and the default does
 # not: renaming the existing assets would break every `moe_probe_batch` path pointing at them.
+#
+# Set STRIDE_OFFSET=N to phase-shift a strided draw, which is how a SECOND strided asset is drawn
+# from the same blob. The sampled documents are split_start + N + j*stride, so two draws at
+# different offsets in [0, stride) share no document and the disjointness needs no checking. The
+# offset goes in the name too, so a rejected candidate and an accepted one can never collide.
+# Leave it 0 with SAMPLING=tail: make_probe_batch.py refuses that combination rather than dropping
+# the flag, and this script passes it through so the refusal is the one you see.
 #
 # Set FORCE=1 to overwrite an existing asset. Off by default: these are committed, frozen inputs
 # that every arm's dumps are keyed to, so replacing one silently invalidates cross-run comparison.
@@ -65,7 +73,16 @@ BLOB="$(basename "$DATA_PREFIX")"
 # filename can still tell two instruments apart.
 SAMPLING_TAG=""
 [ "$SAMPLING" != "tail" ] && SAMPLING_TAG="_${SAMPLING}"
-OUT="assets/probe/${ROLE}_${BLOB}${SAMPLING_TAG}_${SEQUENCES}x${SEQ_LENGTH}.npz"
+# Same rule for the offset: absent at 0 so the committed strided asset keeps the name every config
+# already points at, present otherwise so two draws from one blob cannot share a filename.
+STRIDE_OFFSET="${STRIDE_OFFSET:-0}"
+OFFSET_TAG=""
+OFFSET_FLAG=""
+if [ "$STRIDE_OFFSET" != "0" ]; then
+  OFFSET_TAG="_off${STRIDE_OFFSET}"
+  OFFSET_FLAG="--stride-offset $STRIDE_OFFSET"
+fi
+OUT="assets/probe/${ROLE}_${BLOB}${SAMPLING_TAG}${OFFSET_TAG}_${SEQUENCES}x${SEQ_LENGTH}.npz"
 FORCE_FLAG=""
 [ "${FORCE:-0}" = "1" ] && FORCE_FLAG="--force"
 
@@ -103,7 +120,7 @@ srun --nodes=1 --ntasks=1 --environment=alps6 bash -c "
 srun --nodes=1 --ntasks=1 --environment=alps6 --cpus-per-task "$SLURM_CPUS_PER_TASK" bash -c "
   set -euo pipefail
   echo \"=== node \$(hostname) | \$(date) ===\"
-  echo \"=== role=$ROLE sampling=$SAMPLING S=$SEQUENCES seq_length=$SEQ_LENGTH out=$OUT ===\"
+  echo \"=== role=$ROLE sampling=$SAMPLING stride_offset=$STRIDE_OFFSET S=$SEQUENCES seq_length=$SEQ_LENGTH out=$OUT ===\"
   $CACHE_ENV_EXPORT
   cd $WORKDIR
   set +u; source .venv/bin/activate; set -u
@@ -116,7 +133,7 @@ srun --nodes=1 --ntasks=1 --environment=alps6 --cpus-per-task "$SLURM_CPUS_PER_T
     --seq-length $SEQ_LENGTH \
     --sequences $SEQUENCES \
     --role $ROLE \
-    --sampling $SAMPLING \
+    --sampling $SAMPLING $OFFSET_FLAG \
     --out \"$OUT\" $FORCE_FLAG
 
   echo '=== provenance ==='

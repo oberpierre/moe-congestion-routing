@@ -362,3 +362,60 @@ def test_strided_window_refuses_a_fraction_that_leaves_no_split():
     lengths = _uniform_lengths(50)
     with pytest.raises(ValueError, match="no held-out split"):
         strided_window(lengths, 100, 0.001)
+
+
+# --- strided_window: stride_offset, the knob the third probe asset is drawn with -------------
+
+
+def test_strided_window_default_offset_reproduces_the_original_indices():
+    """``stride_offset=0`` must be indistinguishable from calling without the parameter at all,
+    because every asset extracted before this parameter existed depends on that."""
+    lengths = _uniform_lengths(1_000_000)
+
+    without_param, stride_a, span_a = strided_window(lengths, 32_784, 0.01)
+    with_zero, stride_b, span_b = strided_window(lengths, 32_784, 0.01, stride_offset=0)
+
+    numpy.testing.assert_array_equal(without_param, with_zero)
+    assert stride_a == stride_b
+    assert span_a == pytest.approx(span_b)
+
+
+def test_strided_window_offset_shifts_every_index_by_the_offset():
+    """This is the test that bites: it fails if ``stride_offset`` is dropped from the index
+    arithmetic (the loop would then always start at ``split_start``, ignoring the parameter),
+    and it passes once the offset is folded into the starting index as the contract requires.
+    """
+    lengths = _uniform_lengths(1_000_000)
+
+    base, stride, _ = strided_window(lengths, 32_784, 0.01, stride_offset=0)
+    offset = stride // 2
+    shifted, shifted_stride, _ = strided_window(lengths, 32_784, 0.01, stride_offset=offset)
+
+    assert shifted_stride == stride
+    # Same count and same stride, but every index moved by exactly `offset`.
+    assert shifted.size == base.size
+    numpy.testing.assert_array_equal(shifted, base + offset)
+
+
+def test_strided_window_offsets_are_disjoint_from_the_zero_offset_draw():
+    lengths = _uniform_lengths(1_000_000)
+
+    base, stride, _ = strided_window(lengths, 32_784, 0.01, stride_offset=0)
+    offset_draw, _, _ = strided_window(lengths, 32_784, 0.01, stride_offset=stride // 2)
+
+    assert set(base.tolist()).isdisjoint(offset_draw.tolist())
+
+
+def test_strided_window_rejects_an_offset_outside_the_stride():
+    lengths = _uniform_lengths(1_000_000)
+    _, stride, _ = strided_window(lengths, 32_784, 0.01)
+
+    with pytest.raises(ValueError, match=f"stride={stride}"):
+        strided_window(lengths, 32_784, 0.01, stride_offset=stride)
+
+
+def test_strided_window_rejects_a_negative_offset():
+    lengths = _uniform_lengths(1_000_000)
+
+    with pytest.raises(ValueError, match="stride_offset"):
+        strided_window(lengths, 32_784, 0.01, stride_offset=-1)

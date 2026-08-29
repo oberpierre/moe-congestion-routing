@@ -11,7 +11,8 @@ Usage:
         --seq-length <int> --sequences <S> \\
         --role standing|skewed|dev \\
         --out assets/probe/<role>_<blob>_<S>x<seq_length>.npz \\
-        [--label <int>] [--max-tail-fraction 0.01] [--force]
+        [--label <int>] [--max-tail-fraction 0.01] [--force] \\
+        [--sampling tail|strided] [--stride-offset <int>, strided only]
     uv run python scripts/make_probe_batch.py --show assets/probe/<name>.npz
 """
 
@@ -37,6 +38,12 @@ from moe_congestion_routing.training.probe_batch import (
 def _extract(args: argparse.Namespace) -> None:
     role = args.role  # argparse's choices= refuses anything outside PROBE_ROLES
 
+    if args.sampling != "strided" and args.stride_offset:
+        sys.exit(
+            f"error: --stride-offset {args.stride_offset} only applies with --sampling "
+            f"strided, got --sampling {args.sampling!r}"
+        )
+
     out_path = Path(args.out)
     out_name = out_path.name
     if not out_name.startswith(f"{role}_"):
@@ -61,14 +68,38 @@ def _extract(args: argparse.Namespace) -> None:
     try:
         if args.sampling == "strided":
             indices, stride, span_fraction = strided_window(
-                ds.sequence_lengths, target_tokens, args.max_tail_fraction
+                ds.sequence_lengths, target_tokens, args.max_tail_fraction, args.stride_offset
             )
+
+            # A defense-in-depth guard against the arithmetic that produced `indices` rather than
+            # evidence of anything by itself: at two offsets in [0, stride) the sampled sets
+            # cannot collide, so this can only fire if the index formula in strided_window
+            # regresses.
+            split_size = int(args.max_tail_fraction * num_documents)
+            split_start = num_documents - split_size
+            if int(indices.min()) < split_start or int(indices.max()) >= num_documents:
+                sys.exit(
+                    f"error: sampled indices [{int(indices.min())}, {int(indices.max())}] "
+                    f"escape the held-out split [{split_start}, {num_documents})"
+                )
+            if args.stride_offset:
+                base_indices, _, _ = strided_window(
+                    ds.sequence_lengths, target_tokens, args.max_tail_fraction, 0
+                )
+                overlap = {int(i) for i in indices} & {int(i) for i in base_indices}
+                if overlap:
+                    sys.exit(
+                        f"error: stride_offset={args.stride_offset} draw shares documents "
+                        f"with the offset-0 draw on the same blob: {sorted(overlap)[:5]}"
+                    )
+
             window = {
                 "sampling": "strided",
                 "doc_stride": int(stride),
                 "doc_range": [int(indices[0]), int(indices[-1]) + 1],
                 "num_docs": int(indices.size),
                 "span_fraction": span_fraction,
+                "stride_offset": int(args.stride_offset),
             }
         else:
             start, end, tail_fraction = tail_window(
@@ -173,6 +204,14 @@ def main() -> None:
         "window reaching further back than the fraction, and with strided it is the range the "
         "sample is spread over. The default 0.01 is the valid fraction of a "
         "'split: \"99,1,0\"' training split and must move with it",
+    )
+    parser.add_argument(
+        "--stride-offset",
+        type=int,
+        default=0,
+        help="phase offset in [0, stride) for --sampling strided, so a second strided draw on "
+        "the same blob samples a document set disjoint from an offset-0 draw. Rejected with "
+        "--sampling tail unless left at its default 0",
     )
     parser.add_argument("--force", action="store_true", help="overwrite an existing --out")
     parser.add_argument(
