@@ -416,7 +416,8 @@ def test_base_cluster_config_pins_the_reference_architecture():
     # 16 sequences give every asset two reportable 16,384-token units, whereas 8 would give
     # only one.
     assert cfg.moe_probe_seqs == 16
-    assert len(cfg.moe_probe_batch) == 2  # the two committed assets, because S5 adds the third
+    # All three committed standing assets, which is what the triad estimator needs on one run.
+    assert len(cfg.moe_probe_batch) == 3
 
 
 def test_base_cluster_active_params_match_flame_exactly():
