@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import numpy
@@ -8,6 +9,7 @@ import pytest
 from moe_congestion_routing.training.megatron_path import MegatronLMNotVendoredError, ensure_on_path
 from moe_congestion_routing.training.probe_batch import (
     STRIDE_SPREAD,
+    interleave_order,
     load_probe_batch,
     probe_micro_batches,
     spread_window,
@@ -646,3 +648,62 @@ def test_water_fill_matches_the_defect_this_spec_exists_to_prevent():
     allocation, _ = water_fill(lengths, target)
     assert (allocation >= 1).all()
     assert int(allocation.sum()) == target
+
+
+def _max_normalised_gap(order: numpy.ndarray, n_docs: int, count: int) -> float:
+    """Largest gap between consecutive grid positions selected by the first ``count`` stream
+    positions, as a fraction of the grid. Small means that prefix samples the whole grid.
+    """
+    selected = numpy.sort(order[:count])
+    wrapped = numpy.concatenate([selected, [selected[0] + n_docs]])
+    return float(numpy.diff(wrapped).max() / n_docs)
+
+
+def test_interleave_order_is_a_permutation_with_a_coprime_stride():
+    for n_docs in (16, 32, 57, 64, 65, 66, 67, 100, 128):
+        order, stride = interleave_order(n_docs)
+        assert sorted(order.tolist()) == list(range(n_docs))
+        assert math.gcd(stride, n_docs) == 1
+
+
+def test_interleave_order_is_deterministic():
+    first, first_stride = interleave_order(66)
+    second, second_stride = interleave_order(66)
+    assert numpy.array_equal(first, second)
+    assert first_stride == second_stride
+
+
+def test_interleave_order_spreads_every_half_across_the_whole_grid():
+    """The property the halves need, and the reason the stride is chosen near n/phi: a
+    16,384-token unit is about half the stream, so half the permutation must still sample the
+    whole grid rather than one neighbourhood of it.
+    """
+    for n_docs in (57, 64, 66, 80, 100):
+        order, _ = interleave_order(n_docs)
+        for start in (0, n_docs // 2):
+            half = order[start : start + n_docs // 2]
+            assert _max_normalised_gap(half, n_docs, half.size) < 0.10
+
+
+def test_interleave_order_matches_the_defect_this_change_exists_to_prevent():
+    """Ascending order leaves each half covering one contiguous neighbourhood, which is how a
+    full-span draw still produced a half-split unit. A stride near n/2 is equally coprime and
+    still fails, which is why the golden-ratio choice is load-bearing rather than cosmetic.
+    """
+    n_docs = 57
+    half = n_docs // 2
+
+    ascending = numpy.arange(n_docs, dtype=numpy.int64)
+    assert _max_normalised_gap(ascending, n_docs, half) > 0.4  # the defect: one neighbourhood
+
+    near_half = (numpy.arange(n_docs, dtype=numpy.int64) * 29) % n_docs
+    assert math.gcd(29, n_docs) == 1  # coprime, so still a permutation
+    assert _max_normalised_gap(near_half, n_docs, half) > 0.10  # yet two slow lanes, not spread
+
+    golden, _ = interleave_order(n_docs)
+    assert _max_normalised_gap(golden, n_docs, half) < 0.10
+
+
+def test_interleave_order_rejects_an_empty_grid():
+    with pytest.raises(ValueError, match="at least 1"):
+        interleave_order(0)

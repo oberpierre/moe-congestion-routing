@@ -31,6 +31,7 @@ from moe_congestion_routing.training.probe_batch import (
     PROBE_ASSET_VERSION,
     PROBE_ROLES,
     compute_provenance_sha256,
+    interleave_order,
     spread_window,
     strided_window,
     tail_window,
@@ -170,8 +171,19 @@ def _extract(args: argparse.Namespace) -> None:
             )
 
     if allocation is None:
+        # The tail and strided paths pack in ascending document order and must keep doing so,
+        # because re-extracting a committed asset has to reproduce its bytes and not merely its
+        # provenance. Only the full-span spread path interleaves.
         pieces = [ds.get(int(i)) for i in indices]
     else:
+        # Permuted after water_fill rather than before, so the allocation and `per_doc_cap` are
+        # the ones the ascending grid produced. This changes the arrangement of the asset and
+        # nothing about which documents it draws or how many tokens each supplies.
+        order, interleave_stride = interleave_order(int(indices.size))
+        indices = indices[order]
+        allocation = allocation[order]
+        window["doc_order"] = "interleaved"
+        window["doc_order_stride"] = int(interleave_stride)
         # Each document supplies exactly its water-filled share, so no tail truncation happens:
         # the [:target_tokens] slice below is then a no-op kept only for uniformity with the
         # other two sampling paths.

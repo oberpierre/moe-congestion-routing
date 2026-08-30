@@ -7,6 +7,7 @@ re-derive them from. This module only reads that frozen array, it never touches 
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -209,6 +210,34 @@ def spread_window(
     # because it is built to fit.
     span_fraction = (int(indices[-1]) + 1 - int(indices[0])) / split_size
     return indices, stride, span_fraction
+
+
+def interleave_order(n_docs: int) -> tuple[numpy.ndarray, int]:
+    """Return ``(order, stride)``: a permutation of ``range(n_docs)`` that reads the grid at the
+    stride nearest ``n_docs / phi`` that is coprime to it, so any contiguous run of stream
+    positions draws from across the whole grid rather than from one neighbourhood of it.
+
+    A unit's composition must not depend on corpus position. Packing a full-span draw in
+    ascending document order defeats that on its own, because reshaping a corpus-ordered stream
+    makes every sequence a contiguous window of the span, so a corpus region that is local in
+    the split stays local in the asset. Interleaving before packing is what severs it.
+
+    The golden ratio is what makes every *prefix* well spread and not merely the whole
+    permutation, which is the property the halves need: a stride near ``n_docs / 2`` is equally
+    coprime but walks the grid in two slow lanes, leaving a contiguous half covering about 3/4
+    of it. Coprimality is what makes ``j -> (j * stride) % n_docs`` a permutation at all.
+    """
+    if n_docs < 1:
+        raise ValueError(f"n_docs={n_docs} must be at least 1")
+    if n_docs <= 2:
+        return numpy.arange(n_docs, dtype=numpy.int64), 1
+    target = round(n_docs / ((1 + math.sqrt(5)) / 2))
+    for step in range(n_docs):
+        for stride in (target - step, target + step):
+            if 1 <= stride < n_docs and math.gcd(stride, n_docs) == 1:
+                order = (numpy.arange(n_docs, dtype=numpy.int64) * stride) % n_docs
+                return order, stride
+    raise AssertionError(f"no stride coprime to n_docs={n_docs} exists, which is impossible")
 
 
 def water_fill(lengths: numpy.ndarray, target_tokens: int) -> tuple[numpy.ndarray, int]:
