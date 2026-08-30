@@ -13,10 +13,11 @@
 #     assignment and expert bias via a local import of
 #     moe_congestion_routing.metrics.router_probe.active_capture(), immediately before its
 #     `return probs, routing_map`.
-#   - arguments.py: adds --moe-probe-batch, --moe-probe-coarse-interval,
-#     --moe-probe-dense-interval, --moe-probe-dense-windows, --moe-probe-seqs and --moe-probe-dir
-#     to _add_moe_args. --moe-probe-coarse-interval is the on-switch: 0 (the default) disables the
-#     probe and every config emits an unchanged command line.
+#   - arguments.py: adds --moe-probe-batch (list-valued, nargs='+': one no-grad forward and one
+#     dump per asset per probe step), --moe-probe-coarse-interval, --moe-probe-dense-interval,
+#     --moe-probe-dense-windows, --moe-probe-seqs and --moe-probe-dir to _add_moe_args.
+#     --moe-probe-coarse-interval is the on-switch: 0 (the default) disables the probe and every
+#     config emits an unchanged command line.
 #   - training.py: two insertions in train(), both gated on args.moe_probe_coarse_interval and
 #     both a function-local import of moe_congestion_routing.training.probe_forward, so neither
 #     the router hunk nor these two add an import-time dependency on our package:
@@ -49,7 +50,8 @@
 #   patches have been applied and re-insert the active_capture()/record() block immediately before
 #   it, verifying the variable names `logits`, `probs`, etc. are still consistent.
 #   In arguments.py, re-add the six --moe-probe-* flags to _add_moe_args() (or wherever MoE CLI
-#   flags now live). In training.py, re-find train()'s eval block (the one guarding
+#   flags now live), and give --moe-probe-batch its nargs='+' (a list of assets) since every other
+#   flag stays scalar. In training.py, re-find train()'s eval block (the one guarding
 #   get_moe_metrics_tracker().clear() on `args.num_experts is not None`) and re-insert the two
 #   guarded blocks: one before the training while-loop, one immediately after that block ends.
 #
@@ -101,8 +103,8 @@ index 06ed16a55..96bc8ff32 100644
 +    # Router probe arguments (moe_congestion_routing patch): a no-grad forward on a frozen batch,
 +    # dumped on its own schedule for offline computations. moe-probe-coarse-interval is the
 +    # on-switch: 0 (the default) disables the probe and every flag below is unread.
-+    group.add_argument('--moe-probe-batch', type=str, default=None,
-+                       help='Path to a frozen probe-batch asset (assets/probe/*.npz, moe_congestion_routing patch). Required whenever --moe-probe-coarse-interval is nonzero.')
++    group.add_argument('--moe-probe-batch', type=str, nargs='+', default=None,
++                       help='List of frozen probe-batch assets (assets/probe/*.npz, moe_congestion_routing patch), one no-grad forward and one dump per asset per probe step. Required whenever --moe-probe-coarse-interval is nonzero.')
 +    group.add_argument('--moe-probe-coarse-interval', type=int, default=0,
 +                       help='Probe every N iterations, identically across every run and arm (moe_congestion_routing patch). 0 disables the probe entirely.')
 +    group.add_argument('--moe-probe-dense-interval', type=int, default=0,

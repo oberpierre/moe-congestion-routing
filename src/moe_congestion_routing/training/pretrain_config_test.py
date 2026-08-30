@@ -410,6 +410,13 @@ def test_base_cluster_config_pins_the_reference_architecture():
     # The common probe grid is structural: every arm shares one coarse interval so their dumps
     # land on identical steps. Pinning it here guards against a config drift.
     assert cfg.moe_probe_coarse_interval == 250
+    # A second dense window over the WSD anneal (train_iters - lr_wsd_decay_iters = 5000
+    # to train_iters = 5500), discriminating the two live explanations of the kappa decay.
+    assert cfg.moe_probe_dense_windows == ["0:500", "5000:5500"]
+    # 16 sequences give every asset two reportable 16,384-token units, whereas 8 would give
+    # only one.
+    assert cfg.moe_probe_seqs == 16
+    assert len(cfg.moe_probe_batch) == 2  # the two committed assets, because S5 adds the third
 
 
 def test_base_cluster_active_params_match_flame_exactly():
@@ -884,6 +891,33 @@ def test_probe_emits_all_flags_when_enabled():
     assert args[i + 1 : i + 2] == ["0:500"]
 
 
+def test_probe_emits_every_asset_in_a_multi_asset_list():
+    args = build_megatron_args(
+        _cfg(
+            moe_probe_batch=["assets/probe/standing_a_16x2048.npz", "assets/probe/strided_b.npz"],
+            moe_probe_coarse_interval=250,
+            moe_probe_dense_interval=25,
+            moe_probe_seqs=8,
+        )
+    )
+    i = args.index("--moe-probe-batch")
+    assert args[i + 1 : i + 3] == [
+        "assets/probe/standing_a_16x2048.npz",
+        "assets/probe/strided_b.npz",
+    ]
+    assert args[i + 3] == "--moe-probe-coarse-interval"  # the list ends before the next flag
+
+
+def test_probe_rejects_duplicate_asset_stems():
+    with pytest.raises(ValueError, match="unique stems"):
+        build_megatron_args(
+            _cfg(
+                moe_probe_batch=["assets/probe/dev.npz", "other/dir/dev.npz"],
+                moe_probe_coarse_interval=250,
+            )
+        )
+
+
 def test_probe_requires_an_asset_when_enabled():
     with pytest.raises(ValueError, match="moe_probe_batch"):
         build_megatron_args(_cfg(moe_probe_coarse_interval=250))
@@ -1017,13 +1051,30 @@ def test_probe_windows_malformed_spec_rejected():
 
 
 def test_resolved_absolutises_moe_probe_paths(tmp_path):
+    # A bare string is still legal input and normalises to a one-element list.
     r = MoEPretrainConfig(
         train_data_path="/data/train",
         moe_probe_batch="assets/probe/dev.npz",
         moe_probe_dir="probes",
     ).resolved(tmp_path)
-    assert r.moe_probe_batch == str(tmp_path / "assets/probe/dev.npz")
+    assert r.moe_probe_batch == [str(tmp_path / "assets/probe/dev.npz")]
     assert r.moe_probe_dir == str(tmp_path / "probes")
+
+
+def test_moe_probe_batch_scalar_string_normalises_to_a_list():
+    cfg = MoEPretrainConfig(moe_probe_batch="assets/probe/dev.npz")
+    assert cfg.moe_probe_batch == ["assets/probe/dev.npz"]
+
+
+def test_resolved_absolutises_a_list_of_moe_probe_batch_assets(tmp_path):
+    r = MoEPretrainConfig(
+        train_data_path="/data/train",
+        moe_probe_batch=["assets/probe/standing.npz", "assets/probe/strided.npz"],
+    ).resolved(tmp_path)
+    assert r.moe_probe_batch == [
+        str(tmp_path / "assets/probe/standing.npz"),
+        str(tmp_path / "assets/probe/strided.npz"),
+    ]
 
 
 def test_pretrain_config_module_imports_no_torch():

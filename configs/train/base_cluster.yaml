@@ -58,14 +58,20 @@ moe_grouped_gemm: true
 moe_per_layer_logging: true
 log_throughput: true
 
-# router probe: a coarse grid every arm shares, plus a dense window over the warmup/early-
-# saturation phase. The standing asset must stay a git-tracked file, because a run refuses to
-# start without one and every arm's dumps are keyed to the same tokens.
+# router probe: a coarse grid every arm shares, plus dense windows over the warmup/early-
+# saturation phase and the WSD anneal (train_iters - lr_wsd_decay_iters = 5000 to train_iters =
+# 5500 below), which discriminates the noise-floor and lag explanations of the kappa decay by
+# their sign. Re-derive the second window if either horizon setting moves. Every asset
+# must stay a git-tracked file, because a run refuses to start without one and every arm's dumps
+# are keyed to the same tokens.
 moe_probe_coarse_interval: 250
 moe_probe_dense_interval: 25
-moe_probe_dense_windows: ["0:500"]
-moe_probe_seqs: 8
-moe_probe_batch: assets/probe/standing_climbmix_small_16x2048.npz
+moe_probe_dense_windows: ["0:500", "5000:5500"]
+moe_probe_seqs: 16
+moe_probe_batch:
+  - assets/probe/standing_climbmix_small_16x2048.npz
+  - assets/probe/standing_climbmix_small_strided_16x2048.npz
+  - assets/probe/standing_climbmix_small_spread_off1_16x2048.npz
 
 # Set the project name and WANDB_API_KEY in the env (see config.sh.example) to enable W&B logging.
 # WANDB_MODE=offline skips the upload for quick runs.

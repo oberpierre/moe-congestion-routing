@@ -172,9 +172,11 @@ class MoEPretrainConfig:
     moe_per_layer_logging: bool = False
     """Also log every MoE metric per layer (``moe/<metric>_layer_<i>``), not just the layer-mean."""
 
-    moe_probe_batch: str | None = None
-    """Path to a frozen probe-batch asset (``assets/probe/*.npz``). Required whenever
-    ``moe_probe_coarse_interval`` is nonzero."""
+    moe_probe_batch: str | list[str] | None = None
+    """Path(s) to frozen probe-batch asset(s) (``assets/probe/*.npz``). A run probes each asset
+    in its own forward pass and dump directory, keyed by the asset's filename stem, so stems must
+    be unique across the list. Required whenever ``moe_probe_coarse_interval`` is nonzero. A bare
+    string is still legal and normalises to a one-element list in ``__post_init__``."""
 
     moe_probe_coarse_interval: int = 0
     """Probe every N iterations. ``0`` (the default) disables the probe entirely."""
@@ -396,6 +398,16 @@ class MoEPretrainConfig:
     subdir (train.log, launch_command.txt, checkpoints); the dataset cache above is the one shared
     exception at ``<output_dir>/cache``."""
 
+    def __post_init__(self) -> None:
+        """Coerce a scalar ``moe_probe_batch`` into a one-element list.
+
+        Runs on every construction, including ``dataclasses.replace()`` inside ``resolved()``, so
+        a config built straight from a dict (a bare string in yaml) and one already carrying a
+        list end up in the same shape before anything downstream reads the field.
+        """
+        if isinstance(self.moe_probe_batch, str):
+            object.__setattr__(self, "moe_probe_batch", [self.moe_probe_batch])
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> "MoEPretrainConfig":
         """Build from a yaml file. Unknown keys raise ``TypeError`` (fail loud).
@@ -432,7 +444,9 @@ class MoEPretrainConfig:
             load=absolutise(self.load) if self.load else None,
             tensorboard_dir=absolutise(self.tensorboard_dir) if self.tensorboard_dir else None,
             wandb_save_dir=absolutise(self.wandb_save_dir) if self.wandb_save_dir else None,
-            moe_probe_batch=absolutise(self.moe_probe_batch) if self.moe_probe_batch else None,
+            moe_probe_batch=(
+                [absolutise(p) for p in self.moe_probe_batch] if self.moe_probe_batch else None
+            ),
             moe_probe_dir=absolutise(self.moe_probe_dir) if self.moe_probe_dir else None,
         )
 
@@ -632,6 +646,15 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
     if cfg.moe_probe_coarse_interval:
         if not cfg.moe_probe_batch:
             raise ValueError("moe_probe_coarse_interval requires moe_probe_batch to be set")
+        # Each asset's dump lands at <moe_probe_dir>/<stem>/iter_%07d.npz, so two assets sharing a
+        # stem would silently overwrite each other's dumps rather than each getting their own.
+        stems = [Path(p).stem for p in cfg.moe_probe_batch]
+        if len(stems) != len(set(stems)):
+            duplicates = sorted({s for s in stems if stems.count(s) > 1})
+            raise ValueError(
+                f"moe_probe_batch assets must have unique stems, got duplicate stem(s) "
+                f"{duplicates} in {cfg.moe_probe_batch}"
+            )
         if cfg.tensor_model_parallel_size != 1 or cfg.pipeline_model_parallel_size != 1:
             raise ValueError(
                 "the router probe requires tensor_model_parallel_size == 1 and "
@@ -678,7 +701,7 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
                 )
         args += [
             "--moe-probe-batch",
-            cfg.moe_probe_batch,
+            *cfg.moe_probe_batch,
             "--moe-probe-coarse-interval",
             str(cfg.moe_probe_coarse_interval),
             "--moe-probe-dense-interval",

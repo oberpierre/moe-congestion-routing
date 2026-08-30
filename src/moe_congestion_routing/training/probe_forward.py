@@ -1,5 +1,5 @@
 """Drives the router probe: the fire/no-fire schedule, startup validation, and the no-grad
-forward that produces one dump.
+forwards that produce one dump per probe asset.
 
 ``run_probe`` imports ``megatron`` because it only ever runs inside a Megatron training process.
 The import is function-local so this module stays importable, and
@@ -38,26 +38,29 @@ def validate_probe_setup(args) -> None:
     tracked-asset check shells out to ``git``, and the directory check is plain ``os``/``pathlib``
     -- all things ``--dry-run`` deliberately does NOT run, because they read the asset and the
     filesystem rather than only the config shape (that split lives in ``pretrain_config.py``).
+    Iterates every asset in ``args.moe_probe_batch``: the stem-uniqueness check already ran at
+    config-build time, so this only re-runs the per-asset checks that need file/git access.
     """
-    batch = load_probe_batch(args.moe_probe_batch)
-    if batch.seq_length != args.seq_length:
-        raise ValueError(
-            f"probe asset {args.moe_probe_batch!r} has seq_length {batch.seq_length}, "
-            f"which disagrees with --seq-length {args.seq_length}"
-        )
-    if batch.role == "standing":
-        result = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", str(args.moe_probe_batch)],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
+    for probe_batch in args.moe_probe_batch:
+        batch = load_probe_batch(probe_batch)
+        if batch.seq_length != args.seq_length:
             raise ValueError(
-                f"probe asset {args.moe_probe_batch!r} has role 'standing' but git does not "
-                f"track it: a standing probe must be a committed asset so every machine measures "
-                f"the same instrument, so commit it before a reported run fires it "
-                f"({result.stderr.strip()})"
+                f"probe asset {probe_batch!r} has seq_length {batch.seq_length}, "
+                f"which disagrees with --seq-length {args.seq_length}"
             )
+        if batch.role == "standing":
+            result = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", str(probe_batch)],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise ValueError(
+                    f"probe asset {probe_batch!r} has role 'standing' but git does not "
+                    f"track it: a standing probe must be a committed asset so every machine "
+                    f"measures the same instrument, so commit it before a reported run fires it "
+                    f"({result.stderr.strip()})"
+                )
 
     probe_dir = Path(args.moe_probe_dir)
     probe_dir.mkdir(parents=True, exist_ok=True)
@@ -66,7 +69,7 @@ def validate_probe_setup(args) -> None:
 
 
 def run_probe(model, forward_step_func, iteration: int) -> None:
-    """Run one no-grad forward on the frozen probe batch and dump this step's router state.
+    """Run one no-grad forward per probe asset and dump each asset's router state separately.
 
     Mirrors the eval block's own scaffolding, since TP/CP/PP are forced to 1 so every
     data-parallel rank computes the identical loss on the identical batch and only rank 0 writes.
@@ -106,43 +109,103 @@ def run_probe(model, forward_step_func, iteration: int) -> None:
     rerun_mode = rerun_state_machine.get_mode()
     rerun_state_machine.set_mode(RerunMode.DISABLED)
 
-    batch = load_probe_batch(args.moe_probe_batch)
-    micro_batches = probe_micro_batches(
-        batch,
-        micro_batch_size=args.micro_batch_size,
-        num_sequences=args.moe_probe_seqs,
-        seq_length=args.seq_length,
-        eod_token=get_tokenizer().eod,
-        reset_position_ids=args.reset_position_ids,
-        reset_attention_mask=args.reset_attention_mask,
-        eod_mask_loss=args.eod_mask_loss,
-        create_attention_mask=args.create_attention_mask_in_dataloader,
-    )
-    num_microbatches = args.moe_probe_seqs // args.micro_batch_size
+    # RNG neutrality is a guarantee this code makes rather than one that dropout-off and eval()
+    # happen to give. Whether the forward path below consumes any RNG is unmeasured, so the state
+    # is saved here and the equality check below is what establishes it.
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state()
+
+    writer = get_tensorboard_writer()
+    wandb_writer = get_wandb_writer()
     forward_backward_func = get_forward_backward_func()
+    tokenizer_eod = get_tokenizer().eod
 
-    with (
-        torch.no_grad(),
-        capturing(iteration, args.micro_batch_size, args.moe_router_topk) as capture,
-    ):
-        loss_dicts = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=iter(micro_batches),
-            model=model,
-            num_microbatches=num_microbatches,
-            seq_length=args.seq_length,
+    for probe_batch_path in args.moe_probe_batch:
+        # One forward per asset rather than one forward over the concatenation: the LP unit is one
+        # asset's tokens, so mixing assets would price a differently-sized game with a different
+        # capacity dual. Splitting ONE asset into microbatches stays legitimate because
+        # routing at inference is per-token given the weights and bias, with no capacity feedback
+        # inside the forward, so the microbatch chunks can be reassembled afterwards.
+        stem = Path(probe_batch_path).stem
+        batch = load_probe_batch(probe_batch_path)
+        micro_batches = probe_micro_batches(
+            batch,
             micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=True,
+            num_sequences=args.moe_probe_seqs,
+            seq_length=args.seq_length,
+            eod_token=tokenizer_eod,
+            reset_position_ids=args.reset_position_ids,
+            reset_attention_mask=args.reset_attention_mask,
+            eod_mask_loss=args.eod_mask_loss,
+            create_attention_mask=args.create_attention_mask_in_dataloader,
         )
+        num_microbatches = args.moe_probe_seqs // args.micro_batch_size
 
-    total_loss = torch.zeros((), device="cuda")
-    total_tokens = torch.zeros((), device="cuda")
-    for loss_dict in loss_dicts:
-        value = loss_dict["lm loss"]
-        total_loss += value[0]
-        total_tokens += value[1]
-    probe_lm_loss = (total_loss / total_tokens).item()
+        with (
+            torch.no_grad(),
+            capturing(iteration, args.micro_batch_size, args.moe_router_topk) as capture,
+        ):
+            loss_dicts = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=iter(micro_batches),
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=True,
+            )
+
+        total_loss = torch.zeros((), device="cuda")
+        total_tokens = torch.zeros((), device="cuda")
+        for loss_dict in loss_dicts:
+            value = loss_dict["lm loss"]
+            total_loss += value[0]
+            total_tokens += value[1]
+        probe_lm_loss = (total_loss / total_tokens).item()
+
+        if writer:
+            writer.add_scalar(f"probe_lm_loss/{stem}", probe_lm_loss, iteration)
+        if wandb_writer and is_last_rank():
+            wandb_writer.log({f"probe_lm_loss/{stem}": probe_lm_loss}, iteration)
+
+        if torch.distributed.get_rank() == 0:
+            meta = {
+                "iteration": iteration,
+                "moe_probe_batch": probe_batch_path,
+                "token_sha256": batch.token_sha256,
+                "role": batch.role,
+                "seq_length": args.seq_length,
+                "moe_router_score_function": args.moe_router_score_function,
+                "moe_router_pre_softmax": args.moe_router_pre_softmax,
+                "moe_probe_coarse_interval": args.moe_probe_coarse_interval,
+                "moe_probe_dense_interval": args.moe_probe_dense_interval,
+                "moe_probe_dense_windows": args.moe_probe_dense_windows,
+                "moe_probe_seqs": args.moe_probe_seqs,
+                "resumed_from_iteration": args.iteration,
+                "probe_lm_loss": probe_lm_loss,
+                "tensor_model_parallel_size": args.tensor_model_parallel_size,
+                "pipeline_model_parallel_size": args.pipeline_model_parallel_size,
+                "context_parallel_size": args.context_parallel_size,
+                "expert_model_parallel_size": args.expert_model_parallel_size,
+                "data_parallel_size": args.data_parallel_size,
+                "world_size": args.world_size,
+            }
+            path = Path(args.moe_probe_dir) / stem / f"iter_{iteration:07d}.npz"
+            write_probe_dump(path, capture, meta)
+
+    cpu_rng_state_after = torch.get_rng_state()
+    cuda_rng_state_after = torch.cuda.get_rng_state()
+    torch.set_rng_state(cpu_rng_state)
+    torch.cuda.set_rng_state(cuda_rng_state)
+    assert torch.equal(cpu_rng_state, cpu_rng_state_after), (
+        "the probe forward consumed CPU RNG: training's own RNG stream would drift depending on "
+        "whether a step was probed"
+    )
+    assert torch.equal(cuda_rng_state, cuda_rng_state_after), (
+        "the probe forward consumed CUDA RNG: training's own RNG stream would drift depending on "
+        "whether a step was probed"
+    )
 
     for model_module in model:
         model_module.train()
@@ -151,35 +214,3 @@ def run_probe(model, forward_step_func, iteration: int) -> None:
         enable_forward_pre_hook(model)
     timers("interval-time", log_level=0).start(barrier=True)
     get_moe_metrics_tracker().clear()
-
-    writer = get_tensorboard_writer()
-    if writer:
-        writer.add_scalar("probe_lm_loss", probe_lm_loss, iteration)
-    wandb_writer = get_wandb_writer()
-    if wandb_writer and is_last_rank():
-        wandb_writer.log({"probe_lm_loss": probe_lm_loss}, iteration)
-
-    if torch.distributed.get_rank() == 0:
-        meta = {
-            "iteration": iteration,
-            "moe_probe_batch": args.moe_probe_batch,
-            "token_sha256": batch.token_sha256,
-            "role": batch.role,
-            "seq_length": args.seq_length,
-            "moe_router_score_function": args.moe_router_score_function,
-            "moe_router_pre_softmax": args.moe_router_pre_softmax,
-            "moe_probe_coarse_interval": args.moe_probe_coarse_interval,
-            "moe_probe_dense_interval": args.moe_probe_dense_interval,
-            "moe_probe_dense_windows": args.moe_probe_dense_windows,
-            "moe_probe_seqs": args.moe_probe_seqs,
-            "resumed_from_iteration": args.iteration,
-            "probe_lm_loss": probe_lm_loss,
-            "tensor_model_parallel_size": args.tensor_model_parallel_size,
-            "pipeline_model_parallel_size": args.pipeline_model_parallel_size,
-            "context_parallel_size": args.context_parallel_size,
-            "expert_model_parallel_size": args.expert_model_parallel_size,
-            "data_parallel_size": args.data_parallel_size,
-            "world_size": args.world_size,
-        }
-        path = Path(args.moe_probe_dir) / f"iter_{iteration:07d}.npz"
-        write_probe_dump(path, capture, meta)

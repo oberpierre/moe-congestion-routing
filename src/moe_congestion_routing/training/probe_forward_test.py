@@ -4,6 +4,7 @@ import types
 
 import pytest
 
+from moe_congestion_routing.probe_windows import parse_windows
 from moe_congestion_routing.training.probe_forward import (
     probe_fires,
     validate_probe_setup,
@@ -40,18 +41,37 @@ def test_probe_fires_outside_every_window_and_off_grid_is_false():
     assert not probe_fires(7, coarse=6, dense=2, windows=[(0, 4)])
 
 
+def test_fleet_cadence_windows_parse_and_the_anneal_start_fires_once():
+    # base_cluster.yaml's cadence: a dense window over warmup plus one over the WSD anneal
+    # (train_iters - lr_wsd_decay_iters = 5000 to train_iters = 5500). Step 5000 lands on both the
+    # coarse grid (a multiple of 250) and the second window's own anchor, and probe_fires reports a
+    # union, so this must be a single True rather than a double-fire.
+    windows = parse_windows(["0:500", "5000:5500"])
+    assert windows == [(0, 500), (5000, 5500)]
+    assert probe_fires(5000, coarse=250, dense=25, windows=windows) is True
+
+
 def test_validate_probe_setup_checks_seq_length_agreement():
-    args = types.SimpleNamespace(moe_probe_batch=_ASSET, seq_length=999)
+    # args.moe_probe_batch is always a list by the time it reaches here: argparse's nargs='+'
+    # never hands back a bare string, even for one asset.
+    args = types.SimpleNamespace(moe_probe_batch=[_ASSET], seq_length=999)
     with pytest.raises(ValueError, match="seq_length"):
         validate_probe_setup(args)
 
 
 def test_validate_probe_setup_accepts_a_tracked_dev_asset(tmp_path):
     args = types.SimpleNamespace(
-        moe_probe_batch=_ASSET, seq_length=1024, moe_probe_dir=str(tmp_path / "probes")
+        moe_probe_batch=[_ASSET], seq_length=1024, moe_probe_dir=str(tmp_path / "probes")
     )
     validate_probe_setup(args)
     assert (tmp_path / "probes").is_dir()
+
+
+def test_validate_probe_setup_checks_every_asset_in_the_list():
+    # A second, bad-seq_length asset later in the list must still be caught, not just the first.
+    args = types.SimpleNamespace(moe_probe_batch=[_ASSET, _ASSET], seq_length=999)
+    with pytest.raises(ValueError, match="seq_length"):
+        validate_probe_setup(args)
 
 
 def test_validate_probe_setup_rejects_an_untracked_standing_asset(tmp_path, monkeypatch):
@@ -77,7 +97,7 @@ def test_validate_probe_setup_rejects_an_untracked_standing_asset(tmp_path, monk
     subprocess.run(["git", "init", "-q"], cwd=untracked_dir, check=True)
 
     args = types.SimpleNamespace(
-        moe_probe_batch=str(asset_path),
+        moe_probe_batch=[str(asset_path)],
         seq_length=1024,
         moe_probe_dir=str(untracked_dir / "probes"),
     )
@@ -92,7 +112,7 @@ def test_validate_probe_setup_rejects_an_unwritable_probe_dir(tmp_path):
     probe_dir.mkdir(mode=0o500)
     try:
         args = types.SimpleNamespace(
-            moe_probe_batch=_ASSET, seq_length=1024, moe_probe_dir=str(probe_dir)
+            moe_probe_batch=[_ASSET], seq_length=1024, moe_probe_dir=str(probe_dir)
         )
         with pytest.raises(ValueError, match="not writable"):
             validate_probe_setup(args)
