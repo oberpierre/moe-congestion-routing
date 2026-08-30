@@ -163,6 +163,9 @@ class ProbeSeries:
     run_dir: Path
     arm: str | None
     dumps: tuple[ProbeDump, ...]
+    asset: str | None = None
+    """The dump directory's stem this series was read from, or ``None`` on the legacy flat
+    layout, which holds exactly one asset and has no per-asset directory to name it with."""
 
     @property
     def token_sha256(self) -> str:
@@ -177,27 +180,97 @@ class ProbeSeries:
         return self.dumps[0].coarse_interval
 
 
+def _resolve_probes_dir(probes_dir: Path, asset: str | None) -> Path:
+    """The directory to glob one asset's dumps from, and every refusal that layout can raise.
+
+    Shared by every reader that turns ``(run_dir, asset)`` into dump paths, so the flat/per-asset
+    layout decision lives in exactly one place. Per-asset layout (``probes_dir`` holds
+    subdirectories): resolves ``asset`` by name, or the lone subdirectory when there is exactly
+    one and ``asset`` is ``None``. Flat layout (``probes_dir`` holds ``*.npz`` directly, the only
+    layout the writer produced before per-asset dumps): always ``probes_dir`` itself, since a flat
+    directory holds exactly one asset and has no subdirectory to name it with. Matching a requested
+    ``asset`` against what a flat directory actually holds needs a dump's own metadata, so that
+    check is the caller's job.
+    """
+    subdirs = sorted(p for p in probes_dir.iterdir() if p.is_dir()) if probes_dir.exists() else []
+    flat = probes_dir.exists() and any(probes_dir.glob("*.npz"))
+    if flat and subdirs:
+        raise IncomparableProbes(
+            f"{probes_dir}: holds both loose dumps and asset subdirectories, which no writer "
+            "produces, so this is a hand-edited directory and which layout is authoritative "
+            "cannot be guessed"
+        )
+    if subdirs:
+        stems = sorted(d.name for d in subdirs)
+        if asset is None:
+            if len(subdirs) != 1:
+                raise IncomparableProbes(
+                    f"{probes_dir}: {len(subdirs)} assets present {stems!r}. Pass an asset to "
+                    "pick one"
+                )
+            return subdirs[0]
+        chosen = probes_dir / asset
+        if chosen not in subdirs:
+            raise IncomparableProbes(
+                f"{probes_dir}: asset {asset!r} not found. Available: {stems!r}"
+            )
+        return chosen
+    return probes_dir
+
+
+def probe_dump_path(run_dir: Path | str, step: int, *, asset: str | None = None) -> Path:
+    """The single dump path for one ``(run, step, asset)``, on whichever layout this run used.
+
+    Every caller that only needs one step's file, rather than a whole :class:`ProbeSeries`, goes
+    through this rather than re-deriving ``probes/iter_%07d.npz`` or
+    ``probes/<asset>/iter_%07d.npz`` at its own call site, so the layout decision is made once.
+    """
+    asset_dir = _resolve_probes_dir(Path(run_dir) / "probes", asset)
+    path = asset_dir / f"iter_{step:07d}.npz"
+    if not path.exists():
+        raise FileNotFoundError(f"no dump at {path}")
+    return path
+
+
 def read_series(
     run_dir: Path | str,
     *,
+    asset: str | None = None,
     arm: str | None = None,
     allow_roles: Sequence[str] = ("standing",),
 ) -> ProbeSeries:
     """Read every dump under ``<run_dir>/probes/`` into one ascending-step ``ProbeSeries``.
 
-    Refuses (``IncomparableProbes``) a dump whose ``role`` is outside ``allow_roles``, and refuses
-    two dumps in this run that disagree on ``token_sha256``, because either would silently pool
-    an instrument this table was never meant to include. A run with no ``probes/`` directory, or
-    one with no dumps in it, is a missing input rather than an incomparable one and raises
+    ``asset`` picks a dump directory's stem under the per-asset layout, or is left ``None`` on
+    the legacy flat layout where there is only ever one. See :func:`_resolve_probes_dir` for the
+    layout refusals this raises before any dump is even opened.
+
+    Also refuses (``IncomparableProbes``) a dump whose ``role`` is outside ``allow_roles``, a
+    non-``None`` ``asset`` that a flat directory's own dumps do not match, and two dumps in this
+    run that disagree on ``token_sha256``, because any of those would silently pool an instrument
+    this table was never meant to include. A run with no ``probes/`` directory, or one with no
+    dumps in it, is a missing input rather than an incomparable one and raises
     ``FileNotFoundError`` naming the path.
     """
     run_dir = Path(run_dir)
     probes_dir = run_dir / "probes"
-    paths = sorted(probes_dir.glob("*.npz")) if probes_dir.exists() else []
+    asset_dir = _resolve_probes_dir(probes_dir, asset)
+    is_flat = asset_dir == probes_dir
+    paths = sorted(asset_dir.glob("*.npz"))
     if not paths:
         raise FileNotFoundError(f"no probe dumps found under {probes_dir}")
 
     dumps = [read_dump(path) for path in paths]
+
+    if is_flat and asset is not None:
+        # A flat directory has no subdirectory to name it with, so the asset it holds is read
+        # from the dumps' own record of which asset file wrote them.
+        found = Path(dumps[0].meta["moe_probe_batch"]).stem
+        if found != asset:
+            raise IncomparableProbes(
+                f"{probes_dir}: holds asset {found!r}, not the requested {asset!r}"
+            )
+
     for dump in dumps:
         if dump.role not in allow_roles:
             raise IncomparableProbes(
@@ -212,7 +285,13 @@ def read_series(
             "the same instrument and cannot be pooled into one series"
         )
 
-    return ProbeSeries(run_dir=run_dir, arm=arm, dumps=tuple(sorted(dumps, key=lambda d: d.step)))
+    resolved_asset = None if is_flat else asset_dir.name
+    return ProbeSeries(
+        run_dir=run_dir,
+        arm=arm,
+        dumps=tuple(sorted(dumps, key=lambda d: d.step)),
+        asset=resolved_asset,
+    )
 
 
 @dataclass(frozen=True)

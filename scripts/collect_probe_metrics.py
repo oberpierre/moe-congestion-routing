@@ -59,6 +59,11 @@ def main() -> None:
         help="role permitted to be scored, repeatable, defaulting to 'standing' alone",
     )
     parser.add_argument(
+        "--asset",
+        help="dump directory stem, applied to every RUNDIR, required when a run probed more "
+        "than one asset",
+    )
+    parser.add_argument(
         "--reference-step",
         type=int,
         default=None,
@@ -71,7 +76,7 @@ def main() -> None:
 
     try:
         series_list = [
-            read_series(run_dir, arm=arm, allow_roles=allow_roles)
+            read_series(run_dir, arm=arm, allow_roles=allow_roles, asset=args.asset)
             for arm, run_dir in (_parse_positional(spec) for spec in args.run_dirs)
         ]
         rows = saturation_rows(series_list, reference_step=args.reference_step)

@@ -10,6 +10,7 @@ from moe_congestion_routing.metrics.probe_series import (
     ProbeDump,
     ProbeSeries,
     SaturationRow,
+    probe_dump_path,
     read_dump,
     read_series,
     saturation_rows,
@@ -30,12 +31,15 @@ def _write_dump(
     logits=None,
     expert_bias=None,
     score_function="sigmoid",
+    moe_probe_batch="assets/probe/default_asset.npz",
 ):
     """A synthetic ``.npz`` dump with the metadata keys ``probe_series.py`` reads.
 
     ``routing_map`` is ``[L, N, E]`` bool in unpacked form, packed here the same way
     ``router_probe.py`` packs it, so a round trip through this helper exercises the real bit
-    layout rather than a stand-in.
+    layout rather than a stand-in. ``moe_probe_batch`` is the writer's own record of which asset
+    file produced this dump, the only way a flat (pre-per-asset-layout) directory's asset can be
+    named, since there is no subdirectory to read a stem from.
     """
     probes_dir.mkdir(parents=True, exist_ok=True)
     num_layers, _num_tokens, num_experts = routing_map.shape
@@ -57,6 +61,7 @@ def _write_dump(
         "layer_numbers": layer_numbers,
         "E": num_experts,
         "K": topk,
+        "moe_probe_batch": moe_probe_batch,
     }
     path = probes_dir / f"iter_{step:07d}.npz"
     numpy.savez(path, **arrays, metadata=numpy.array(json.dumps(meta)))
@@ -145,6 +150,99 @@ def test_read_series_records_the_given_arm(tmp_path):
     _write_dump(tmp_path / "probes", step=0, routing_map=routing_map)
     series = read_series(tmp_path, arm="switch")
     assert series.arm == "switch"
+
+
+# --- read_series: asset resolution -------------------------------------------------------
+
+
+def test_read_series_flat_layout_resolves_with_no_asset_and_carries_no_asset_field(tmp_path):
+    routing_map = numpy.stack([_one_hot_map([[0, 1]], 4)], axis=0)
+    _write_dump(tmp_path / "probes", step=0, routing_map=routing_map)
+    series = read_series(tmp_path)
+    assert series.asset is None
+
+
+def test_read_series_flat_layout_refuses_a_non_matching_asset(tmp_path):
+    routing_map = numpy.stack([_one_hot_map([[0, 1]], 4)], axis=0)
+    _write_dump(
+        tmp_path / "probes",
+        step=0,
+        routing_map=routing_map,
+        moe_probe_batch="assets/probe/actual_asset.npz",
+    )
+    with pytest.raises(IncomparableProbes, match="actual_asset"):
+        read_series(tmp_path, asset="wrong_asset")
+
+
+def test_read_series_flat_layout_accepts_the_matching_asset_but_reports_none(tmp_path):
+    routing_map = numpy.stack([_one_hot_map([[0, 1]], 4)], axis=0)
+    _write_dump(
+        tmp_path / "probes",
+        step=0,
+        routing_map=routing_map,
+        moe_probe_batch="assets/probe/actual_asset.npz",
+    )
+    series = read_series(tmp_path, asset="actual_asset")
+    assert series.asset is None  # flat layout has no directory to name it with
+
+
+def test_read_series_per_asset_layout_resolves_the_lone_subdirectory(tmp_path):
+    routing_map = numpy.stack([_one_hot_map([[0, 1]], 4)], axis=0)
+    _write_dump(tmp_path / "probes" / "asset_a", step=0, routing_map=routing_map)
+    series = read_series(tmp_path)
+    assert series.asset == "asset_a"
+
+
+def test_read_series_per_asset_layout_with_no_asset_refuses_when_ambiguous(tmp_path):
+    routing_map = numpy.stack([_one_hot_map([[0, 1]], 4)], axis=0)
+    _write_dump(tmp_path / "probes" / "asset_a", step=0, routing_map=routing_map)
+    _write_dump(tmp_path / "probes" / "asset_b", step=0, routing_map=routing_map)
+    with pytest.raises(IncomparableProbes, match="asset_a.*asset_b|asset_b.*asset_a"):
+        read_series(tmp_path)
+
+
+def test_read_series_per_asset_layout_selects_the_named_asset(tmp_path):
+    map_a = numpy.stack([_one_hot_map([[0, 1]], 4)], axis=0)
+    map_b = numpy.stack([_one_hot_map([[2, 3]], 4)], axis=0)
+    _write_dump(tmp_path / "probes" / "asset_a", step=0, routing_map=map_a)
+    _write_dump(tmp_path / "probes" / "asset_b", step=0, routing_map=map_b)
+    series = read_series(tmp_path, asset="asset_b")
+    assert series.asset == "asset_b"
+    numpy.testing.assert_array_equal(series.dumps[0].routing_map(), map_b)
+
+
+def test_read_series_per_asset_layout_refuses_an_unknown_asset(tmp_path):
+    routing_map = numpy.stack([_one_hot_map([[0, 1]], 4)], axis=0)
+    _write_dump(tmp_path / "probes" / "asset_a", step=0, routing_map=routing_map)
+    with pytest.raises(IncomparableProbes, match="asset_a"):
+        read_series(tmp_path, asset="asset_z")
+
+
+def test_read_series_refuses_a_directory_holding_both_layouts_at_once(tmp_path):
+    routing_map = numpy.stack([_one_hot_map([[0, 1]], 4)], axis=0)
+    _write_dump(tmp_path / "probes", step=0, routing_map=routing_map)
+    _write_dump(tmp_path / "probes" / "asset_a", step=0, routing_map=routing_map)
+    with pytest.raises(IncomparableProbes, match="hand-edited"):
+        read_series(tmp_path)
+
+
+def test_probe_dump_path_resolves_a_flat_layout_step(tmp_path):
+    routing_map = numpy.stack([_one_hot_map([[0, 1]], 4)], axis=0)
+    written = _write_dump(tmp_path / "probes", step=6, routing_map=routing_map)
+    assert probe_dump_path(tmp_path, 6) == written
+
+
+def test_probe_dump_path_resolves_a_per_asset_layout_step(tmp_path):
+    routing_map = numpy.stack([_one_hot_map([[0, 1]], 4)], axis=0)
+    written = _write_dump(tmp_path / "probes" / "asset_a", step=6, routing_map=routing_map)
+    assert probe_dump_path(tmp_path, 6, asset="asset_a") == written
+
+
+def test_probe_dump_path_raises_file_not_found_for_a_missing_step(tmp_path):
+    routing_map = numpy.stack([_one_hot_map([[0, 1]], 4)], axis=0)
+    _write_dump(tmp_path / "probes", step=0, routing_map=routing_map)
+    with pytest.raises(FileNotFoundError):
+        probe_dump_path(tmp_path, 99)
 
 
 # --- saturation_rows: single series -------------------------------------------------------------

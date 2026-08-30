@@ -38,17 +38,21 @@ import numpy as np
 
 from moe_congestion_routing.game import lp
 from moe_congestion_routing.game.compare import dual_agreement
-from moe_congestion_routing.metrics.probe_series import read_dump, selection_conformance
+from moe_congestion_routing.metrics.probe_series import (
+    probe_dump_path,
+    read_dump,
+    selection_conformance,
+)
 
 RUN_A = "artifacts/exp1/alflb/20260819-195028"
 RUN_B = "artifacts/exp1/alflb/20260824-232033"
 
 # cell -> (source run, the training dump it re-measures, or None when it is a new measurement)
 CELLS = {
-    "a_tail": (RUN_A, f"{RUN_A}/probes/iter_0000500.npz"),
+    "a_tail": (RUN_A, probe_dump_path(RUN_A, 500)),
     "a_strided": (RUN_A, None),
     "b_tail": (RUN_B, None),
-    "b_strided": (RUN_B, f"{RUN_B}/probes/iter_0000500.npz"),
+    "b_strided": (RUN_B, probe_dump_path(RUN_B, 500)),
     "a_tail16": (RUN_A, None),
     "b_tail16": (RUN_B, None),
 }
@@ -83,14 +87,15 @@ def _lp_correlations(path: str) -> dict:
 
 def check(cell: str, run_dir: str, reference: str | None, use_lp: bool) -> list:
     """Every failure for one cell, as strings. Empty means the cell is usable."""
-    fresh_path = f"artifacts/exp1/crossprobe/{cell}/probes/iter_0000000.npz"
+    fresh_dir = f"artifacts/exp1/crossprobe/{cell}"
     try:
-        fresh = read_dump(fresh_path)
+        fresh_path = probe_dump_path(fresh_dir, 0)
     except FileNotFoundError:
-        return [f"missing {fresh_path}"]
+        return [f"missing {fresh_dir}/probes step 0"]
+    fresh = read_dump(fresh_path)
 
     failures = []
-    source = read_dump(f"{run_dir}/probes/iter_0000500.npz")
+    source = read_dump(probe_dump_path(run_dir, 500))
     if not np.array_equal(fresh.expert_bias(), source.expert_bias()):
         gap = float(np.abs(fresh.expert_bias() - source.expert_bias()).max())
         failures.append(

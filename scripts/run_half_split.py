@@ -67,6 +67,9 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("run_dir", metavar="RUNDIR", help="a run directory holding probes/*.npz")
+    parser.add_argument(
+        "--asset", help="dump directory stem, required when a run probed more than one"
+    )
     parser.add_argument("--out", required=True, help="output CSV path")
     parser.add_argument(
         "--step", type=int, action="append", dest="steps", help="iteration number, repeatable"
@@ -77,7 +80,7 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, default=4, help="worker processes")
     args = parser.parse_args()
 
-    series = read_series(args.run_dir)
+    series = read_series(args.run_dir, asset=args.asset)
     dumps = series.dumps
     if args.steps:
         by_step = {d.step: d for d in dumps}

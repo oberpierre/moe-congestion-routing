@@ -26,6 +26,30 @@ from moe_congestion_routing.metrics.probe_series import (
     selection_conformance,
 )
 
+# The reported unit, in tokens. This is a hard rule rather than a convention, because a
+# coarser unit dilutes a concentrated sub-batch below `CONCENTRATION_LIMIT`, which is calibrated
+# only at this `n`, so the two constants must never drift apart. Single-sourced here and imported
+# by every script that slices a dump rather than re-declared at each call site.
+UNIT_TOKENS = 16384
+
+
+def probe_units(n_tokens: int) -> list[tuple[str, int, int]]:
+    """The ``[("u0", 0, 16384), ("u1", 16384, 32768), ...]`` cut of ``n_tokens``.
+
+    Raises when ``n_tokens`` is not a positive multiple of :data:`UNIT_TOKENS`, because a partial
+    unit is not the instrument any screen or price here was calibrated on. Units are named
+    ``u<i>`` rather than ``all``/``h1``/``h2``, because a name that says "half" is only true at
+    ``n_tokens == 2 * UNIT_TOKENS`` and misnaming a tail unit as a half is exactly the defect that
+    reached committed output.
+    """
+    if n_tokens <= 0 or n_tokens % UNIT_TOKENS != 0:
+        raise ValueError(
+            f"n_tokens {n_tokens} is not a positive multiple of UNIT_TOKENS {UNIT_TOKENS}"
+        )
+    num_units = n_tokens // UNIT_TOKENS
+    return [(f"u{i}", i * UNIT_TOKENS, (i + 1) * UNIT_TOKENS) for i in range(num_units)]
+
+
 # Below this ratio the stored bias's position within its own +/-eta orbit spans more than a
 # quarter of the dual spread, so a correlation against one batch's duals would report the phase
 # of a limit cycle rather than a property of the bias. The constant rests on that argument

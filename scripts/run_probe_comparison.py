@@ -68,6 +68,9 @@ def main() -> None:
     )
     parser.add_argument("run_dir", metavar="RUNDIR", help="a run directory holding probes/*.npz")
     parser.add_argument(
+        "--asset", help="dump directory stem, required when a run probed more than one"
+    )
+    parser.add_argument(
         "--bias-update-rate",
         type=float,
         required=True,
@@ -100,7 +103,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    series = read_series(args.run_dir)
+    series = read_series(args.run_dir, asset=args.asset)
 
     verification = verification_rows(
         series,

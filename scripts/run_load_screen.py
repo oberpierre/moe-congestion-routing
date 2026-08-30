@@ -12,7 +12,7 @@ milliseconds and no LP, and it is the check to run **before** trusting a price.
 
 Usage:
     uv run python scripts/run_load_screen.py RUNDIR [RUNDIR ...] --out artifacts/game/screen.csv
-    uv run python scripts/run_load_screen.py RUNDIR --halves     # score each half separately
+    uv run python scripts/run_load_screen.py RUNDIR --asset standing_climbmix_small_16x2048
 """
 
 import argparse
@@ -22,27 +22,20 @@ from pathlib import Path
 
 import numpy as np
 
-from moe_congestion_routing.metrics.probe_comparison import CONCENTRATION_LIMIT
+from moe_congestion_routing.metrics.probe_comparison import CONCENTRATION_LIMIT, probe_units
 from moe_congestion_routing.metrics.probe_series import read_dump, read_series
 
 # Single-sourced, so the screen this prints and the gate the analysis enforces cannot drift apart.
 CONCENTRATION_WARN = CONCENTRATION_LIMIT
 
 
-def rows_for_dump(path: str, halves: bool) -> list:
+def rows_for_dump(path: str) -> list:
     dump = read_dump(path)
     routing = dump.routing_map()
     tokens = routing.shape[1]
-    cuts = (
-        [(0, tokens, "all")]
-        if not halves
-        else [
-            (0, tokens // 2, "h1"),
-            (tokens // 2, tokens, "h2"),
-        ]
-    )
+    cuts = probe_units(tokens)
     out = []
-    for start, stop, name in cuts:
+    for name, start, stop in cuts:
         n = stop - start
         balanced = n * dump.topk / routing.shape[2]
         for axis, layer in enumerate(dump.layer_numbers):
@@ -68,22 +61,27 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dirs", nargs="+", metavar="RUNDIR")
     parser.add_argument("--out", help="CSV path; prints a summary either way")
-    parser.add_argument("--halves", action="store_true", help="score each half separately")
+    parser.add_argument(
+        "--asset", help="dump directory stem, required when a run probed more than one"
+    )
     parser.add_argument("--step", type=int, action="append", dest="steps")
     args = parser.parse_args()
 
     rows = []
     for run_dir in args.run_dirs:
-        series = read_series(run_dir)
+        series = read_series(run_dir, asset=args.asset)
         dumps = series.dumps
         if args.steps:
             dumps = [d for d in dumps if d.step in args.steps]
         for dump in dumps:
-            rows.extend(rows_for_dump(str(dump.path), args.halves))
+            rows.extend(rows_for_dump(str(dump.path)))
 
     flagged = 0
     for run_dir in args.run_dirs:
-        for part in ("all", "h1", "h2"):
+        parts = sorted(
+            {r["part"] for r in rows if r["dump"].startswith(run_dir)}, key=lambda p: int(p[1:])
+        )
+        for part in parts:
             sel = [r for r in rows if r["dump"].startswith(run_dir) and r["part"] == part]
             if not sel:
                 continue

@@ -36,8 +36,8 @@ WINDOWS = (3, 5, 7)
 LAGS = (1, 2, 4, 8, 12, 16)
 
 
-def rows_for_run(run_dir: str, eta: float) -> list:
-    series = read_series(run_dir)
+def rows_for_run(run_dir: str, eta: float, asset: str | None) -> list:
+    series = read_series(run_dir, asset=asset)
     dumps = series.dumps
     steps = np.array([d.step for d in dumps])
     gaps = np.unique(np.diff(steps))
@@ -84,12 +84,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dirs", nargs="+", metavar="RUNDIR")
     parser.add_argument("--eta", type=float, default=1.0e-3, help="moe_router_bias_update_rate")
+    parser.add_argument(
+        "--asset", help="dump directory stem, required when a run probed more than one"
+    )
     parser.add_argument("--out")
     args = parser.parse_args()
 
     rows = []
     for run_dir in args.run_dirs:
-        rows.extend(rows_for_run(run_dir, args.eta))
+        rows.extend(rows_for_run(run_dir, args.eta, args.asset))
 
     gap = rows[0]["step_gap"]
     print(f"dump gap {gap} steps: memoryless floor {np.sqrt(gap):.1f} eta, pure drift {gap} eta\n")

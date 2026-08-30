@@ -81,7 +81,9 @@ def _rows_for_path(job: tuple) -> list:
     )
 
 
-def _benchmark(run_dir: str, num_parts: int, split: str, seed: int | None) -> None:
+def _benchmark(
+    run_dir: str, num_parts: int, split: str, seed: int | None, asset: str | None
+) -> None:
     """Time one full-batch LP solve and one part solve, so a machine can be compared to another.
 
     Prints the shapes alongside the seconds, because a solve time means nothing without them, and
@@ -91,7 +93,7 @@ def _benchmark(run_dir: str, num_parts: int, split: str, seed: int | None) -> No
 
     from moe_congestion_routing.game import lp
 
-    series = read_series(run_dir)
+    series = read_series(run_dir, asset=asset)
     dump = series.dumps[-1]
     affinities = dump.affinities()
     layer_a = affinities[0]
@@ -126,6 +128,9 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("run_dir", metavar="RUNDIR", help="a run directory holding probes/*.npz")
+    parser.add_argument(
+        "--asset", help="dump directory stem, required when a run probed more than one"
+    )
     parser.add_argument(
         "--bias-update-rate",
         type=float,
@@ -168,12 +173,12 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.benchmark:
-        _benchmark(args.run_dir, args.parts, args.split, args.split_seed)
+        _benchmark(args.run_dir, args.parts, args.split, args.split_seed, args.asset)
         return
     if args.bias_update_rate is None or args.out is None:
         parser.error("--bias-update-rate and --out are required unless --benchmark is given")
 
-    series = read_series(args.run_dir)
+    series = read_series(args.run_dir, asset=args.asset)
     dumps = series.dumps
     if args.steps:
         by_step = {dump.step: dump for dump in dumps}

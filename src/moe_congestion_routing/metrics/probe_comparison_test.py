@@ -7,10 +7,12 @@ from moe_congestion_routing.game.alflb import top_k_map
 from moe_congestion_routing.metrics import probe_comparison
 from moe_congestion_routing.metrics.probe_comparison import (
     DUAL_SPREAD_GATE,
+    UNIT_TOKENS,
     gated_dual_agreement,
     internalization_rows,
     part_indices,
     price_stability_rows_for_dump,
+    probe_units,
     verification_rows,
 )
 from moe_congestion_routing.metrics.probe_dump_format import ROUTING_MAP_BITORDER
@@ -516,3 +518,29 @@ def test_screen_batch_refuses_concentration_and_dead_experts():
     assert dead.dead_experts == 1
     assert dead.max_load_over_balanced <= probe_comparison.CONCENTRATION_LIMIT
     assert "zero tokens" in dead.reason
+
+
+# --- probe_units ---------------------------------------------------------------------
+
+
+def test_probe_units_covers_one_unit_exactly():
+    assert probe_units(UNIT_TOKENS) == [("u0", 0, UNIT_TOKENS)]
+
+
+def test_probe_units_covers_two_units_named_u0_and_u1():
+    assert probe_units(2 * UNIT_TOKENS) == [
+        ("u0", 0, UNIT_TOKENS),
+        ("u1", UNIT_TOKENS, 2 * UNIT_TOKENS),
+    ]
+
+
+def test_probe_units_raises_on_a_partial_unit():
+    with pytest.raises(ValueError, match="8192"):
+        probe_units(8192)
+
+
+def test_probe_units_raises_on_zero_or_negative():
+    with pytest.raises(ValueError):
+        probe_units(0)
+    with pytest.raises(ValueError):
+        probe_units(-UNIT_TOKENS)

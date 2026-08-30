@@ -35,12 +35,15 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from moe_congestion_routing.game import lp
-from moe_congestion_routing.metrics.probe_comparison import half_split_row, screen_batch
-from moe_congestion_routing.metrics.probe_series import read_dump, read_series
+from moe_congestion_routing.metrics.probe_comparison import (
+    UNIT_TOKENS,
+    half_split_row,
+    screen_batch,
+)
+from moe_congestion_routing.metrics.probe_series import probe_dump_path, read_dump, read_series
 
 RUN_A = "artifacts/exp1/alflb/20260819-195028"  # tail asset, S=8
 RUN_B = "artifacts/exp1/alflb/20260824-232033"  # strided asset, S=16
-UNIT_TOKENS = 16384
 
 FIELDS = [
     "step",
@@ -65,8 +68,8 @@ FIELDS = [
 def _cell(job: tuple) -> dict:
     """One (step, layer). Screens both units first, and only then pays for two LP solves."""
     step, axis, resamples, seed = job
-    a = read_dump(f"{RUN_A}/probes/iter_{step:07d}.npz")
-    b = read_dump(f"{RUN_B}/probes/iter_{step:07d}.npz")
+    a = read_dump(probe_dump_path(RUN_A, step))
+    b = read_dump(probe_dump_path(RUN_B, step))
     layer = int(a.layer_numbers[axis])
 
     # Run A's tail dump is one unit. Run B's strided dump is twice the size, and its FIRST half is

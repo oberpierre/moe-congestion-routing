@@ -30,9 +30,9 @@ import numpy as np
 
 from moe_congestion_routing.game import lp
 from moe_congestion_routing.game.compare import dual_agreement
-from moe_congestion_routing.metrics.probe_series import read_dump
+from moe_congestion_routing.metrics.probe_comparison import UNIT_TOKENS
+from moe_congestion_routing.metrics.probe_series import probe_dump_path, read_dump
 
-UNIT_TOKENS = 16384
 CACHE = Path("artifacts/game/crossprobe_duals.npz")
 OUT_CSV = Path("artifacts/game/crossprobe_units.csv")
 
@@ -93,8 +93,9 @@ def main() -> None:
 
     jobs, missing = [], []
     for key, cell, half in UNITS:
-        path = f"artifacts/exp1/crossprobe/{cell}/probes/iter_0000000.npz"
-        if not Path(path).exists():
+        try:
+            path = probe_dump_path(f"artifacts/exp1/crossprobe/{cell}", 0)
+        except FileNotFoundError:
             missing.append(cell)
             continue
         for axis in range(8):
