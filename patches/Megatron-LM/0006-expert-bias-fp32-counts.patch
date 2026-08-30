@@ -1,0 +1,59 @@
+# Patch: Restore local_tokens_per_expert to float32 alongside expert_bias
+# ==================================
+# Problem: TopKRouter.__init__ registers both `expert_bias` and `local_tokens_per_expert` as
+#   float32 buffers, but Float16Module.__init__ calls module.bfloat16(), which
+#   nn.Module._apply() casts every registered buffer to regardless of its declared dtype.
+#   `_maintain_float32_expert_bias` restores only `expert_bias`, leaving the token-count
+#   accumulator in bf16. `get_updated_expert_bias`'s `offset = average_tokens -
+#   tokens_per_expert` and its `torch.sign(offset)` then evaluate in bf16, whose spacing (32 at
+#   the mean count under base_local, 512 under base_cluster) is comparable to the imbalance
+#   ALF-LB is meant to correct near the mean, occasionally flipping or zeroing the sign of a
+#   step near it. Megatron's own docstring on `_maintain_float32_expert_bias` ("Maintain the
+#   expert bias in float32... to avoid routing errors when updating the expert_bias") already
+#   states this is meant to protect the whole bias-update computation, not just the bias buffer
+#   itself, so this patch is closing a gap in that method's own stated intent.
+#
+# What this patch does:
+#   - router.py: `_maintain_float32_expert_bias` also re-casts `local_tokens_per_expert` to
+#     float32 whenever Float16Module has quantized it, using the same hasattr/dtype-check shape
+#     already used for `expert_bias`. The fix sits in the buffer's own maintenance hook rather
+#     than at `get_updated_expert_bias`'s `offset` computation or the `finalize_model_grads`
+#     call site, because either of those would correct the step size while leaving the
+#     accumulated counts themselves quantized, so a wrong-direction sign flip near the mean
+#     would still occur before the cast ever runs.
+#
+# Where in the code:
+#   File: megatron/core/transformer/moe/router.py
+#   Function: TopKRouter._maintain_float32_expert_bias()
+#   Location: immediately after the existing `expert_bias` cast (~line 242), before
+#     `sinkhorn_load_balancing`.
+#
+# How to fix on a future version:
+#   Find `_maintain_float32_expert_bias` in router.py and confirm it still only restores
+#   `expert_bias`. Add the same guarded re-cast for `local_tokens_per_expert`, or for whatever
+#   buffer `_apply_expert_bias` accumulates raw token counts into on that version.
+#
+# Applied to: Megatron-LM core_v0.18.0
+#
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 1ebe6953d..a6ebd4d3c 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -240,6 +240,17 @@ class TopKRouter(Router):
+         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
+             if self.expert_bias.dtype != torch.float32:
+                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
++        # local_tokens_per_expert accumulates raw token counts with += across a step
++        # (moe_congestion_routing patch). Float16Module.__init__ calls module.bfloat16(),
++        # which recasts every registered buffer regardless of its declared dtype, so left
++        # unfixed here it silently quantizes counts to the bf16 grid (spacing 32 at the
++        # mean count under base_local, 512 under base_cluster) before get_updated_expert_bias
++        # ever sees them, corrupting both the bias step size and its sign near the mean.
++        if hasattr(self, 'local_tokens_per_expert') and self.local_tokens_per_expert is not None:
++            if self.local_tokens_per_expert.dtype != torch.float32:
++                self.local_tokens_per_expert.data = self.local_tokens_per_expert.data.to(
++                    torch.float32
++                )
+ 
+     def sinkhorn_load_balancing(self, logits: torch.Tensor):
+         """Apply sinkhorn routing to the logits tensor.
