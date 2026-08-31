@@ -1,0 +1,28 @@
+# Tracked pre-flight for every future bias-arm launch: proves a run that stores an
+# expert_bias produces per-asset probe dumps every bias-gated offline stage (S8) reads
+# without error, on the local GPU, before committing an 11.5B-token ALF-LB run to it.
+extends: /home/pierre/projects/moe-congestion-routing/configs/train/base_local.yaml
+
+# alflb.yaml's bias settings, verbatim.
+moe_router_load_balancing_type: none
+moe_aux_loss_coeff: 0.0
+moe_router_enable_expert_bias: true
+moe_router_score_function: sigmoid
+moe_router_bias_update_rate: 1.0e-3
+
+seq_length: 2048          # the committed standing assets are 16x2048
+train_iters: 12
+exit_interval: 12
+save_interval: 12
+
+moe_probe_coarse_interval: 4
+moe_probe_seqs: 16
+moe_probe_batch:
+  - assets/probe/standing_climbmix_small_16x2048.npz
+  - assets/probe/standing_climbmix_small_strided_16x2048.npz
+  - assets/probe/standing_climbmix_small_spread_off1_16x2048.npz
+
+# moe_probe_dir left unset so the launcher derives <run_dir>/probes, exercising that
+# derivation rather than a config-supplied path.
+
+output_dir: artifacts/exp1/alflb_local_smoke
