@@ -488,3 +488,175 @@ def screen_batch(routing_map: np.ndarray, topk: int) -> BatchScreen:
     if ratio > CONCENTRATION_LIMIT:
         return BatchScreen(False, ratio, dead, f"busiest expert at {ratio:.2f}x balanced load")
     return BatchScreen(True, ratio, dead, "")
+
+
+def longest_admissible_run(steps: Sequence[int], admissible: Sequence[bool]) -> list[int]:
+    """The longest stretch of admissible steps spaced evenly at this series' own cadence.
+
+    A lag shift indexes by dump position, so a stretch only means what it claims when every
+    consecutive pair inside it is one dump apart. On the committed ALF-LB probes, two layers are
+    admissible at step 0 and then not again until step 75, and treating that as one run would
+    silently make ``lag_dumps = 1`` mean 75 training steps there and 25 everywhere else.
+    """
+    if len(steps) != len(admissible):
+        raise ValueError(f"steps has {len(steps)} entries but admissible has {len(admissible)}")
+    spacing = min((b - a for a, b in zip(steps, steps[1:], strict=False)), default=1)
+    best: list[int] = []
+    current: list[int] = []
+    for step, ok in zip(steps, admissible, strict=True):
+        if ok and current and step - current[-1] == spacing:
+            current.append(step)
+        elif ok:
+            current = [step]
+        else:
+            current = []
+        if len(current) > len(best):
+            best = list(current)
+    return best
+
+
+def _validate_price_lag_inputs(
+    steps: Sequence[int], bias: np.ndarray, duals: np.ndarray, max_lag: int
+) -> int:
+    """Shared shape and range checks for both price-lag row builders. Returns ``len(steps)``."""
+    n = len(steps)
+    if bias.shape[0] != n or duals.shape[0] != n:
+        raise ValueError(
+            f"steps has {n} entries but bias/duals have {bias.shape[0]}/{duals.shape[0]}"
+        )
+    if n < 2 * max_lag + 1:
+        raise ValueError(
+            f"n_steps {n} is too short for max_lag {max_lag}: need at least {2 * max_lag + 1}"
+        )
+    return n
+
+
+def _price_lag_correlations(
+    bias: np.ndarray, duals: np.ndarray, k: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-``t`` forward/backward correlations at signed lag ``k``, on their common overlap.
+
+    Both directions read the same dump positions, ``[|k|, n - 1 - |k|]``, because training is not
+    stationary, so letting each direction keep its own maximal range would turn a lag measurement
+    into a trend artifact between the start and the end of the run. Returns the dump-position
+    index alongside both correlation arrays so a caller can name the literal training step.
+    """
+    n = bias.shape[0]
+    m = abs(k)
+    positions = np.arange(m, n - m)
+    forward = np.array([_centred_corr(bias[t], duals[t - k]) for t in positions])
+    backward = np.array([_centred_corr(bias[t], duals[t + k]) for t in positions])
+    return positions, forward, backward
+
+
+class PriceLagRow(NamedTuple):
+    """One ``(run, layer, lag_dumps)``: the asymmetry ``A(k) = c(+k) - c(-k)``.
+
+    ``c_forward`` is ``corr(b(t), p*(t - k))`` and ``c_backward`` is ``corr(b(t), p*(t + k))``,
+    each the mean over ``t`` of a per-``t`` correlation across the 64 experts. The lag hypothesis
+    predicts ``asymmetry > 0`` at small positive ``lag_dumps``, and a null here bounds the lag
+    below the dump spacing rather than refuting it.
+    """
+
+    run: str
+    layer: int
+    n_steps: int
+    lag_dumps: int
+    lag_steps: int
+    c_forward: float
+    c_backward: float
+    asymmetry: float
+    pairs: int
+
+
+class PriceLagStepRow(NamedTuple):
+    """One ``(run, layer, lag_dumps, t)``: the per-step correlation a :class:`PriceLagRow` means.
+
+    A sign judgement built from as few as 9 correlations cannot be read off a bare mean, so these
+    travel with the summary rather than being recomputed later, which would need a fresh LP solve
+    per cell.
+    """
+
+    run: str
+    layer: int
+    lag_dumps: int
+    lag_steps: int
+    t: int
+    c_forward: float
+    c_backward: float
+    asymmetry: float
+
+
+def price_lag_rows(
+    steps: Sequence[int],
+    bias: np.ndarray,
+    duals: np.ndarray,
+    *,
+    run: str,
+    layer: int,
+    max_lag: int,
+) -> list[PriceLagRow]:
+    """The asymmetry statistic for ``lag_dumps`` in ``-max_lag..max_lag``, one row each.
+
+    ``steps``, ``bias`` ``[n, experts]`` and ``duals`` ``[n, experts]`` must already be the one
+    contiguous, evenly spaced admissible run this ``(run, layer)`` owns: use
+    :func:`longest_admissible_run` first. ``argmax_k`` of either correlation is never reported
+    here, because it is dominated by how smooth the price series is rather than by any lag.
+    """
+    n = _validate_price_lag_inputs(steps, bias, duals, max_lag)
+    spacing = steps[1] - steps[0] if n > 1 else 0
+    rows = []
+    for k in range(-max_lag, max_lag + 1):
+        _, forward, backward = _price_lag_correlations(bias, duals, k)
+        c_forward = float(np.mean(forward))
+        c_backward = float(np.mean(backward))
+        rows.append(
+            PriceLagRow(
+                run=run,
+                layer=layer,
+                n_steps=n,
+                lag_dumps=k,
+                lag_steps=k * spacing,
+                c_forward=c_forward,
+                c_backward=c_backward,
+                asymmetry=c_forward - c_backward,
+                pairs=len(forward),
+            )
+        )
+    return rows
+
+
+def price_lag_per_step_rows(
+    steps: Sequence[int],
+    bias: np.ndarray,
+    duals: np.ndarray,
+    *,
+    run: str,
+    layer: int,
+    max_lag: int,
+) -> list[PriceLagStepRow]:
+    """The per-``t`` correlations that :func:`price_lag_rows` reports the mean of.
+
+    Same inputs and the same restriction to one contiguous admissible run, so every
+    :class:`PriceLagRow` reconciles exactly against the rows this returns for its
+    ``(run, layer, lag_dumps)``.
+    """
+    n = _validate_price_lag_inputs(steps, bias, duals, max_lag)
+    spacing = steps[1] - steps[0] if n > 1 else 0
+    rows = []
+    for k in range(-max_lag, max_lag + 1):
+        positions, forward, backward = _price_lag_correlations(bias, duals, k)
+        for pos, c_f, c_b in zip(positions, forward, backward, strict=True):
+            rows.append(
+                PriceLagStepRow(
+                    run=run,
+                    layer=layer,
+                    lag_dumps=k,
+                    lag_steps=k * spacing,
+                    t=steps[pos],
+                    c_forward=float(c_f),
+                    c_backward=float(c_b),
+                    asymmetry=float(c_f - c_b),
+                )
+            )
+    return rows

@@ -544,3 +544,128 @@ def test_probe_units_raises_on_zero_or_negative():
         probe_units(0)
     with pytest.raises(ValueError):
         probe_units(-UNIT_TOKENS)
+
+
+# --- price lag: the contiguous-run rule -----------------------------------------------------
+
+
+def test_longest_admissible_run_drops_an_isolated_point_ahead_of_a_gap():
+    """The defect the committed data actually contains: admissible at step 0, then not again
+    until step 75. The run starting at 75 is 18 long and must win over the isolated point at 0,
+    which would otherwise be counted as step 1 of a spuriously 19-long, unevenly spaced run."""
+    steps = list(range(0, 501, 25))
+    admissible = [s == 0 or s >= 75 for s in steps]
+
+    run = probe_comparison.longest_admissible_run(steps, admissible)
+
+    assert run == list(range(75, 501, 25))
+    assert len(run) == 18
+
+
+def test_longest_admissible_run_on_a_sparse_admissible_only_input():
+    """The same rule stated the other way: given only the admissible steps themselves (no
+    explicit False entries for the gap), the spacing is still inferred correctly."""
+    run = probe_comparison.longest_admissible_run([0, 75, 100, 125, 150], [True] * 5)
+
+    assert run == [75, 100, 125, 150]
+
+
+def test_longest_admissible_run_is_empty_when_nothing_is_admissible():
+    assert probe_comparison.longest_admissible_run([0, 25, 50], [False, False, False]) == []
+
+
+# --- price lag: the asymmetry statistic -------------------------------------------------------
+
+
+def _smooth_price_series(
+    seed: int, n_steps: int, experts: int, scale: float = 0.3
+) -> numpy.ndarray:
+    """A random walk per expert: autocorrelated in time, so its shape alone cannot fake a lag."""
+    rng = numpy.random.default_rng(seed)
+    return numpy.cumsum(rng.normal(scale=scale, size=(n_steps, experts)), axis=0)
+
+
+def test_price_lag_asymmetry_peaks_at_the_injected_lag():
+    """A bias that is an exact lagged copy of the price must show its largest positive
+    asymmetry at exactly the injected lag, because c_forward(lag) compares b(t) to the very
+    price sample it was copied from and so is a perfect match nowhere else."""
+    n_steps, experts, max_lag, lag = 60, 40, 5, 3
+    price = _smooth_price_series(seed=0, n_steps=n_steps, experts=experts)
+    bias = numpy.roll(price, lag, axis=0)
+    steps = list(range(n_steps))
+
+    rows = probe_comparison.price_lag_rows(steps, bias, price, run="A", layer=2, max_lag=max_lag)
+    by_lag = {row.lag_dumps: row for row in rows}
+
+    assert by_lag[lag].c_forward == pytest.approx(1.0, abs=1e-9)
+    positive_lags = [k for k in by_lag if k > 0]
+    assert max(positive_lags, key=lambda k: by_lag[k].asymmetry) == lag
+    assert by_lag[lag].asymmetry > 0.1
+    assert by_lag[0].asymmetry == pytest.approx(0.0, abs=1e-12)
+
+
+def test_price_lag_asymmetry_is_near_zero_for_an_unlagged_noisy_bias():
+    """The null this design exists to separate from a real lag: a bias that reads the SAME
+    step's price plus independent noise. A symmetric confound (price's own smoothness) must
+    cancel in the difference, leaving every asymmetry small regardless of lag_dumps."""
+    n_steps, experts, max_lag = 60, 40, 5
+    # One rng stream for both draws, because two independently seeded generators with the same
+    # seed are not the same stream and produced a noticeably noisier (and flaky) null in practice.
+    rng = numpy.random.default_rng(1)
+    price = numpy.cumsum(rng.normal(scale=0.3, size=(n_steps, experts)), axis=0)
+    bias = price + rng.normal(scale=0.5, size=(n_steps, experts))
+    steps = list(range(n_steps))
+
+    rows = probe_comparison.price_lag_rows(steps, bias, price, run="A", layer=2, max_lag=max_lag)
+
+    assert max(abs(row.asymmetry) for row in rows) < 0.05
+
+
+def test_price_lag_rows_count_and_lag_steps_scale_with_spacing():
+    n_steps, experts, max_lag, spacing = 20, 8, 4, 25
+    price = _smooth_price_series(seed=2, n_steps=n_steps, experts=experts)
+    bias = numpy.roll(price, 1, axis=0)
+    steps = [i * spacing for i in range(n_steps)]
+
+    rows = probe_comparison.price_lag_rows(steps, bias, price, run="B", layer=6, max_lag=max_lag)
+
+    assert len(rows) == 2 * max_lag + 1
+    assert {row.lag_dumps for row in rows} == set(range(-max_lag, max_lag + 1))
+    assert all(row.n_steps == n_steps for row in rows)
+    assert all(row.run == "B" and row.layer == 6 for row in rows)
+    for row in rows:
+        assert row.lag_steps == row.lag_dumps * spacing
+        assert row.pairs == n_steps - 2 * abs(row.lag_dumps)
+
+
+def test_price_lag_rows_raises_on_a_shape_mismatch_or_too_short_a_series():
+    price = _smooth_price_series(seed=3, n_steps=10, experts=6)
+    bias = numpy.roll(price, 1, axis=0)
+    with pytest.raises(ValueError, match="entries but bias/duals"):
+        probe_comparison.price_lag_rows(list(range(9)), bias, price, run="A", layer=2, max_lag=2)
+    with pytest.raises(ValueError, match="too short"):
+        probe_comparison.price_lag_rows(list(range(10)), bias, price, run="A", layer=2, max_lag=5)
+
+
+def test_price_lag_per_step_rows_reconcile_with_the_summary():
+    """Every summary row's `pairs` and `asymmetry` must be exactly recoverable from the per-step
+    rows sharing its `lag_dumps`, because a sign judgement drawn from as few as 9 correlations is
+    read from the per-step file, not from a mean nobody can check."""
+    n_steps, experts, max_lag = 30, 12, 3
+    price = _smooth_price_series(seed=4, n_steps=n_steps, experts=experts)
+    bias = numpy.roll(price, 2, axis=0)
+    steps = list(range(n_steps))
+
+    summary = probe_comparison.price_lag_rows(steps, bias, price, run="A", layer=4, max_lag=max_lag)
+    per_step = probe_comparison.price_lag_per_step_rows(
+        steps, bias, price, run="A", layer=4, max_lag=max_lag
+    )
+
+    for row in summary:
+        matching = [r for r in per_step if r.lag_dumps == row.lag_dumps]
+        assert len(matching) == row.pairs
+        assert numpy.mean([r.asymmetry for r in matching]) == pytest.approx(row.asymmetry)
+        assert numpy.mean([r.c_forward for r in matching]) == pytest.approx(row.c_forward)
+        assert numpy.mean([r.c_backward for r in matching]) == pytest.approx(row.c_backward)
+        assert all(r.run == "A" and r.layer == 4 for r in matching)
+        assert all(r.lag_steps == row.lag_steps for r in matching)

@@ -23,6 +23,14 @@ uncalibrated contamination of that order.
 Every unit is screened before it is priced, and a refused unit is emitted with `admissible = False`
 and NaN statistics rather than dropped.
 
+`--dump-duals PATH` additionally writes one `.npz`, for every requested `(step, layer)` cell,
+carrying `duals_a`/`duals_b` (run A's tail / run B's strided-second-half capacity duals),
+`bias_a`/`bias_b` (each run's own stored bias) and `admissible_a`/`admissible_b` from `screen_a`
+and `screen_b` separately, so a later within-run analysis is not limited to the conjunction the
+CSV's `admissible` column records. It does not change any value the CSV writes: the duals are a
+side effect of the LP solves this script already pays for, or, when only one side of a cell's
+conjunction is admissible, one extra solve for that side alone.
+
 Usage:
     uv run python scripts/run_kappa_trajectory.py --out artifacts/game/kappa_trajectory.csv
 """
@@ -33,6 +41,8 @@ import multiprocessing
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+
+import numpy as np
 
 from moe_congestion_routing.game import lp
 from moe_congestion_routing.metrics.probe_comparison import (
@@ -65,9 +75,13 @@ FIELDS = [
 ]
 
 
-def _cell(job: tuple) -> dict:
-    """One (step, layer). Screens both units first, and only then pays for two LP solves."""
-    step, axis, resamples, seed = job
+def _cell(job: tuple) -> tuple[dict, dict | None]:
+    """One (step, layer). Screens both units first, and only then pays for two LP solves.
+
+    Returns the CSV row unchanged by ``dump_duals`` and, only when it is set, a second dict of
+    this cell's own duals/bias/admissibility for the price-lag `.npz`.
+    """
+    step, axis, resamples, seed, dump_duals = job
     a = read_dump(probe_dump_path(RUN_A, step))
     b = read_dump(probe_dump_path(RUN_B, step))
     layer = int(a.layer_numbers[axis])
@@ -87,15 +101,49 @@ def _cell(job: tuple) -> dict:
         load_ratio_tail=round(screen_a.max_load_over_balanced, 4),
         load_ratio_strided=round(screen_b.max_load_over_balanced, 4),
     )
+
+    duals_payload = None
+    if dump_duals:
+        num_experts = a.num_experts
+        # Solved per side of the conjunction rather than only when both pass, because a within-run
+        # price-lag reader needs each run's own usable steps and the conjunction the CSV records
+        # below discards a step whenever only the other run's screen fails.
+        duals_a = (
+            lp.solve(a.affinities()[axis][:UNIT_TOKENS], a.topk).capacity_duals
+            if screen_a.admissible
+            else np.full(num_experts, np.nan)
+        )
+        duals_b = (
+            lp.solve(b.affinities()[axis][UNIT_TOKENS:], b.topk).capacity_duals
+            if screen_b.admissible
+            else np.full(num_experts, np.nan)
+        )
+        duals_payload = {
+            "step": step,
+            "layer": layer,
+            "duals_a": duals_a,
+            "duals_b": duals_b,
+            "bias_a": a.expert_bias()[axis],
+            "bias_b": b.expert_bias()[axis],
+            "admissible_a": screen_a.admissible,
+            "admissible_b": screen_b.admissible,
+        }
+
     if not (screen_a.admissible and screen_b.admissible):
         reason = "; ".join(x for x in (screen_a.reason, screen_b.reason) if x)
         row.update(admissible=False, refused_reason=reason)
         for f in FIELDS[7:]:
             row[f] = float("nan")
-        return row
+        return row, duals_payload
 
-    duals_tail = lp.solve(a.affinities()[axis][:UNIT_TOKENS], a.topk).capacity_duals
-    duals_strided = lp.solve(b.affinities()[axis][UNIT_TOKENS:], b.topk).capacity_duals
+    # Both sides passed, so the dump-duals solves above (when requested) are exactly the tail and
+    # strided duals this branch needs, and reusing them pays for no LP solve twice.
+    if dump_duals:
+        duals_tail = duals_payload["duals_a"]
+        duals_strided = duals_payload["duals_b"]
+    else:
+        duals_tail = lp.solve(a.affinities()[axis][:UNIT_TOKENS], a.topk).capacity_duals
+        duals_strided = lp.solve(b.affinities()[axis][UNIT_TOKENS:], b.topk).capacity_duals
     stats = half_split_row(
         a.expert_bias()[axis],
         duals_tail,
@@ -118,7 +166,7 @@ def _cell(job: tuple) -> dict:
         kappa_boot_high=stats.kappa_boot_high,
         kappa_boot_undefined=stats.kappa_boot_undefined,
     )
-    return row
+    return row, duals_payload
 
 
 def main() -> None:
@@ -128,6 +176,11 @@ def main() -> None:
     parser.add_argument("--resamples", type=int, default=4000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--jobs", type=int, default=8)
+    parser.add_argument(
+        "--dump-duals",
+        default=None,
+        help="also write duals_a/b, bias_a/b and admissible_a/b for every cell to this .npz",
+    )
     args = parser.parse_args()
 
     steps_a = {d.step for d in read_series(RUN_A).dumps}
@@ -135,11 +188,16 @@ def main() -> None:
     steps = sorted(steps_a & steps_b)
     if args.steps:
         steps = [s for s in steps if s in set(args.steps)]
-    jobs = [(s, axis, args.resamples, args.seed) for s in steps for axis in range(8)]
+    jobs = [
+        (s, axis, args.resamples, args.seed, bool(args.dump_duals))
+        for s in steps
+        for axis in range(8)
+    ]
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     written = refused = 0
+    duals_records: list[dict] = []
     with (
         open(out, "w", newline="") as handle,
         ProcessPoolExecutor(
@@ -150,13 +208,31 @@ def main() -> None:
         writer.writeheader()
         handle.flush()
         print(f"{len(jobs)} cells over {len(steps)} steps", file=sys.stderr, flush=True)
-        for row in executor.map(_cell, jobs):
+        for row, duals_payload in executor.map(_cell, jobs):
             writer.writerow(row)
             handle.flush()
             written += 1
             refused += 0 if row["admissible"] is True else 1
+            if duals_payload is not None:
+                duals_records.append(duals_payload)
             print(f"  {written}/{len(jobs)}", file=sys.stderr, flush=True)
     print(f"wrote {out}: {written} rows, {refused} refused by the screen")
+
+    if args.dump_duals:
+        dump_path = Path(args.dump_duals)
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            dump_path,
+            steps=np.array([d["step"] for d in duals_records]),
+            layers=np.array([d["layer"] for d in duals_records]),
+            duals_a=np.stack([d["duals_a"] for d in duals_records]),
+            duals_b=np.stack([d["duals_b"] for d in duals_records]),
+            bias_a=np.stack([d["bias_a"] for d in duals_records]),
+            bias_b=np.stack([d["bias_b"] for d in duals_records]),
+            admissible_a=np.array([d["admissible_a"] for d in duals_records]),
+            admissible_b=np.array([d["admissible_b"] for d in duals_records]),
+        )
+        print(f"wrote {dump_path}: {len(duals_records)} cells")
 
 
 if __name__ == "__main__":
