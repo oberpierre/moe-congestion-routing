@@ -669,3 +669,39 @@ def test_price_lag_per_step_rows_reconcile_with_the_summary():
         assert numpy.mean([r.c_backward for r in matching]) == pytest.approx(row.c_backward)
         assert all(r.run == "A" and r.layer == 4 for r in matching)
         assert all(r.lag_steps == row.lag_steps for r in matching)
+
+
+def test_segment_autocorr_matches_the_pooled_formula_at_segments_1():
+    """`segments=1` must reproduce exactly the pooled per-expert-mean formula `run_bias_jitter.py`
+    already reports as `lag1_autocorr`, so the new path and the old one agree where they must."""
+    rng = numpy.random.default_rng(7)
+    deltas = rng.normal(size=(20, 5))
+
+    (segment_index, start, n_diffs, autocorr) = probe_comparison.segment_autocorr(
+        deltas, segments=1
+    )[0]
+
+    expected = numpy.mean([numpy.corrcoef(deltas[:-1, e], deltas[1:, e])[0, 1] for e in range(5)])
+    assert segment_index == 0
+    assert start == 0
+    assert n_diffs == 20
+    assert autocorr == pytest.approx(expected)
+
+
+def test_segment_autocorr_splits_into_nearly_equal_contiguous_chunks():
+    rng = numpy.random.default_rng(8)
+    deltas = rng.normal(size=(20, 3))
+
+    rows = probe_comparison.segment_autocorr(deltas, segments=2)
+
+    assert [r[0] for r in rows] == [0, 1]
+    assert [r[1] for r in rows] == [0, 10]
+    assert [r[2] for r in rows] == [10, 10]
+
+
+def test_segment_autocorr_raises_when_a_segment_would_be_too_thin():
+    rng = numpy.random.default_rng(9)
+    deltas = rng.normal(size=(20, 3))
+
+    with pytest.raises(ValueError, match="below the minimum"):
+        probe_comparison.segment_autocorr(deltas, segments=3, min_per_segment=8)

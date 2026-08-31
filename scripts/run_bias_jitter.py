@@ -29,11 +29,19 @@ from pathlib import Path
 
 import numpy as np
 
+from moe_congestion_routing.metrics.probe_comparison import segment_autocorr
 from moe_congestion_routing.metrics.probe_series import read_series
 
 WINDOWS = (3, 5, 7)
 # Lags in dumps. The series is 21 dumps, so lag 16 is the longest with enough pairs to average.
 LAGS = (1, 2, 4, 8, 12, 16)
+
+DEFAULT_AUTOCORR_OUT = "assets/results/bias-autocorr_both-runs_segmented.csv"
+# The committed cross-asset kappa trajectory, joined by layer for the second registered prediction.
+DEFAULT_KAPPA_CSV = "assets/results/kappa-trajectory_cross-asset_21-steps.csv"
+# The registered window for kappa's decay rate: after the early rise and before the run ends.
+KAPPA_SLOPE_STEP_LO = 100
+KAPPA_SLOPE_STEP_HI = 500
 
 
 def rows_for_run(run_dir: str, eta: float, asset: str | None) -> list:
@@ -80,6 +88,97 @@ def rows_for_run(run_dir: str, eta: float, asset: str | None) -> list:
     return out
 
 
+def kappa_decay_rates(kappa_csv: str) -> dict[int, float]:
+    """Per-layer slope of `kappa` against step over `[KAPPA_SLOPE_STEP_LO, KAPPA_SLOPE_STEP_HI]`.
+
+    Read from the committed cross-asset trajectory rather than recomputed, so this and
+    `run_kappa_trajectory.py`'s own LP solves never disagree. `kappa` is a joint statistic over
+    both runs (`run_kappa_trajectory.py`'s `RUN_A`/`RUN_B`), so the rate is per layer only and is
+    joined onto both runs' rows here. Refused (non-admissible) cells are skipped rather than fit,
+    because their `kappa` is NaN.
+    """
+    by_layer: dict[int, list[tuple[int, float]]] = {}
+    with open(kappa_csv, newline="") as handle:
+        for row in csv.DictReader(handle):
+            step = int(row["step"])
+            if not (KAPPA_SLOPE_STEP_LO <= step <= KAPPA_SLOPE_STEP_HI):
+                continue
+            if row["admissible"] != "True":
+                continue
+            by_layer.setdefault(int(row["layer"]), []).append((step, float(row["kappa"])))
+    return {
+        layer: float(np.polyfit([s for s, _ in pairs], [k for _, k in pairs], 1)[0])
+        for layer, pairs in by_layer.items()
+    }
+
+
+def autocorr_rows_for_run(
+    run_dir: str,
+    asset: str | None,
+    segments: int,
+    kappa_rates: dict[int, float],
+) -> list[dict]:
+    """One row per `(layer, segment)` of this run: `segment_autocorr` joined to `kappa_decay_rate`.
+
+    Unlike `rows_for_run`'s pooled `lag1_autocorr`, this never divides by `eta`: an
+    autocorrelation is scale-invariant, and the registered predictions are about its sign and
+    level, not about a rate that the bf16 update path already distorts elsewhere.
+    """
+    series = read_series(run_dir, asset=asset)
+    dumps = series.dumps
+    steps = [d.step for d in dumps]
+    bias = np.stack([d.expert_bias() for d in dumps])  # [T, L, E]
+
+    out = []
+    for axis, layer in enumerate(dumps[0].layer_numbers):
+        diffs = np.diff(bias[:, axis, :], axis=0)
+        for segment_index, start, n_diffs, autocorr in segment_autocorr(diffs, segments=segments):
+            out.append(
+                {
+                    "run": run_dir,
+                    "layer": int(layer),
+                    "segments": segments,
+                    "segment_index": segment_index,
+                    "step_lo": steps[start],
+                    "step_hi": steps[start + n_diffs],
+                    "n_diffs": n_diffs,
+                    "lag1_autocorr": autocorr,
+                    "kappa_decay_rate": kappa_rates.get(int(layer), float("nan")),
+                }
+            )
+    return out
+
+
+def report_predictions(rows: list[dict]) -> None:
+    """Print the two registered predictions, with their signs and nothing more: no verdict.
+
+    Prediction 1 is the count of `(run, layer)` cells whose autocorrelation declines from the
+    first segment to the last. Prediction 2 is each layer's late-segment level next to its
+    `kappa` decay rate, so a reader can see whether the near-zero cells are the fast-decaying ones.
+    """
+    by_cell: dict[tuple[str, int], dict[int, float]] = {}
+    for row in rows:
+        by_cell.setdefault((row["run"], row["layer"]), {})[row["segment_index"]] = row[
+            "lag1_autocorr"
+        ]
+    declined = sum(1 for levels in by_cell.values() if levels[max(levels)] < levels[min(levels)])
+    print(
+        f"\nprediction 1: {declined}/{len(by_cell)} cells decline "
+        "from the first to the last segment"
+    )
+
+    last_segment = max(row["segment_index"] for row in rows)
+    print("\nprediction 2: late-segment lag1_autocorr beside this layer's kappa decay rate")
+    print(f"{'run':<12} {'L':>2} {'late autocorr':>14} {'kappa_decay_rate':>18}")
+    for row in sorted(rows, key=lambda r: (r["run"], r["layer"])):
+        if row["segment_index"] != last_segment:
+            continue
+        print(
+            f"{Path(row['run']).name:<12} {row['layer']:2d} "
+            f"{row['lag1_autocorr']:14.3f} {row['kappa_decay_rate']:18.5f}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dirs", nargs="+", metavar="RUNDIR")
@@ -88,6 +187,14 @@ def main() -> None:
         "--asset", help="dump directory stem, required when a run probed more than one"
     )
     parser.add_argument("--out")
+    parser.add_argument(
+        "--segments",
+        type=int,
+        default=2,
+        help="time segments the Delta-b series is split into for segment_autocorr",
+    )
+    parser.add_argument("--autocorr-out", default=DEFAULT_AUTOCORR_OUT)
+    parser.add_argument("--kappa-csv", default=DEFAULT_KAPPA_CSV)
     args = parser.parse_args()
 
     rows = []
@@ -120,6 +227,21 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(rows)
         print(f"\nwrote {out} ({len(rows)} rows)")
+
+    kappa_rates = kappa_decay_rates(args.kappa_csv)
+    autocorr_rows = []
+    for run_dir in args.run_dirs:
+        autocorr_rows.extend(autocorr_rows_for_run(run_dir, args.asset, args.segments, kappa_rates))
+    report_predictions(autocorr_rows)
+
+    if args.autocorr_out:
+        autocorr_out = Path(args.autocorr_out)
+        autocorr_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(autocorr_out, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(autocorr_rows[0]))
+            writer.writeheader()
+            writer.writerows(autocorr_rows)
+        print(f"\nwrote {autocorr_out} ({len(autocorr_rows)} rows)")
 
 
 if __name__ == "__main__":

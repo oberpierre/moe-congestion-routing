@@ -660,3 +660,36 @@ def price_lag_per_step_rows(
                 )
             )
     return rows
+
+
+def segment_autocorr(
+    deltas: np.ndarray,
+    *,
+    segments: int,
+    min_per_segment: int = 8,
+) -> list[tuple[int, int, int, float]]:
+    """Lag-1 autocorrelation of ``deltas`` (``[T-1, experts]``), computed separately per segment.
+
+    Splits the ``T-1`` rows into ``segments`` contiguous chunks of nearly equal size, the earliest
+    chunks absorbing any remainder, and reports each chunk's own per-expert lag-1 autocorrelation
+    averaged over experts, matching the pooled formula exactly when ``segments == 1``. Raises
+    rather than returning a row for a chunk with fewer than ``min_per_segment`` differences,
+    because a lag-1 autocorrelation on a handful of pairs is noise with a column heading, not a
+    segment-wise measurement.
+    """
+    if segments < 1:
+        raise ValueError(f"segments must be at least 1, got {segments}")
+    n, num_experts = deltas.shape
+    chunks = np.array_split(np.arange(n), segments)
+    for chunk in chunks:
+        if len(chunk) < min_per_segment:
+            raise ValueError(
+                f"segments={segments} leaves a segment with {len(chunk)} differences, below "
+                f"the minimum {min_per_segment} needed for a lag-1 autocorrelation"
+            )
+    rows = []
+    for segment_index, chunk in enumerate(chunks):
+        seg = deltas[chunk]
+        per_expert = [np.corrcoef(seg[:-1, e], seg[1:, e])[0, 1] for e in range(num_experts)]
+        rows.append((segment_index, int(chunk[0]), int(len(chunk)), float(np.mean(per_expert))))
+    return rows
