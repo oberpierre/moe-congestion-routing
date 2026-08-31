@@ -6,6 +6,8 @@ from here to validate a config, and ``--dry-run`` should not require ``torch``.
 
 from typing import NamedTuple
 
+import numpy as np
+
 COST_FAMILIES: tuple[str, ...] = ("linear", "quadratic")
 VARIANTS: tuple[str, ...] = ("hard", "soft")
 COST_EXPONENTS: dict[str, int] = {"linear": 1, "quadratic": 2}
@@ -29,6 +31,47 @@ def cost_exponent(cost_family: str) -> int:
     if cost_family not in COST_EXPONENTS:
         raise ValueError(f"unknown cost family {cost_family!r}; expected one of {COST_FAMILIES}")
     return COST_EXPONENTS[cost_family]
+
+
+def marginal_cost(
+    j: np.ndarray | int,
+    balanced_load: float,
+    *,
+    lam: float = 1.0,
+    cost_family: str = "linear",
+) -> np.ndarray:
+    """Marginal price of the ``j``-th (1-based) token routed to an expert, ``lam*(j/L)**p``.
+
+    ``j`` is the arc index in the oracle's per-expert cost-flow graph, so this is the price the LP
+    oracle assigns to that arc. Float64, matching the LP's own precision rather than the torch
+    loss's float32.
+    """
+    p = cost_exponent(cost_family)
+    j_arr = np.asarray(j, dtype=np.float64)
+    return lam * (j_arr / balanced_load) ** p
+
+
+def discrete_potential(
+    loads: np.ndarray,
+    balanced_load: float,
+    *,
+    lam: float = 1.0,
+    cost_family: str = "linear",
+) -> float:
+    """Discrete Rosenthal potential ``sum_e sum_{j=1..n_e} lam*(j/L)**p`` over realized loads.
+
+    Raw sum, unnormalized by ``N*K``, unlike ``rosenthal.congestion_potential``, because this is
+    the scored quantity the LP oracle's objective is checked against.
+    """
+    p = cost_exponent(cost_family)
+    total = 0.0
+    for n in np.asarray(loads):
+        n_int = int(n)
+        if n_int <= 0:
+            continue
+        j = np.arange(1, n_int + 1, dtype=np.float64)
+        total += float(np.sum(lam * (j / balanced_load) ** p))
+    return total
 
 
 def check_variant(variant: str) -> None:

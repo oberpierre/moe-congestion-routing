@@ -2,7 +2,9 @@ import pathlib
 import subprocess
 import sys
 
+import numpy as np
 import pytest
+import torch
 
 from moe_congestion_routing.losses.cost_families import (
     COST_EXPONENTS,
@@ -12,8 +14,11 @@ from moe_congestion_routing.losses.cost_families import (
     VARIANTS,
     check_variant,
     cost_exponent,
+    discrete_potential,
+    marginal_cost,
     pressure_bound,
 )
+from moe_congestion_routing.losses.rosenthal import congestion_potential
 
 
 def test_no_torch_import():
@@ -156,3 +161,79 @@ def test_cost_families_key_mismatch_raises_at_import():
     assert mutated != source
     with pytest.raises(ValueError, match="disagree"):
         exec(compile(mutated, "<mutated cost_families>", "exec"), {"__name__": "mutated"})
+
+
+# N=64, K=4, E=8 is the shape the raw-to-normalized factor was measured on,
+# so balanced_load L = N*K/E = 32 and every load vector below sums to N*K = 256.
+_N, _K, _E = 64, 4, 8
+_BALANCED_LOAD = _N * _K / _E
+
+_LOAD_VECTORS = {
+    "balanced": np.full(_E, _BALANCED_LOAD, dtype=np.int64),
+    "concentrated": np.array([256 - 7, 1, 1, 1, 1, 1, 1, 1], dtype=np.int64),
+    "uneven": np.array([80, 60, 40, 30, 20, 15, 8, 3], dtype=np.int64),
+}
+
+
+@pytest.mark.parametrize("cost_family", COST_FAMILIES)
+@pytest.mark.parametrize("lam", [1.0, 0.5, 2.5])
+@pytest.mark.parametrize("loads_name", sorted(_LOAD_VECTORS))
+def test_discrete_potential_pins_against_torch_congestion_potential(cost_family, lam, loads_name):
+    # rosenthal.congestion_potential returns Phi_cong/(N*K) as float32, whereas discrete_potential
+    # is the raw sum, so the two are compared with that factor restored rather than
+    # directly, and the float32 side sets the tolerance.
+    loads = _LOAD_VECTORS[loads_name]
+    assert loads.sum() == _N * _K
+
+    numpy_value = discrete_potential(loads, _BALANCED_LOAD, lam=lam, cost_family=cost_family)
+    torch_value = congestion_potential(
+        torch.tensor(loads),
+        total_num_tokens=_N,
+        topk=_K,
+        num_experts=_E,
+        lam=lam,
+        cost_family=cost_family,
+    )
+    assert numpy_value == pytest.approx(float(torch_value) * (_N * _K), rel=1e-5, abs=1e-4)
+
+
+@pytest.mark.parametrize("cost_family", COST_FAMILIES)
+@pytest.mark.parametrize("lam", [1.0, 0.5, 2.5])
+def test_marginal_cost_at_balanced_load_is_lam(cost_family, lam):
+    # The definition's own fixed point: at j == L the relative load j/L is exactly 1, so the price
+    # collapses to lam regardless of the exponent p. Catches an off-by-one in the 1-based index.
+    assert marginal_cost(
+        _BALANCED_LOAD, _BALANCED_LOAD, lam=lam, cost_family=cost_family
+    ) == pytest.approx(lam)
+
+
+@pytest.mark.parametrize("cost_family", COST_FAMILIES)
+def test_discrete_potential_on_zero_loads_is_zero(cost_family):
+    zero_loads = np.zeros(_E, dtype=np.int64)
+    assert discrete_potential(zero_loads, _BALANCED_LOAD, cost_family=cost_family) == 0.0
+
+
+@pytest.mark.parametrize("cost_family", COST_FAMILIES)
+def test_discrete_potential_increases_moving_a_token_to_the_heavier_expert(cost_family):
+    # Convexity of the marginal cost is what makes the LP oracle fill arcs in increasing-price
+    # order, so moving one token from the lighter expert to the heavier one must strictly raise
+    # the potential.
+    loads = np.array([3, 7, 2, 4], dtype=np.int64)
+    before = discrete_potential(loads, _BALANCED_LOAD, cost_family=cost_family)
+
+    moved = loads.copy()
+    moved[np.argmin(moved)] -= 1
+    moved[np.argmax(moved)] += 1
+    after = discrete_potential(moved, _BALANCED_LOAD, cost_family=cost_family)
+
+    assert after > before
+
+
+def test_marginal_cost_unknown_cost_family_raises():
+    with pytest.raises(ValueError, match="bogus"):
+        marginal_cost(1, _BALANCED_LOAD, cost_family="bogus")
+
+
+def test_discrete_potential_unknown_cost_family_raises():
+    with pytest.raises(ValueError, match="bogus"):
+        discrete_potential(np.array([1, 2]), _BALANCED_LOAD, cost_family="bogus")
