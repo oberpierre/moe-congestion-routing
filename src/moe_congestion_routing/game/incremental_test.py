@@ -140,3 +140,53 @@ def test_wrong_expert_row_count_raises():
     a = np.random.default_rng(2).random((5, 3))
     with pytest.raises(ValueError, match="rows"):
         solve_incremental(a, k=1, arc_prices=np.zeros((2, 6)))
+
+
+def test_feasibility_floor_dominates_the_span_bound():
+    # floor = ceil(6*1/2) = 3, whereas a tightly clustered affinity spread (max_span ~ 0.01) and a
+    # single arc priced well above it makes the span bound alone only 1. Supplying exactly 1 price
+    # is therefore short of what J_e needs once the floor, not the span, sets it, and the raised
+    # length names the floor rather than the span it would have named before this change.
+    n, e, k = 6, 2, 1
+    a = np.full((n, e), 0.5) + np.array([[0.001 * i, -0.001 * i] for i in range(n)])
+    max_span = float(np.max(a.max(axis=1) - a.min(axis=1)))
+    with pytest.raises(ValueError, match=r"need 3"):
+        solve_incremental(a, k, arc_prices=np.array([max_span * 2.0]))
+
+
+def test_growth_resolves_a_saturated_floor():
+    # floor = ceil(9*1/2) = 5, tight enough that congestion pricing pushing toward an even split
+    # saturates one expert on the first attempt. A schedule long enough to double into (up to the
+    # cap N=9) lets the retry find an unsaturated optimum instead of refusing.
+    n, e, k = 9, 2, 1
+    rng = np.random.default_rng(42)
+    a = 0.5 + rng.normal(scale=0.01, size=(n, e))
+    max_span = float(np.max(a.max(axis=1) - a.min(axis=1)))
+    arc_prices = np.linspace(max_span * 1.5, max_span * 1.5 + 2.0, n + 1)
+    result = solve_incremental(a, k, arc_prices)
+    assert result.arc_growths >= 1
+    assert np.all(result.arcs_used < result.arcs_available)
+
+
+def test_growth_capped_at_n_still_raises():
+    # Every token strictly prefers expert 0 under zero congestion cost, so the true optimum routes
+    # all N=8 tokens there. That is only possible if arcs_available reaches N itself, so the
+    # instance is genuinely stuck rather than merely under-provisioned, and the cap must say so.
+    n, e, k = 8, 2, 1
+    a = np.zeros((n, e))
+    a[:, 0] = 1.0
+    with pytest.raises(ValueError, match=f"cap J_e = N = {n}"):
+        solve_incremental(a, k, arc_prices=np.zeros(n))
+
+
+def test_arc_prices_too_short_for_a_retry_raises():
+    # Same saturating instance as test_growth_resolves_a_saturated_floor, but arc_prices only
+    # supplies 7 arcs per expert. The first attempt (J_e=5) fits and saturates, so growth wants to
+    # double to 9 (capped at N), which the caller did not supply, so this is the caller's error.
+    n, e, k = 9, 2, 1
+    rng = np.random.default_rng(42)
+    a = 0.5 + rng.normal(scale=0.01, size=(n, e))
+    max_span = float(np.max(a.max(axis=1) - a.min(axis=1)))
+    arc_prices = np.linspace(max_span * 1.5, max_span * 1.5 + 2.0, 7)
+    with pytest.raises(ValueError, match="at least 9"):
+        solve_incremental(a, k, arc_prices)

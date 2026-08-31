@@ -26,18 +26,20 @@ class IncrementalResult(NamedTuple):
     objective: float  # affinity - congestion
     loads: np.ndarray  # int [E], x.sum(axis=0)
     arcs_used: np.ndarray  # int [E], how many arcs each expert filled
-    arcs_available: np.ndarray  # int [E], J_e after truncation
+    arcs_available: np.ndarray  # int [E], J_e after truncation and any growth
     max_fractional_deviation: float  # max|. - round(.)| over x and y before rounding
+    arc_growths: int  # how many times J_e was doubled before the solve held
 
 
 def solve_incremental(a: np.ndarray, k: int, arc_prices: np.ndarray) -> IncrementalResult:
     """Solve the incremental-arc assignment LP and return it with its diagnostics.
 
     ``arc_prices`` is either a shared ``[J]`` schedule broadcast to every expert or a per-expert
-    ``[E, J]`` schedule. Raises ``ValueError`` when it is not non-decreasing along ``j``, and
-    raises when any expert's rounded optimum uses every arc it was given — a silently truncated
-    optimum would be a wrong number that looks like a right one, so extend that expert's schedule
-    before trusting the result.
+    ``[E, J]`` schedule. Raises ``ValueError`` when it is not non-decreasing along ``j``. When the
+    schedule starts too short to seat the batch, or an optimum saturates it, ``J_e`` doubles and
+    the solve retries, up to a cap of ``N`` where doubling stops helping and the refusal becomes a
+    genuine one, and a caller-supplied ``arc_prices`` too short for what a retry wants raises
+    rather than being extrapolated past what was given.
     """
     a = np.asarray(a, dtype=np.float64)
     n, e = a.shape
@@ -66,98 +68,144 @@ def solve_incremental(a: np.ndarray, k: int, arc_prices: np.ndarray) -> Incremen
         )
 
     # No token will ever pay more than the largest affinity gain it could realize by switching
-    # experts, so an arc priced above that bound can never belong to an optimal assignment. Cutting
-    # the schedule there off shrinks the LP without changing its answer, and the first such arc is
-    # kept as a sentinel: an optimum that reaches it has broken the bound, so treat that as a
-    # signal to raise rather than trust the truncation.
+    # experts, so an arc priced above that bound can never belong to an optimal assignment. This
+    # bound alone can undershoot the batch's own demand, since a token that must go somewhere is
+    # not the token the bound reasons about, so it is only the first of two floors on J_e below.
     max_span = float(np.max(a.max(axis=1) - a.min(axis=1)))
-    j_e = np.empty(e, dtype=np.int64)
+    j_span = np.empty(e, dtype=np.int64)
     for expert in range(e):
         exceeds = np.flatnonzero(prices_full[expert] > max_span)
-        j_e[expert] = int(exceeds[0]) + 1 if exceeds.size else j_full
+        j_span[expert] = int(exceeds[0]) + 1 if exceeds.size else j_full
 
-    num_x = n * e
-    offsets = np.concatenate(([0], np.cumsum(j_e)))
-    num_y = int(offsets[-1])
-
-    # Flatten x[i, e] to column index i*e + expert, matching a.ravel()'s row-major order, exactly
-    # as lp.py does, so the objective vector and the constraint columns index the same variable.
-    columns = np.arange(num_x)
-    token_of = columns // e
-    expert_of = columns % e
-
-    token_rows = sp.csr_matrix((np.ones(num_x), (token_of, columns)), shape=(n, num_x))
-    token_block = sp.hstack([token_rows, sp.csr_matrix((n, num_y))], format="csr")
-    b_token = np.full(n, k, dtype=np.float64)
-
-    # Per-expert flow conservation: load in from tokens equals arcs filled out, which is what lets
-    # the cheapest arcs fill first without an explicit ordering constraint on y.
-    x_expert_rows = sp.csr_matrix((np.ones(num_x), (expert_of, columns)), shape=(e, num_x))
-    y_expert_of = np.repeat(np.arange(e), j_e)
-    y_expert_rows = sp.csr_matrix(
-        (-np.ones(num_y), (y_expert_of, np.arange(num_y))), shape=(e, num_y)
-    )
-    expert_block = sp.hstack([x_expert_rows, y_expert_rows], format="csr")
-    b_expert = np.zeros(e, dtype=np.float64)
-
-    a_eq = sp.vstack([token_block, expert_block], format="csr")
-    b_eq = np.concatenate([b_token, b_expert])
-
-    y_prices = np.concatenate([prices_full[expert, : j_e[expert]] for expert in range(e)])
-    c = np.concatenate([-a.ravel(), y_prices])
-
-    res = linprog(c, A_eq=a_eq, b_eq=b_eq, bounds=(0, 1), method="highs-ds")
-    if not res.success:
-        raise RuntimeError(f"linprog did not succeed: {res.message}")
-
-    x_lp = res.x[:num_x].reshape(n, e)
-    y_lp = res.x[num_x:]
-
-    max_fractional_deviation = float(
-        max(
-            np.max(np.abs(x_lp - np.round(x_lp))),
-            np.max(np.abs(y_lp - np.round(y_lp))) if num_y else 0.0,
-        )
-    )
-    # Insurance against a future HiGHS presolve or method change, not a fix for an observed
-    # defect: no fractional result was seen while writing this, including under deliberate ties.
-    assert max_fractional_deviation <= 1e-6, (
-        f"non-integral LP solution: max_fractional_deviation={max_fractional_deviation}"
-    )
-
-    x = np.round(x_lp).astype(bool)
-    y = np.round(y_lp).astype(bool)
-
-    experts_per_token = x.sum(axis=1)
-    bad_tokens = np.flatnonzero(experts_per_token != k)
-    if bad_tokens.size:
+    # Sigma_e x_ie = k is an equality, so every token must be seated somewhere, and a schedule
+    # shorter than the batch cannot seat it at all.
+    feasibility_floor = int(np.ceil(n * k / e))
+    j_e = np.maximum(j_span, feasibility_floor)
+    # Total capacity equal to total demand leaves no aggregate slack, so pigeonhole pins every
+    # expert to its cap and the schedule saturates whatever the prices are. Start one doubling up
+    # where the caller's array allows it, rather than spending a whole solve to learn that.
+    # Only ever upward: capping at j_full must not pull j_e back below the floor, or the
+    # too-short check below would stop firing on a schedule that genuinely cannot seat the batch.
+    if int(j_e.sum()) <= n * k:
+        j_e = np.maximum(j_e, np.minimum(2 * j_e, j_full))
+    if np.any(j_e > j_full):
+        needed = int(j_e.max())
         raise ValueError(
-            f"rounded assignment violates the top-k constraint: tokens {bad_tokens.tolist()} "
-            f"have counts {experts_per_token[bad_tokens].tolist()}, expected k={k}"
+            f"arc_prices supplies {j_full} arcs per expert but the feasibility floor and span "
+            f"bound together need {needed}, so extend arc_prices before calling solve_incremental"
         )
 
-    loads = x.sum(axis=0)
-    arcs_used = np.array(
-        [int(y[offsets[expert] : offsets[expert + 1]].sum()) for expert in range(e)]
-    )
-    saturated = np.flatnonzero(arcs_used == j_e)
-    if saturated.size:
-        raise ValueError(
-            f"incremental oracle saturated its arc budget for experts {saturated.tolist()}: "
-            f"arcs_used == arcs_available == {j_e[saturated].tolist()}. The true optimum may "
-            "need more arcs than arc_prices supplied for these experts; extend their schedule."
+    def _grow(j_e: np.ndarray, reason: str) -> np.ndarray:
+        # Shared by the infeasible and saturated branches below: both face the same two terminal
+        # conditions, the hard cap N where growing further can never help, and a caller-supplied
+        # schedule too short to grow into, which is not this oracle's cost to invent.
+        if np.all(j_e >= n):
+            raise ValueError(
+                f"incremental oracle still {reason} with every J_e at the cap J_e = N = {n}: "
+                "this is a failure of the instance itself, not of the arc provisioning."
+            )
+        candidate = np.minimum(j_e * 2, n)
+        if np.any(candidate > j_full):
+            needed = int(candidate.max())
+            raise ValueError(
+                f"incremental oracle {reason} and the retry wants {needed} arcs per expert, but "
+                f"arc_prices supplies only {j_full}, so extend arc_prices to at least {needed}"
+            )
+        return candidate
+
+    arc_growths = 0
+    while True:
+        num_x = n * e
+        offsets = np.concatenate(([0], np.cumsum(j_e)))
+        num_y = int(offsets[-1])
+
+        # Flatten x[i, e] to column index i*e + expert, matching a.ravel()'s row-major order,
+        # exactly as lp.py does, so the objective vector and the constraint columns index the
+        # same variable.
+        columns = np.arange(num_x)
+        token_of = columns // e
+        expert_of = columns % e
+
+        token_rows = sp.csr_matrix((np.ones(num_x), (token_of, columns)), shape=(n, num_x))
+        token_block = sp.hstack([token_rows, sp.csr_matrix((n, num_y))], format="csr")
+        b_token = np.full(n, k, dtype=np.float64)
+
+        # Per-expert flow conservation: load in from tokens equals arcs filled out, which is what
+        # lets the cheapest arcs fill first without an explicit ordering constraint on y.
+        x_expert_rows = sp.csr_matrix((np.ones(num_x), (expert_of, columns)), shape=(e, num_x))
+        y_expert_of = np.repeat(np.arange(e), j_e)
+        y_expert_rows = sp.csr_matrix(
+            (-np.ones(num_y), (y_expert_of, np.arange(num_y))), shape=(e, num_y)
+        )
+        expert_block = sp.hstack([x_expert_rows, y_expert_rows], format="csr")
+        b_expert = np.zeros(e, dtype=np.float64)
+
+        a_eq = sp.vstack([token_block, expert_block], format="csr")
+        b_eq = np.concatenate([b_token, b_expert])
+
+        y_prices = np.concatenate([prices_full[expert, : j_e[expert]] for expert in range(e)])
+        c = np.concatenate([-a.ravel(), y_prices])
+
+        res = linprog(c, A_eq=a_eq, b_eq=b_eq, bounds=(0, 1), method="highs-ds")
+        if not res.success:
+            # Infeasible here means the schedule was too short to seat the batch, not that the
+            # instance is unsolvable, so this is not an error until growth has nowhere left to go.
+            j_e = _grow(j_e, f"got an infeasible linprog result ({res.message})")
+            arc_growths += 1
+            continue
+
+        x_lp = res.x[:num_x].reshape(n, e)
+        y_lp = res.x[num_x:]
+
+        max_fractional_deviation = float(
+            max(
+                np.max(np.abs(x_lp - np.round(x_lp))),
+                np.max(np.abs(y_lp - np.round(y_lp))) if num_y else 0.0,
+            )
+        )
+        # Insurance against a future HiGHS presolve or method change, not a fix for an observed
+        # defect: no fractional result was seen while writing this, including under deliberate
+        # ties.
+        assert max_fractional_deviation <= 1e-6, (
+            f"non-integral LP solution: max_fractional_deviation={max_fractional_deviation}"
         )
 
-    congestion = float(y_prices[y].sum())
-    affinity = float((a * x).sum())
+        x = np.round(x_lp).astype(bool)
+        y = np.round(y_lp).astype(bool)
 
-    return IncrementalResult(
-        x=x,
-        affinity=affinity,
-        congestion=congestion,
-        objective=affinity - congestion,
-        loads=loads.astype(np.int64),
-        arcs_used=arcs_used.astype(np.int64),
-        arcs_available=j_e,
-        max_fractional_deviation=max_fractional_deviation,
-    )
+        experts_per_token = x.sum(axis=1)
+        bad_tokens = np.flatnonzero(experts_per_token != k)
+        if bad_tokens.size:
+            raise ValueError(
+                f"rounded assignment violates the top-k constraint: tokens {bad_tokens.tolist()} "
+                f"have counts {experts_per_token[bad_tokens].tolist()}, expected k={k}"
+            )
+
+        loads = x.sum(axis=0)
+        arcs_used = np.array(
+            [int(y[offsets[expert] : offsets[expert + 1]].sum()) for expert in range(e)]
+        )
+        saturated = np.flatnonzero(arcs_used == j_e)
+        if saturated.size:
+            # Before the cap this means the schedule was provisioned too short to see the true
+            # optimum, so it grows and retries. At the cap J_e = N it means the instance itself
+            # needs more than one arc per token per expert can ever supply, which cannot happen,
+            # so it is a genuine failure of the instance rather than of the provisioning.
+            j_e = _grow(j_e, f"saturated its arc budget for experts {saturated.tolist()}")
+            arc_growths += 1
+            continue
+
+        congestion = float(y_prices[y].sum())
+        affinity = float((a * x).sum())
+
+        return IncrementalResult(
+            x=x,
+            affinity=affinity,
+            congestion=congestion,
+            objective=affinity - congestion,
+            loads=loads.astype(np.int64),
+            arcs_used=arcs_used.astype(np.int64),
+            arcs_available=j_e,
+            max_fractional_deviation=max_fractional_deviation,
+            arc_growths=arc_growths,
+        )
