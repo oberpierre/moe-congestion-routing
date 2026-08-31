@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from moe_congestion_routing.losses import rosenthal
 from moe_congestion_routing.losses.cost_families import (
     COST_EXPONENTS,
     COST_FAMILIES,
@@ -195,6 +196,18 @@ def test_discrete_potential_pins_against_torch_congestion_potential(cost_family,
         cost_family=cost_family,
     )
     assert numpy_value == pytest.approx(float(torch_value) * (_N * _K), rel=1e-5, abs=1e-4)
+
+
+@pytest.mark.parametrize("cost_family", COST_FAMILIES)
+@pytest.mark.parametrize("lam", [1.0, 0.5, 2.5])
+def test_marginal_cost_is_pinned_to_the_torch_cost(cost_family, lam):
+    # marginal_cost is a second implementation of rosenthal.cost with the j/L division folded in,
+    # so it needs the same pin discrete_potential has. The fixed point below cannot supply it: at
+    # j == L every family agrees, so an exponent dropped entirely would still pass there.
+    j = np.arange(1, 4 * int(_BALANCED_LOAD) + 1, dtype=np.float64)
+    numpy_value = marginal_cost(j, _BALANCED_LOAD, lam=lam, cost_family=cost_family)
+    torch_value = rosenthal.cost(torch.tensor(j / _BALANCED_LOAD), cost_family, lam=lam)
+    assert numpy_value == pytest.approx(torch_value.numpy(), rel=1e-5, abs=1e-4)
 
 
 @pytest.mark.parametrize("cost_family", COST_FAMILIES)

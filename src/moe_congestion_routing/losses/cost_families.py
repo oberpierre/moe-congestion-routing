@@ -63,14 +63,18 @@ def discrete_potential(
     Raw sum, unnormalized by ``N*K``, unlike ``rosenthal.congestion_potential``, because this is
     the scored quantity the LP oracle's objective is checked against.
     """
-    p = cost_exponent(cost_family)
+    # Validate eagerly, because an all-zero load vector never enters the loop and would otherwise
+    # accept an unknown family silently.
+    cost_exponent(cost_family)
     total = 0.0
     for n in np.asarray(loads):
         n_int = int(n)
         if n_int <= 0:
             continue
         j = np.arange(1, n_int + 1, dtype=np.float64)
-        total += float(np.sum(lam * (j / balanced_load) ** p))
+        # Through marginal_cost rather than inline, so the exponent is applied in exactly one place
+        # and a defect in the price cannot cancel itself out of the potential.
+        total += float(np.sum(marginal_cost(j, balanced_load, lam=lam, cost_family=cost_family)))
     return total
 
 
