@@ -446,6 +446,37 @@ def test_affinities_refuse_a_dump_that_was_not_scored_with_sigmoid(tmp_path):
         read_dump(path).affinities()
 
 
+def test_router_scores_agrees_with_affinities_on_a_sigmoid_dump(tmp_path):
+    path = _conformance_dump(tmp_path, stored_selections=[[0], [0], [3]])
+    dump = read_dump(path)
+    # Same input, same branch, so this must be bit-exact rather than merely close, because
+    # router_scores() is meant to be interchangeable with affinities() on a sigmoid dump.
+    assert numpy.array_equal(dump.router_scores(), dump.affinities())
+
+
+def test_router_scores_is_softmax_over_experts_on_a_softmax_dump(tmp_path):
+    path = _conformance_dump(tmp_path, stored_selections=[[0], [0], [3]], score_function="softmax")
+    dump = read_dump(path)
+
+    logits = dump.logits().astype(numpy.float64)
+    shifted = logits - logits.max(axis=-1, keepdims=True)
+    expected = numpy.exp(shifted) / numpy.exp(shifted).sum(axis=-1, keepdims=True)
+
+    scores = dump.router_scores()
+    numpy.testing.assert_allclose(scores, expected, rtol=0, atol=1e-15)
+    # Sums to 1 to float64 precision, not merely to float32 precision, because a caller widening
+    # a float32 softmax after the fact would carry float32's rounding along with it.
+    assert numpy.max(numpy.abs(scores.sum(axis=-1) - 1.0)) < 1e-12
+
+
+def test_router_scores_refuses_a_score_function_it_does_not_know(tmp_path):
+    path = _conformance_dump(
+        tmp_path, stored_selections=[[0], [0], [3]], score_function="sqrtsoftplus"
+    )
+    with pytest.raises(IncomparableProbes, match="sqrtsoftplus"):
+        read_dump(path).router_scores()
+
+
 def test_expert_bias_refuses_a_run_that_carried_none(tmp_path):
     routing_map = _one_hot_map([[0], [1]], 4)[numpy.newaxis, :, :]
     path = _write_dump(tmp_path / "probes", step=0, routing_map=routing_map, topk=1)

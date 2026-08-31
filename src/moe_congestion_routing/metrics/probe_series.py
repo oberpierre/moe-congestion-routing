@@ -45,6 +45,20 @@ def _sigmoid(x: numpy.ndarray) -> numpy.ndarray:
     return one / (one + numpy.exp(-x))
 
 
+def _softmax(x: numpy.ndarray) -> numpy.ndarray:
+    """Softmax over the last axis, shifted by the row max for numerical stability.
+
+    Unlike :func:`_sigmoid`, this is evaluated in float64 rather than in the input's own dtype,
+    because :func:`ProbeDump.router_scores` needs each token's scores to sum to 1 far tighter
+    than float32 carries, and a softmax is the one quantity here where widening only after the
+    computation would bake that float32 rounding in.
+    """
+    x = numpy.asarray(x, dtype=numpy.float64)
+    shifted = x - numpy.max(x, axis=-1, keepdims=True)
+    exp = numpy.exp(shifted)
+    return exp / numpy.sum(exp, axis=-1, keepdims=True)
+
+
 @dataclass(frozen=True)
 class ProbeDump:
     """One probe forward's dump: metadata always in memory, arrays opened on access.
@@ -146,6 +160,29 @@ class ProbeDump:
             )
         logits = self.logits().astype(numpy.float32, copy=False)
         return _sigmoid(logits).astype(numpy.float64)
+
+    def router_scores(self) -> numpy.ndarray:
+        """``[L, N, E]`` float64: the router's own score, in whichever space this dump used.
+
+        Unlike :meth:`affinities`, this accepts any ``score_function`` the dump records rather
+        than refusing everything but ``sigmoid``. Eleven of twelve arms are softmax, and softmax
+        is a perfectly good affinity for a game scored on the router's own valuation, it is just
+        not the quantity ALF-LB's bias was added to, which is what :meth:`affinities` means.
+
+        The sigmoid branch matches :meth:`affinities` exactly, float32 sigmoid then widened, so
+        the two agree bit-for-bit on a sigmoid dump. The softmax branch is computed directly in
+        float64, because a token's scores summing to 1 is a property callers here check, and a
+        float32 softmax later widened would only widen its float32 rounding along with it.
+        """
+        logits = self.logits()
+        if self.score_function == "sigmoid":
+            return _sigmoid(logits.astype(numpy.float32, copy=False)).astype(numpy.float64)
+        if self.score_function == "softmax":
+            return _softmax(logits)
+        raise IncomparableProbes(
+            f"{self.path}: score function {self.score_function!r} has no known affinity "
+            "conversion here, only 'sigmoid' and 'softmax' are"
+        )
 
 
 def read_dump(path: Path | str) -> ProbeDump:
