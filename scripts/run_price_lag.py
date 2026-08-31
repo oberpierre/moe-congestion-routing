@@ -34,8 +34,8 @@ from moe_congestion_routing.metrics.probe_comparison import (
     price_lag_rows,
 )
 
-DEFAULT_SUMMARY_OUT = "assets/results/price-lag_both-runs_asymmetry.csv"
-DEFAULT_PER_STEP_OUT = "assets/results/price-lag_both-runs_per-step.csv"
+DEFAULT_SUMMARY_OUT = "assets/results/price-recovery/price-lag_both-runs_asymmetry.csv"
+DEFAULT_PER_STEP_OUT = "assets/results/price-recovery/price-lag_both-runs_per-step.csv"
 
 
 def _rows_for_run_and_layer(

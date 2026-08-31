@@ -36,9 +36,9 @@ WINDOWS = (3, 5, 7)
 # Lags in dumps. The series is 21 dumps, so lag 16 is the longest with enough pairs to average.
 LAGS = (1, 2, 4, 8, 12, 16)
 
-DEFAULT_AUTOCORR_OUT = "assets/results/bias-autocorr_both-runs_segmented.csv"
+DEFAULT_AUTOCORR_OUT = "assets/results/price-recovery/bias-autocorr_both-runs_segmented.csv"
 # The committed cross-asset kappa trajectory, joined by layer for the second registered prediction.
-DEFAULT_KAPPA_CSV = "assets/results/kappa-trajectory_cross-asset_21-steps.csv"
+DEFAULT_KAPPA_CSV = "assets/results/price-recovery/kappa-trajectory_cross-asset_21-steps.csv"
 # The registered window for kappa's decay rate: after the early rise and before the run ends.
 KAPPA_SLOPE_STEP_LO = 100
 KAPPA_SLOPE_STEP_HI = 500

@@ -24,7 +24,7 @@ from moe_congestion_routing.metrics.probe_series import probe_dump_path, read_du
 from moe_congestion_routing.metrics.triad import TriadRow, priced_unit, triad_rows
 
 CROSSPROBE_DIR = Path("artifacts/exp1/crossprobe")
-OUT_CSV = Path("assets/results/triad_step500_three-pairings.csv")
+OUT_CSV = Path("assets/results/price-recovery/triad_step500_three-pairings.csv")
 RUNS = ("a", "b")
 
 # (role, cell suffix, unit start/stop in tokens). "spread" needs both its units, whereas the

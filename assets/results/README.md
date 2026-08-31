@@ -3,6 +3,19 @@
 **This directory is authoritative.** Every CSV here is the version any figure, notebook or write-up
 cites. `notebooks/alflb_price_internalization.ipynb` reads from here and from nowhere else.
 
+Results sit in one subdirectory per question, and `MANIFEST.csv` stays at the top with the
+subdirectory carried in its `file` column:
+
+| Subdirectory | The question it answers |
+|---|---|
+| `price-recovery/` | Can the population price be recovered from the stored bias, and does that hold across training and across probe assets? |
+| `phi-gap/` | How far is each arm's realized routing from the optimum of one shared reference game? |
+
+`phi-gap/` holds one CSV per arm rather than one combined file, because arms finish at different
+times and each row costs an LP solve of a couple of minutes. A row is never recomputed: the driver
+reads whatever is already there and skips those keys, so a crashed or cancelled sweep resumes
+instead of restarting.
+
 The scripts that produced these numbers write to `artifacts/game/` under working names
 (`kappa_trajectory.csv`, `spread_trajectory_mac.csv`), and `artifacts/` is gitignored, so those
 files are machine-local and not recoverable. Each row of `MANIFEST.csv` records the working file
