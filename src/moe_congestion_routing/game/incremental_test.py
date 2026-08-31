@@ -102,7 +102,9 @@ def test_steep_prices_converge_to_the_hard_capacity_lp():
 
 def test_truncation_refusal_fires_when_the_optimum_saturates_its_schedule():
     # cap-like divisible instance (2 * 3 == 6 * 1): counting alone forces every expert to exactly
-    # 2 units regardless of preference, so a 2-arc schedule is saturated by every expert.
+    # 2 units regardless of preference, so a 2-arc schedule is saturated by every expert. The
+    # refusal now arrives through the retry rather than directly, because the saturated schedule
+    # wants to double into an array the caller did not supply, which is the caller's error.
     rng = np.random.default_rng(5)
     a = rng.random((6, 3))
     with pytest.raises(ValueError, match="saturated"):
@@ -166,17 +168,42 @@ def test_growth_resolves_a_saturated_floor():
     result = solve_incremental(a, k, arc_prices)
     assert result.arc_growths >= 1
     assert np.all(result.arcs_used < result.arcs_available)
+    # The optimum reached through a retry must be the optimum, not merely an unsaturated one. Every
+    # brute-force case runs without growth, so without this the whole retry path is unchecked
+    # against the reference oracle.
+    expected_objective, expected_x = enumerate_soft_optimal(a, k, arc_prices)
+    assert result.objective == pytest.approx(expected_objective)
+    assert np.array_equal(result.x, expected_x)
 
 
-def test_growth_capped_at_n_still_raises():
-    # Every token strictly prefers expert 0 under zero congestion cost, so the true optimum routes
-    # all N=8 tokens there. That is only possible if arcs_available reaches N itself, so the
-    # instance is genuinely stuck rather than merely under-provisioned, and the cap must say so.
+def test_a_floor_with_no_aggregate_slack_is_doubled_before_the_first_solve():
+    # floor = ceil(6*1/3) = 2 makes total capacity 6 equal to demand 6, so pigeonhole would pin
+    # every expert to its cap and saturate whatever the prices are. Starting at twice the floor
+    # spends no solve to learn that, which is where the real-shape solve's speedup comes from.
+    n, e, k = 6, 3, 1
+    a = np.full((n, e), 0.5) + np.array([[0.001 * i, -0.001 * i, 0.0] for i in range(n)])
+    max_span = float(np.max(a.max(axis=1) - a.min(axis=1)))
+    arc_prices = np.linspace(max_span * 2.0, max_span * 2.0 + 2.0, 8)
+    result = solve_incremental(a, k, arc_prices)
+    assert result.arc_growths == 0
+    assert result.arcs_available.tolist() == [4] * e
+    assert np.all(result.arcs_used < result.arcs_available)
+
+
+def test_an_optimum_that_fills_one_expert_to_n_is_returned_not_refused():
+    # Every token strictly prefers expert 0 under zero congestion cost, so the unique optimum puts
+    # all N tokens there and arcs_used necessarily equals arcs_available at the cap. Saturation at
+    # the cap is the correct answer rather than a truncated one, because an expert can never hold
+    # more than N tokens, so refusing here would reject a well-posed instance.
     n, e, k = 8, 2, 1
     a = np.zeros((n, e))
     a[:, 0] = 1.0
-    with pytest.raises(ValueError, match=f"cap J_e = N = {n}"):
-        solve_incremental(a, k, arc_prices=np.zeros(n))
+    arc_prices = np.zeros(n)
+    result = solve_incremental(a, k, arc_prices)
+    expected_objective, expected_x = enumerate_soft_optimal(a, k, arc_prices)
+    assert result.objective == pytest.approx(expected_objective)
+    assert np.array_equal(result.x, expected_x)
+    assert result.loads.tolist() == [n, 0]
 
 
 def test_arc_prices_too_short_for_a_retry_raises():

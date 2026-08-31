@@ -79,7 +79,7 @@ def solve_incremental(a: np.ndarray, k: int, arc_prices: np.ndarray) -> Incremen
 
     # Sigma_e x_ie = k is an equality, so every token must be seated somewhere, and a schedule
     # shorter than the batch cannot seat it at all.
-    feasibility_floor = int(np.ceil(n * k / e))
+    feasibility_floor = -(-n * k // e)
     j_e = np.maximum(j_span, feasibility_floor)
     # Total capacity equal to total demand leaves no aggregate slack, so pigeonhole pins every
     # expert to its cap and the schedule saturates whatever the prices are. Start one doubling up
@@ -96,13 +96,15 @@ def solve_incremental(a: np.ndarray, k: int, arc_prices: np.ndarray) -> Incremen
         )
 
     def _grow(j_e: np.ndarray, reason: str) -> np.ndarray:
-        # Shared by the infeasible and saturated branches below: both face the same two terminal
-        # conditions, the hard cap N where growing further can never help, and a caller-supplied
-        # schedule too short to grow into, which is not this oracle's cost to invent.
+        # Shared by the infeasible and saturated branches below, which face the same two terminal
+        # conditions: the hard cap N where growing further can never help, and a caller-supplied
+        # schedule too short to grow into, which is not this oracle's cost to invent. The cap
+        # branch is a termination guard rather than a reachable outcome, because a schedule of N
+        # arcs seats any assignment and cannot bind.
         if np.all(j_e >= n):
             raise ValueError(
-                f"incremental oracle still {reason} with every J_e at the cap J_e = N = {n}: "
-                "this is a failure of the instance itself, not of the arc provisioning."
+                f"incremental oracle still {reason} with every J_e at the cap J_e = N = {n}, "
+                "which a schedule of N arcs cannot cause, so the oracle itself is wrong"
             )
         candidate = np.minimum(j_e * 2, n)
         if np.any(candidate > j_full):
@@ -163,9 +165,8 @@ def solve_incremental(a: np.ndarray, k: int, arc_prices: np.ndarray) -> Incremen
                 np.max(np.abs(y_lp - np.round(y_lp))) if num_y else 0.0,
             )
         )
-        # Insurance against a future HiGHS presolve or method change, not a fix for an observed
-        # defect: no fractional result was seen while writing this, including under deliberate
-        # ties.
+        # Insurance against a future HiGHS presolve or method change rather than a fix for an
+        # observed defect, because total unimodularity makes every vertex integral.
         assert max_fractional_deviation <= 1e-6, (
             f"non-integral LP solution: max_fractional_deviation={max_fractional_deviation}"
         )
@@ -185,12 +186,12 @@ def solve_incremental(a: np.ndarray, k: int, arc_prices: np.ndarray) -> Incremen
         arcs_used = np.array(
             [int(y[offsets[expert] : offsets[expert + 1]].sum()) for expert in range(e)]
         )
-        saturated = np.flatnonzero(arcs_used == j_e)
+        # An expert whose schedule reaches N cannot be truncated by it, because only N tokens
+        # exist so its load can never exceed N. Saturation is evidence of a short schedule only
+        # below that cap, whereas reading it as evidence at the cap refuses instances whose
+        # true optimum genuinely concentrates every token on one expert.
+        saturated = np.flatnonzero((arcs_used == j_e) & (j_e < n))
         if saturated.size:
-            # Before the cap this means the schedule was provisioned too short to see the true
-            # optimum, so it grows and retries. At the cap J_e = N it means the instance itself
-            # needs more than one arc per token per expert can ever supply, which cannot happen,
-            # so it is a genuine failure of the instance rather than of the provisioning.
             j_e = _grow(j_e, f"saturated its arc budget for experts {saturated.tolist()}")
             arc_growths += 1
             continue

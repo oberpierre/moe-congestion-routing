@@ -55,8 +55,9 @@ def enumerate_soft_optimal(
     Same enumeration and the same ``MAX_ENUMERATED_ASSIGNMENTS`` guard as ``enumerate_optimal``.
     There is no hard capacity here, so every combination is feasible as long as no expert's
     realized load exceeds how many prices ``arc_prices`` supplies for it, whereas a combination
-    that would need more is skipped rather than priced, matching the oracle's own truncation
-    refusal.
+    that would need more is skipped rather than priced. The oracle instead lengthens its own
+    schedule and retries, so supply ``arc_prices`` long enough to seat any load before comparing
+    the two, or this one silently enumerates a smaller feasible set than the oracle searches.
     """
     a = np.asarray(a, dtype=np.float64)
     n, e = a.shape
