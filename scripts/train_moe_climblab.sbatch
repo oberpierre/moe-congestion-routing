@@ -61,9 +61,14 @@ CACHE_ENV_EXPORT="
   $DATA_ENV_EXPORT
 "
 
-# Prepare the environment ONCE for all nodes, before launchhing the training script on every node.
-# Ensures the venv correctly uses the system torch/TE and uv manages other dependencies, while
-# avoiding N nodes racing to write the same .venv/uv-cache concurrently.
+# Preparing the environment MUTATES the shared workdir, so it is opt-in rather than automatic.
+# It can rm -rf the .venv another job imports from for hours, uv sync into that same
+# site-packages, and git reset the submodule while another job is importing megatron.core. Jobs
+# scheduled to start together would race, and the loser on a none/aux_loss arm trains to
+# completion writing no probes. Run it once on an idle workdir:
+#   MOE_PREPARE_ENV=1 sbatch scripts/train_moe_climblab.sbatch <config>
+# or chain the rest behind it with --dependency=afterok:<jobid>.
+if [ "${MOE_PREPARE_ENV:-0}" = 1 ]; then
 srun --nodes=1 --ntasks=1 --environment=alps6 bash -c "
   set -euo pipefail
   $CACHE_ENV_EXPORT
@@ -78,11 +83,18 @@ srun --nodes=1 --ntasks=1 --environment=alps6 bash -c "
   # into the venv (shadows the container copy), --no-deps so it can't pull a conflicting torch.
   uv pip install --no-deps 'nvidia-resiliency-ext>=0.6.0'
   # The vendored Megatron carries no patches in git, so they must be applied before every run.
-  # Skipping this is silent for the aux_loss/none arms: they train fine and log none of the
-  # load-balance battery, SwapGap or phi_cong. A rosenthal arm fails loud at argparse instead.
   ./scripts/apply-patches.sh
   echo '[env] build complete'
 "
+fi
+
+# Preflight on every job, reading only. Fails fast if venv is missing or patches are not applied.
+if [ ! -f "$WORKDIR/.venv/pyvenv.cfg" ]; then
+  echo "[env] no venv at $WORKDIR/.venv." >&2
+  echo "  Run once on an idle workdir: MOE_PREPARE_ENV=1 sbatch $0 <config>" >&2
+  exit 1
+fi
+"$WORKDIR/scripts/apply-patches.sh" --verify
 
 # Launch the training script on every node, one task per node. The launcher runs once per node and
 # run_moe_pretrain.py launches via `python -m torch.distributed.run`, so the workers inherit the
