@@ -6,4 +6,9 @@ moe_router_enable_expert_bias: true
 moe_router_score_function: sigmoid
 moe_router_bias_update_rate: 1.0e-3
 
+# Wider dense windows than the fleet's, and this arm only. ALF-LB is the only arm that stores an
+# expert_bias, so it is the only one whose extra dense points buy anything. These two bracket both
+# phase boundaries rather than sitting inside one phase: warmup into stable and stable into decay.
+moe_probe_dense_windows: ["0:1000", "4500:5500"]
+
 output_dir: artifacts/exp1/alflb
