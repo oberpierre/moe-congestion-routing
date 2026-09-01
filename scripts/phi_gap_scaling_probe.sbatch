@@ -1,76 +1,62 @@
 #!/bin/bash
-#SBATCH --job-name=phi-gap-scaling
+#SBATCH --job-name=lp-contention
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
-#SBATCH --time=01:30:00
+#SBATCH --time=01:00:00
 #SBATCH --no-requeue
-#SBATCH --output=logs/phi_gap_scaling_%j.log
-#SBATCH --error=logs/phi_gap_scaling_%j.log
+#SBATCH --output=logs/lp_contention_%j.log
+#SBATCH --error=logs/lp_contention_%j.log
 
-# Measure how the phi-gap grid's per-cell cost changes with the worker count, on this node.
+# How much does one LP solve slow down when 287 of them run at once on this node?
 #
-#   sbatch scripts/phi_gap_scaling_probe.sbatch artifacts/exp1/control/control-trunk
+#   sbatch scripts/phi_gap_scaling_probe.sbatch <dump.npz>
+#   CPU_BIND=cores sbatch scripts/phi_gap_scaling_probe.sbatch <dump.npz>
 #
-# Why this exists. A full arm measured 856 s per cell per worker at 287 workers, against 77 s per
-# cell per worker on a 4-worker desktop. That 11x mixes three causes that cannot be separated from
-# one number: this node's per-core speed, the difficulty of the particular cells the grid reached,
-# and contention between 287 concurrent simplex solves whose working sets are about 1.1 GB each
-# against roughly 114 MB of last-level cache per Grace module. Only the third is fixable, so the
-# ratio between legs A and D below is what decides whether the fleet's 54 h is reducible.
+# Every worker solves the identical instance, so the only thing changing between legs is how many
+# run at once. That is the one comparison the grid itself cannot make, because a different worker
+# count there also means a different set of cells at a different difficulty.
 #
-# Each leg solves two cells per worker, so every leg takes about the same wall clock whatever its
-# worker count, and the reported seconds-per-cell-per-worker is directly comparable across legs.
-# Legs write to separate scratch CSVs, because a shared one would let resume skip the later legs
-# and measure nothing.
+# Submit it twice, once with CPU_BIND unset and once with CPU_BIND=cores, and compare. The
+# production grid does no binding today, and on a node with four separate memory attachments an
+# unpinned process is migrated away from the memory it allocated.
+#
+# ONE srun, deliberately. An earlier version ran a separate srun per leg and the second one died
+# with "pyxis: Path for EDF image storage must be absolute", because the container environment
+# does not survive into a second step. The worker count is a plain argument to the driver, so
+# every leg fits inside a single step.
 
 set -euo pipefail
 mkdir -p logs
 
 : "${WORKDIR:?set WORKDIR in config.sh and source it before sbatch}"
-RUN_DIR="${1:?pass a run directory, e.g. artifacts/exp1/control/control-trunk}"
+DUMP="${1:?pass one probe dump .npz}"
+LAYER="${2:-2}"
 
-SCRATCH="artifacts/phi_gap/scaling_probe_${SLURM_JOB_ID:-manual}"
+BIND_ARG=()
+if [ -n "${CPU_BIND:-}" ]; then
+  BIND_ARG=(--cpu-bind="$CPU_BIND")
+fi
+echo "[contention] dump=$DUMP layer=$LAYER cpu-bind=${CPU_BIND:-<none>}"
 
-run_leg () {
-  local name="$1" workers="$2" bind="$3"
-  local limit=$(( workers * 2 ))
-  local out="$SCRATCH/${name}.csv"
-  echo "[scaling] leg $name: $workers workers, $limit cells, cpu-bind=$bind"
-  local start
-  start=$(date +%s)
-  srun --nodes=1 --ntasks=1 --environment=alps6 --cpus-per-task "$SLURM_CPUS_PER_TASK" \
-       --cpu-bind="$bind" bash -c "
-    set -euo pipefail
-    cd $WORKDIR
-    set +u; source .venv/bin/activate; set -u
-    mkdir -p $SCRATCH
-    export OMP_NUM_THREADS=1
-    export OPENBLAS_NUM_THREADS=1
-    export MKL_NUM_THREADS=1
-    export NUMEXPR_NUM_THREADS=1
-    python scripts/run_phi_gap_grid.py \
-      --run-dir '$RUN_DIR' --out '$out' --workers $workers --limit $limit
-  "
-  local elapsed=$(( $(date +%s) - start ))
-  # Seconds of worker time per cell, which is the quantity that is flat when scaling is perfect.
-  echo "[scaling] RESULT leg=$name workers=$workers cells=$limit wall=${elapsed}s" \
-       "per_cell_per_worker=$(( elapsed * workers / limit ))s"
-}
+srun --nodes=1 --ntasks=1 --environment=alps6 --cpus-per-task "$SLURM_CPUS_PER_TASK" \
+     "${BIND_ARG[@]}" bash -c "
+  set -euo pipefail
+  cd $WORKDIR
+  set +u; source .venv/bin/activate; set -u
 
-# A is the uncontended baseline: one solve at a time on this hardware, on the same cells the
-# other legs start from, so it isolates per-core speed and cell difficulty from contention.
-run_leg A_serial     1   none
-run_leg B_half     144   none
-run_leg C_full     287   none
-# D repeats C with processes pinned, which the production sbatch does not do today. On a node with
-# four memory attachments an unpinned process is migrated away from the memory it allocated.
-run_leg D_full_bound 287 cores
+  export OMP_NUM_THREADS=1
+  export OPENBLAS_NUM_THREADS=1
+  export MKL_NUM_THREADS=1
+  export NUMEXPR_NUM_THREADS=1
 
-echo "[scaling] done. Compare per_cell_per_worker across legs:"
-echo "[scaling]   A == C          -> no contention, the cost is hardware and cell difficulty"
-echo "[scaling]   C >> A, D << C  -> binding is the fix, add --cpu-bind=cores to the grid sbatch"
-echo "[scaling]   C >> A, D ~= C  -> memory-bound; run fewer workers per node and more nodes"
+  python scripts/lp_contention_probe.py '$DUMP' --layer $LAYER --unit u0 \
+    --workers 1 --workers 32 --workers 128 --workers 287
+"
+
+echo "[contention] read the slowdown_vs_first_leg column:"
+echo "[contention]   flat            -> no contention; the grid's cost is hardware and cell difficulty"
+echo "[contention]   rises with N    -> contention; rerun with CPU_BIND=cores to see if pinning fixes it"
