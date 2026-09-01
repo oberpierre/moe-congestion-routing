@@ -4,7 +4,7 @@
 Prints the potential-gap row, once per declared reference cost, with the incremental-arc LP
 oracle actually solved. This is a diagnostic driver over a single dump, not the sweep: the
 per-arm CSV layout, the resume-on-restart read and the uniqueness assertion over
-``(run_id, arm, asset, layer, step, cost_family, lam)`` belong to a separate grid driver over
+``(run_id, arm, asset, unit, layer, step, cost_family, lam)`` belong to a separate grid driver over
 many dumps, arms and steps.
 
 Usage:
