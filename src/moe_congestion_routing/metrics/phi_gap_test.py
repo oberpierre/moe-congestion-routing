@@ -348,3 +348,96 @@ def test_arc_schedule_length_reproduces_the_measured_table(
         arc_schedule_length(n, k, e, max_span, lam=lam, cost_family="quadratic")
         == expected_quadratic
     )
+
+
+def test_lam_zero_equals_the_solver_on_a_small_instance(tmp_path, monkeypatch):
+    # phi_gap_rows(lam=0) must not call solve_incremental at all, so this proves the closed form
+    # agrees with what an explicit all-zero-price solve of the same instance would have returned.
+    monkeypatch.setattr(probe_comparison, "UNIT_TOKENS", 8)
+
+    n, e, k = 8, 4, 1
+    rng = numpy.random.default_rng(13)
+    scores = rng.uniform(0.05, 0.95, size=(n, e))
+    logits = numpy.log(scores / (1.0 - scores))[numpy.newaxis, :, :].astype(numpy.float32)
+    routing_map = numpy.zeros((1, n, e), dtype=bool)
+    routing_map[0, :, 0] = True
+    path = _write_dump(tmp_path / "probes", step=0, logits=logits, routing_map=routing_map, topk=k)
+
+    dump = read_dump(path)
+    row = phi_gap_rows(dump, layer=2, unit="u0", lam=0.0, cost_families=("linear",))[0]
+
+    a = dump.router_scores()[0]
+    # n arcs at price 0 seats any assignment, including the one every expert would need if every
+    # token concentrated on it, so this schedule never saturates.
+    oracle = solve_incremental(a, k, numpy.zeros(n))
+    affinity_realized = float(a[routing_map[0]].sum())
+    phi_star = oracle.affinity - oracle.congestion
+    gap_per_token = (phi_star - affinity_realized) / n
+
+    baseline_experts = _balanced_assignment(n, k, e)
+    tokens = numpy.arange(n)[:, None]
+    affinity_baseline = float(a[tokens, baseline_experts].sum())
+    normalizer = phi_star - affinity_baseline
+
+    assert row.gap_per_token == pytest.approx(gap_per_token, abs=1e-9)
+    assert row.gap_normalized == pytest.approx(gap_per_token * n / normalizer, abs=1e-9)
+
+
+def test_lam_zero_is_zero_at_topk_and_positive_off_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(probe_comparison, "UNIT_TOKENS", 8)
+
+    from moe_congestion_routing.game.alflb import top_k_map
+
+    n, e, k = 8, 4, 2
+    rng = numpy.random.default_rng(17)
+    logits = rng.normal(size=(1, n, e)).astype(numpy.float32)
+
+    # Read once to get router_scores() in the exact form phi_gap_rows will also see, the same
+    # trick test_gap_normalized_is_zero_at_the_oracle_and_one_at_the_baseline uses above.
+    probe_path = _write_dump(
+        tmp_path / "probes_a",
+        step=0,
+        logits=logits,
+        routing_map=numpy.zeros((1, n, e), dtype=bool),
+        topk=k,
+    )
+    a = read_dump(probe_path).router_scores()[0]
+
+    topk_idx = top_k_map(a, k)
+    topk_map = numpy.zeros((1, n, e), dtype=bool)
+    numpy.put_along_axis(topk_map[0], topk_idx, True, axis=1)
+    topk_path = _write_dump(
+        tmp_path / "probes_topk", step=0, logits=logits, routing_map=topk_map, topk=k
+    )
+    topk_row = phi_gap_rows(
+        read_dump(topk_path), layer=2, unit="u0", lam=0.0, cost_families=("linear",)
+    )[0]
+    assert topk_row.gap_normalized == pytest.approx(0.0, abs=1e-12)
+
+    # Move token 0 off its top-K set onto an expert it did not select, so the assignment is no
+    # longer top-K anywhere else being touched.
+    perturbed_map = topk_map.copy()
+    selected = numpy.flatnonzero(perturbed_map[0, 0])
+    unselected = numpy.flatnonzero(~perturbed_map[0, 0])
+    perturbed_map[0, 0, selected[0]] = False
+    perturbed_map[0, 0, unselected[0]] = True
+    perturbed_path = _write_dump(
+        tmp_path / "probes_perturbed", step=0, logits=logits, routing_map=perturbed_map, topk=k
+    )
+    perturbed_row = phi_gap_rows(
+        read_dump(perturbed_path), layer=2, unit="u0", lam=0.0, cost_families=("linear",)
+    )[0]
+    assert perturbed_row.gap_normalized > 0
+
+
+def test_lam_negative_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(probe_comparison, "UNIT_TOKENS", 4)
+
+    n, e, k = 4, 2, 1
+    logits = numpy.zeros((1, n, e), dtype=numpy.float32)
+    routing_map = numpy.zeros((1, n, e), dtype=bool)
+    routing_map[0, :, 0] = True
+    path = _write_dump(tmp_path / "probes", step=0, logits=logits, routing_map=routing_map, topk=k)
+
+    with pytest.raises(ValueError, match="lam"):
+        phi_gap_rows(read_dump(path), layer=2, unit="u0", lam=-1.0)

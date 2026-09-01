@@ -9,12 +9,12 @@ integral. This module reads one probe dump's unit, builds the three assignments 
 the gap between the realized potential and the oracle's, raw and normalized.
 """
 
-import math
 from collections.abc import Sequence
 from typing import NamedTuple
 
 import numpy as np
 
+from moe_congestion_routing.game.alflb import top_k_map
 from moe_congestion_routing.game.incremental import solve_incremental
 from moe_congestion_routing.losses.cost_families import (
     discrete_potential,
@@ -114,8 +114,12 @@ def phi_gap_rows(
     back in: the game scores what the router valued, and ALF-LB's bias is a balancing mechanism
     acting on that value rather than a term in it. ``admissible`` is always reported as a column,
     never used to skip the row, because a refused unit's gap is still a real reading of a router
-    far from equilibrium rather than an artifact of the screen.
+    far from equilibrium rather than an artifact of the screen. ``lam == 0`` is scored
+    analytically, top-K of the affinity alone with no LP call, matching the objective's own zero
+    prices. ``lam < 0`` raises, because a negative price has no meaning for this game.
     """
+    if lam < 0:
+        raise ValueError(f"lam must be non-negative, got {lam}")
     axis = _layer_axis(dump, layer)
     scores = dump.router_scores()[axis]
     routing = dump.routing_map()[axis]
@@ -131,10 +135,9 @@ def phi_gap_rows(
     n, e = a.shape
     k = dump.topk
     balanced_load = n * k / e
-    # Fixed at exactly this length, not tuned: a shorter schedule starves the feasibility floor
-    # into growing the arc budget mid-solve, whereas a longer one spends solve time nothing here
-    # needs.
-    num_arcs = 2 * math.ceil(n * k / e)
+    # The oracle's own span bound, computed here rather than left to solve_incremental, because
+    # arc_schedule_length needs it before the price array it sizes even exists.
+    max_span = float((a.max(axis=1) - a.min(axis=1)).max())
 
     screen = screen_batch(realized, k)
 
@@ -148,10 +151,26 @@ def phi_gap_rows(
 
     rows = []
     for cost_family in cost_families:
-        arc_prices = marginal_cost(
-            np.arange(1, num_arcs + 1), balanced_load, lam=lam, cost_family=cost_family
-        )
-        oracle = solve_incremental(a, k, arc_prices)
+        if lam == 0:
+            # At zero prices the objective is affinity alone, whose maximum under Sigma_e
+            # x_ie = K is plain top-K, so the oracle is this closed form rather than an LP call.
+            topk_idx = top_k_map(a, k)
+            affinity_star = float(np.take_along_axis(a, topk_idx, axis=1).sum())
+            congestion_star = 0.0
+            arc_growths = 0
+            max_fractional_deviation = 0.0
+            arcs_used_max = int(np.bincount(topk_idx.ravel(), minlength=e).max())
+        else:
+            num_arcs = arc_schedule_length(n, k, e, max_span, lam=lam, cost_family=cost_family)
+            arc_prices = marginal_cost(
+                np.arange(1, num_arcs + 1), balanced_load, lam=lam, cost_family=cost_family
+            )
+            oracle = solve_incremental(a, k, arc_prices)
+            affinity_star = oracle.affinity
+            congestion_star = oracle.congestion
+            arc_growths = oracle.arc_growths
+            max_fractional_deviation = oracle.max_fractional_deviation
+            arcs_used_max = int(oracle.arcs_used.max())
 
         congestion_realized = discrete_potential(
             loads_realized, balanced_load, lam=lam, cost_family=cost_family
@@ -161,7 +180,7 @@ def phi_gap_rows(
         )
 
         phi_realized = affinity_realized - congestion_realized
-        phi_star = oracle.affinity - oracle.congestion
+        phi_star = affinity_star - congestion_star
         phi_baseline = affinity_baseline - congestion_baseline
 
         gap_per_token = (phi_star - phi_realized) / n
@@ -173,8 +192,8 @@ def phi_gap_rows(
             "realized assignment it is supposed to dominate"
         )
 
-        affinity_shortfall = (oracle.affinity - affinity_realized) / n
-        congestion_excess = (congestion_realized - oracle.congestion) / n
+        affinity_shortfall = (affinity_star - affinity_realized) / n
+        congestion_excess = (congestion_realized - congestion_star) / n
         decomposition_sum = affinity_shortfall + congestion_excess
         assert abs(decomposition_sum - gap_per_token) <= 1e-9 * max(abs(gap_per_token), 1.0), (
             f"affinity_shortfall + congestion_excess ({decomposition_sum}) does not reproduce "
@@ -210,9 +229,9 @@ def phi_gap_rows(
                 congestion_excess=congestion_excess,
                 gap_normalized=gap_normalized,
                 normalizer=normalizer,
-                arc_growths=oracle.arc_growths,
-                arcs_used_max=int(oracle.arcs_used.max()),
-                max_fractional_deviation=oracle.max_fractional_deviation,
+                arc_growths=arc_growths,
+                arcs_used_max=arcs_used_max,
+                max_fractional_deviation=max_fractional_deviation,
                 token_sha256=dump.token_sha256,
                 dump_path=str(dump.path),
             )
