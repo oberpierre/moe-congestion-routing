@@ -9,7 +9,12 @@ import pytest
 from moe_congestion_routing.game.incremental import solve_incremental
 from moe_congestion_routing.losses.cost_families import marginal_cost
 from moe_congestion_routing.metrics import probe_comparison
-from moe_congestion_routing.metrics.phi_gap import PhiGapRow, _balanced_assignment, phi_gap_rows
+from moe_congestion_routing.metrics.phi_gap import (
+    PhiGapRow,
+    _balanced_assignment,
+    arc_schedule_length,
+    phi_gap_rows,
+)
 from moe_congestion_routing.metrics.probe_dump_format import ROUTING_MAP_BITORDER
 from moe_congestion_routing.metrics.probe_series import read_dump
 
@@ -316,3 +321,30 @@ def test_phi_gap_rows_scores_a_softmax_dump(tmp_path, monkeypatch):
     assert row.score_function == "softmax"
     assert row.affinity_space == "score"
     assert math.isfinite(row.gap_per_token) and row.gap_per_token >= 0.0
+
+
+# n=16384, k=8, e=64, max_span=0.202505 is the real shape measured on the control arm's step-0
+# layer-2 unit u0. For lam >= 0.25 the feasibility floor governs in both families and the schedule
+# is the constant 4096 the committed rows were solved at, so this table is what stops the sweep
+# silently redefining that budget.
+_SCHEDULE_TABLE = [
+    (8.0, 4096, 4096),
+    (4.0, 4096, 4096),
+    (2.0, 4096, 4096),
+    (1.0, 4096, 4096),
+    (0.5, 4096, 4096),
+    (0.25, 4096, 4096),
+    (0.125, 6636, 5214),
+]
+
+
+@pytest.mark.parametrize("lam,expected_linear,expected_quadratic", _SCHEDULE_TABLE)
+def test_arc_schedule_length_reproduces_the_measured_table(
+    lam, expected_linear, expected_quadratic
+):
+    n, k, e, max_span = 16384, 8, 64, 0.202505
+    assert arc_schedule_length(n, k, e, max_span, lam=lam, cost_family="linear") == expected_linear
+    assert (
+        arc_schedule_length(n, k, e, max_span, lam=lam, cost_family="quadratic")
+        == expected_quadratic
+    )

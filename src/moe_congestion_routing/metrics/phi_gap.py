@@ -16,7 +16,11 @@ from typing import NamedTuple
 import numpy as np
 
 from moe_congestion_routing.game.incremental import solve_incremental
-from moe_congestion_routing.losses.cost_families import discrete_potential, marginal_cost
+from moe_congestion_routing.losses.cost_families import (
+    discrete_potential,
+    first_arc_above_price,
+    marginal_cost,
+)
 from moe_congestion_routing.metrics.probe_comparison import probe_units, screen_batch
 from moe_congestion_routing.metrics.probe_series import ProbeDump
 
@@ -75,6 +79,24 @@ def _balanced_assignment(n: int, k: int, e: int) -> np.ndarray:
     i = np.arange(n)[:, None]
     m = np.arange(k)[None, :]
     return (i * k + m) % e
+
+
+def arc_schedule_length(
+    n: int, k: int, e: int, max_span: float, *, lam: float, cost_family: str
+) -> int:
+    """The arc budget ``J`` every expert's schedule is truncated to at this ``lam``.
+
+    ``min(n, 2 * max(J_span, ceil(n*k/e)))``, where ``J_span`` is the smallest arc index whose
+    price exceeds the unit's own largest per-token affinity span. The feasibility floor
+    ``ceil(n*k/e)`` alone leaves no aggregate slack, so pigeonhole saturates the first solve
+    whatever the prices are, and doubling it starts one growth ahead where a caller-supplied
+    schedule allows it.
+    """
+    balanced_load = n * k / e
+    j_span = first_arc_above_price(max_span, balanced_load, lam=lam, cost_family=cost_family)
+    # Integer ceiling of n*k/e without float rounding, matching solve_incremental's own floor.
+    feasibility_floor = -(-n * k // e)
+    return min(n, 2 * max(j_span, feasibility_floor))
 
 
 def phi_gap_rows(

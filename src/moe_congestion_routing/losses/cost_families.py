@@ -4,6 +4,7 @@ Deliberately ``torch``-free: ``training/pretrain_config.py`` imports the names
 from here to validate a config, and ``--dry-run`` should not require ``torch``.
 """
 
+import math
 from typing import NamedTuple
 
 import numpy as np
@@ -49,6 +50,34 @@ def marginal_cost(
     p = cost_exponent(cost_family)
     j_arr = np.asarray(j, dtype=np.float64)
     return lam * (j_arr / balanced_load) ** p
+
+
+def first_arc_above_price(
+    threshold: float,
+    balanced_load: float,
+    *,
+    lam: float = 1.0,
+    cost_family: str = "linear",
+) -> int:
+    """The smallest 1-based ``j`` with ``marginal_cost(j, ...) > threshold``, in closed form.
+
+    ``marginal_cost`` is strictly increasing in ``j`` for ``lam > 0``, so the crossing point
+    ``x* = balanced_load * (threshold/lam)**(1/p)`` is unique and ``j = floor(x*) + 1``.
+    ``threshold <= 0`` returns 1 directly, because ``marginal_cost(1, ...) > 0`` already, and the
+    real branch's fractional power would otherwise be taken of a negative base under the quadratic
+    family. This is the inverse of ``marginal_cost`` and is what lets a caller size an arc schedule
+    from a price bound without building the schedule first.
+    """
+    p = cost_exponent(cost_family)
+    if lam <= 0:
+        raise ValueError(
+            f"lam must be positive, got {lam}: at lam <= 0 every marginal cost is 0, so no j "
+            "ever exceeds a positive threshold and the inverse is undefined"
+        )
+    if threshold <= 0:
+        return 1
+    x_star = balanced_load * (threshold / lam) ** (1.0 / p)
+    return math.floor(x_star) + 1
 
 
 def discrete_potential(

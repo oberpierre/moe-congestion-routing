@@ -16,6 +16,7 @@ from moe_congestion_routing.losses.cost_families import (
     check_variant,
     cost_exponent,
     discrete_potential,
+    first_arc_above_price,
     marginal_cost,
     pressure_bound,
 )
@@ -250,3 +251,36 @@ def test_marginal_cost_unknown_cost_family_raises():
 def test_discrete_potential_unknown_cost_family_raises():
     with pytest.raises(ValueError, match="bogus"):
         discrete_potential(np.array([1, 2]), _BALANCED_LOAD, cost_family="bogus")
+
+
+# Several (threshold, balanced_load) pairs, including the real shape's measured span and its
+# balanced load, plus a threshold at and below zero to exercise the early-return branch.
+_THRESHOLD_CASES = [
+    (0.202505, 2048.0),
+    (5.0, 32.0),
+    (0.0, 10.0),
+    (-3.0, 10.0),
+]
+
+
+@pytest.mark.parametrize("cost_family", COST_FAMILIES)
+@pytest.mark.parametrize("lam", [0.125, 1.0, 3.0])
+@pytest.mark.parametrize("threshold,balanced_load", _THRESHOLD_CASES)
+def test_first_arc_above_price_agrees_with_brute_force(cost_family, lam, threshold, balanced_load):
+    j = first_arc_above_price(threshold, balanced_load, lam=lam, cost_family=cost_family)
+    assert float(marginal_cost(j, balanced_load, lam=lam, cost_family=cost_family)) > threshold
+    if j > 1:
+        below = float(marginal_cost(j - 1, balanced_load, lam=lam, cost_family=cost_family))
+        assert below <= threshold
+
+
+def test_first_arc_above_price_nonpositive_lam_raises():
+    with pytest.raises(ValueError, match="lam"):
+        first_arc_above_price(1.0, 10.0, lam=0.0, cost_family="linear")
+    with pytest.raises(ValueError, match="lam"):
+        first_arc_above_price(1.0, 10.0, lam=-1.0, cost_family="linear")
+
+
+def test_first_arc_above_price_unknown_cost_family_raises():
+    with pytest.raises(ValueError, match="bogus"):
+        first_arc_above_price(1.0, 10.0, cost_family="bogus")
