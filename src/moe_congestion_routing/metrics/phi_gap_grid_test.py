@@ -189,6 +189,25 @@ def test_enumerate_cells_is_the_full_cross_product(tmp_path, monkeypatch):
     assert all(c.lam == 1.0 for c in cells)
 
 
+def test_enumerate_cells_two_lams_double_the_cells_with_lam_fastest(tmp_path, monkeypatch):
+    from moe_congestion_routing.metrics import probe_comparison
+
+    monkeypatch.setattr(probe_comparison, "UNIT_TOKENS", 4)
+    run_dir = tmp_path / "run"
+    _write_dump(run_dir / "probes" / "asset0", step=0, num_layers=1, n_tokens=4)
+
+    one_lam = enumerate_cells(run_dir, lams=(1.0,), cost_families=("linear",))
+    two_lams = enumerate_cells(run_dir, lams=(1.0, 2.0), cost_families=("linear",))
+    assert len(two_lams) == 2 * len(one_lam)
+
+    # A single (asset, layer, unit, cost_family) combination here, so lam varying fastest means
+    # the two cells differ only in lam, in ascending order, rather than the whole grid repeating.
+    assert [c.lam for c in two_lams] == [1.0, 2.0]
+    assert {(c.asset, c.layer, c.unit, c.cost_family) for c in two_lams} == {
+        (c.asset, c.layer, c.unit, c.cost_family) for c in one_lam
+    }
+
+
 def test_enumerate_cells_filters_by_asset_layer_step(tmp_path, monkeypatch):
     from moe_congestion_routing.metrics import probe_comparison
 

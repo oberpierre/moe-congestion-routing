@@ -38,7 +38,13 @@ def main() -> None:
     parser.add_argument(
         "--workers", type=int, default=1, help="worker processes, spawn-started (default: 1)"
     )
-    parser.add_argument("--lam", type=float, default=1.0, help="lambda for both reference costs")
+    parser.add_argument(
+        "--lam",
+        action="append",
+        dest="lams",
+        type=float,
+        help="repeatable, lambda for both reference costs (default: [1.0])",
+    )
     parser.add_argument(
         "--cost-family",
         action="append",
@@ -76,10 +82,11 @@ def main() -> None:
     run_id = args.run_id or run_dir.name
     arm = args.arm or run_dir.parent.name
     cost_families = tuple(args.cost_families) if args.cost_families else COST_FAMILIES
+    lams = tuple(args.lams) if args.lams else (1.0,)
 
     cells = enumerate_cells(
         run_dir,
-        lam=args.lam,
+        lams=lams,
         cost_families=cost_families,
         assets=args.assets,
         layers=args.layers,

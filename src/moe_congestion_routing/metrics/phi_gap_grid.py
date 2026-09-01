@@ -97,7 +97,7 @@ CSV_FIELDS = KEY_FIELDS + ("status", "detail") + _PHI_GAP_DATA_FIELDS
 def enumerate_cells(
     run_dir: Path,
     *,
-    lam: float = 1.0,
+    lams: Sequence[float] = (1.0,),
     cost_families: Sequence[str] = ("linear", "quadratic"),
     assets: Sequence[str] | None = None,
     layers: Sequence[int] | None = None,
@@ -109,6 +109,11 @@ def enumerate_cells(
     thousands of cells costs one small `numpy.load` per dump rather than one LP solve. `assets`,
     `layers` and `steps` narrow the sweep to the named values when given, keeping their
     dump-native order otherwise.
+
+    `lams` varies fastest, ahead of `cost_family` and everything before it, so a sweep interrupted
+    partway through leaves every `(asset, layer, unit, cost_family)` group it reached with a
+    complete set of the lambdas visited so far. A grid ordered the other way would instead leave
+    every group truncated, which is a frontier that cannot be drawn rather than one that can.
     """
     probes_dir = Path(run_dir) / "probes"
     if not probes_dir.is_dir():
@@ -131,17 +136,18 @@ def enumerate_cells(
             for layer in dump_layers:
                 for unit_name, _start, _stop in units:
                     for cost_family in cost_families:
-                        cells.append(
-                            Cell(
-                                dump_path=dump_path,
-                                asset=asset_dir.name,
-                                step=dump.step,
-                                layer=layer,
-                                unit=unit_name,
-                                cost_family=cost_family,
-                                lam=lam,
+                        for lam in lams:
+                            cells.append(
+                                Cell(
+                                    dump_path=dump_path,
+                                    asset=asset_dir.name,
+                                    step=dump.step,
+                                    layer=layer,
+                                    unit=unit_name,
+                                    cost_family=cost_family,
+                                    lam=lam,
+                                )
                             )
-                        )
     return cells
 
 
