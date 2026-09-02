@@ -33,6 +33,11 @@
 #
 # Then concatenate, keeping one header:
 #   awk 'FNR==1 && NR!=1 {next} {print}' assets/results/phi-gap/<arm>.*.csv > assets/results/phi-gap/<arm>.csv
+#
+# Measured at 287 workers: 1208 cells/hour, so a standard arm's 5664 cells take 4.7 h and ALF-LB's
+# 9120 take 7.6 h, which is why the limit is 6 h and ALF-LB must be split. Do not add --cpu-bind:
+# it measured 3x slower, because one task's mask is inherited by all 287 children rather than
+# spreading them over the node's four memory attachments.
 
 set -euo pipefail
 mkdir -p logs
