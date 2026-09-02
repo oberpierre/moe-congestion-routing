@@ -396,6 +396,51 @@ def _centred_corr(u: np.ndarray, v: np.ndarray) -> float:
     return float(np.dot(u, v) / denom) if denom > 0 else float("nan")
 
 
+def zscored_unit_axis(axis: np.ndarray) -> np.ndarray:
+    """``axis``, z-scored then normalised to unit length: the direction :func:`project_out` removes.
+
+    Z-scoring first, not just normalising, makes the axis exactly mean-zero. That is what lets a
+    projection along it leave every price's and every bias's additive gauge intact, since the
+    capacity duals here are fixed only up to an additive constant and a mean-zero axis has zero
+    dot product with any constant shift.
+    """
+    axis = np.asarray(axis, dtype=np.float64)
+    z = (axis - axis.mean()) / axis.std()
+    norm = float(np.linalg.norm(z))
+    if norm == 0:
+        raise ValueError("axis has zero variance after z-scoring, so it has no direction")
+    return z / norm
+
+
+def project_out(vectors: np.ndarray, axis: np.ndarray) -> np.ndarray:
+    """Remove each row of ``vectors``' component along ``axis``, z-scored and unit-normalised.
+
+    ``axis`` is the code-heavy unit's raw capacity duals, ``[E]``. ``vectors`` is one price or
+    bias vector, ``[E]``, or a stack of several, ``[..., E]``. Correcting `kappa` this way is
+    symmetric: apply it to every price vector **and** to `b` alike, because projecting the prices
+    alone would leave `b`'s own component along the axis correlating with nothing, which changes
+    the correlation by an amount that has nothing to do with the confound being removed.
+    """
+    vectors = np.asarray(vectors, dtype=np.float64)
+    unit = zscored_unit_axis(axis)
+    coeff = vectors @ unit
+    return vectors - coeff[..., None] * unit
+
+
+def axis_angle_degrees(axis_a: np.ndarray, axis_b: np.ndarray) -> float:
+    """The angle, in degrees, between two candidate composition axes.
+
+    Both go through the same z-score-then-normalise transform :func:`project_out` uses, so this
+    asks whether two independently derived axes point the same direction rather than whether
+    their raw duals happen to agree in scale. Used to cross-check the axis definition wherever a
+    second, independent way of drawing it is available.
+    """
+    u = zscored_unit_axis(axis_a)
+    v = zscored_unit_axis(axis_b)
+    cosine = float(np.clip(np.dot(u, v), -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+
 def half_split_row(
     bias: np.ndarray,
     duals_a: np.ndarray,
@@ -416,6 +461,12 @@ def half_split_row(
 
     Re-centering happens inside the resample rather than once outside it, because the gauge is a
     property of the expert set being correlated and a resample is a different set.
+
+    `kappa` is refused to NaN, here rather than in either caller, whenever ``rho < product``, on
+    the point estimate and on every resample alike. `kappa` estimates a correlation and cannot
+    exceed 1, and `kappa**2 == product/rho`, so `kappa > 1` is exactly that condition: a cell whose
+    denominator is below the product of its own numerators has violated the model the estimator
+    assumes, and the value is a detected failure rather than a large measurement.
     """
     rng = np.random.default_rng(seed)
     n = bias.shape[0]
@@ -430,6 +481,9 @@ def half_split_row(
         r = _centred_corr(duals_a[idx], duals_b[idx])
         rhos[i] = r
         ratio = _centred_corr(bias[idx], duals_a[idx]) * _centred_corr(bias[idx], duals_b[idx])
+        # The >1 refusal below applies to the point estimate, not here: a single resample of 64
+        # experts is exactly where sampling noise is expected to cross the model's own boundary,
+        # so pruning it here would narrow the interval by construction rather than measure it.
         kappas.append(np.sqrt(ratio / r) if r > 0 and ratio > 0 else np.nan)
     kappas = np.asarray(kappas)
     finite = kappas[np.isfinite(kappas)]
@@ -438,7 +492,9 @@ def half_split_row(
     # capacity constraint coupling the experts inside one LP solve, which is why it is the bar and
     # the bootstrap is the interval.
     z, se = np.arctanh(np.clip(rho, -0.999999, 0.999999)), 1.0 / np.sqrt(max(n - 3, 1))
-    ratio_point = c_a * c_b / rho if rho > 0 and c_a * c_b > 0 else float("nan")
+    ratio_point = c_a * c_b
+    admissible = rho > 0 and 0 < ratio_point <= rho
+    kappa_point = float(np.sqrt(ratio_point / rho)) if admissible else float("nan")
 
     return HalfSplitRow(
         step=step,
@@ -446,7 +502,7 @@ def half_split_row(
         rho=rho,
         corr_bias_a=c_a,
         corr_bias_b=c_b,
-        kappa=float(np.sqrt(ratio_point)) if ratio_point == ratio_point else float("nan"),
+        kappa=kappa_point,
         rho_fisher_low=float(np.tanh(z - 1.96 * se)),
         rho_fisher_high=float(np.tanh(z + 1.96 * se)),
         rho_boot_low=float(np.percentile(rhos, 2.5)),

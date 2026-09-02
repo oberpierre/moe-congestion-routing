@@ -31,6 +31,14 @@ CSV's `admissible` column records. It does not change any value the CSV writes: 
 side effect of the LP solves this script already pays for, or, when only one side of a cell's
 conjunction is admissible, one extra solve for that side alone.
 
+`--project-code-axis` corrects a composition confound: tail, strided and spread sit on a shared
+content axis, with the code-heavy content concentrated in run B's own strided u0 (excluded from
+every pairing because a single expert dominates its routing). This prices that unit at the same
+`(step, layer)` purely as an axis reference, and projects it out of `bias`, `duals_tail` and
+`duals_strided` alike before scoring them, which is symmetric because projecting the prices alone
+would leave `bias`'s own axis component correlating with nothing. This needs no new forward
+passes: run B's dumps already carry strided u0 at every probe step.
+
 Usage:
     uv run python scripts/run_kappa_trajectory.py --out artifacts/game/kappa_trajectory.csv
 """
@@ -48,6 +56,7 @@ from moe_congestion_routing.game import lp
 from moe_congestion_routing.metrics.probe_comparison import (
     UNIT_TOKENS,
     half_split_row,
+    project_out,
     screen_batch,
 )
 from moe_congestion_routing.metrics.probe_series import probe_dump_path, read_dump, read_series
@@ -81,7 +90,7 @@ def _cell(job: tuple) -> tuple[dict, dict | None]:
     Returns the CSV row unchanged by ``dump_duals`` and, only when it is set, a second dict of
     this cell's own duals/bias/admissibility for the price-lag `.npz`.
     """
-    step, axis, resamples, seed, dump_duals = job
+    step, axis, resamples, seed, dump_duals, project_code_axis = job
     a = read_dump(probe_dump_path(RUN_A, step))
     b = read_dump(probe_dump_path(RUN_B, step))
     layer = int(a.layer_numbers[axis])
@@ -144,8 +153,21 @@ def _cell(job: tuple) -> tuple[dict, dict | None]:
     else:
         duals_tail = lp.solve(a.affinities()[axis][:UNIT_TOKENS], a.topk).capacity_duals
         duals_strided = lp.solve(b.affinities()[axis][UNIT_TOKENS:], b.topk).capacity_duals
+    bias = a.expert_bias()[axis]
+
+    if project_code_axis:
+        # Run B's strided u0 is excluded from every pairing because a single expert dominates
+        # its routing, which is exactly what makes it a clean reference for the code-heavy
+        # content axis. Priced here regardless of its own concentration screen, since only its
+        # direction is used, and projected out of bias and both prices alike, because projecting
+        # the prices alone would leave bias's own axis component correlating with nothing.
+        code_axis = lp.solve(b.affinities()[axis][:UNIT_TOKENS], b.topk).capacity_duals
+        bias = project_out(bias, code_axis)
+        duals_tail = project_out(duals_tail, code_axis)
+        duals_strided = project_out(duals_strided, code_axis)
+
     stats = half_split_row(
-        a.expert_bias()[axis],
+        bias,
         duals_tail,
         duals_strided,
         step=step,
@@ -181,6 +203,14 @@ def main() -> None:
         default=None,
         help="also write duals_a/b, bias_a/b and admissible_a/b for every cell to this .npz",
     )
+    parser.add_argument(
+        "--project-code-axis",
+        action="store_true",
+        help=(
+            "project run B's strided u0 (the code-heavy composition confound) out of bias and "
+            "both prices before scoring each cell"
+        ),
+    )
     args = parser.parse_args()
 
     steps_a = {d.step for d in read_series(RUN_A).dumps}
@@ -189,7 +219,7 @@ def main() -> None:
     if args.steps:
         steps = [s for s in steps if s in set(args.steps)]
     jobs = [
-        (s, axis, args.resamples, args.seed, bool(args.dump_duals))
+        (s, axis, args.resamples, args.seed, bool(args.dump_duals), args.project_code_axis)
         for s in steps
         for axis in range(8)
     ]

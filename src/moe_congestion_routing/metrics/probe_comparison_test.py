@@ -468,8 +468,13 @@ def test_half_split_row_recovers_kappa_when_the_halves_have_very_unequal_noise()
 
 
 def test_half_split_row_reports_a_diluted_bias_below_one():
-    """A bias that is only partly the population price must come back with kappa < 1."""
-    rng = numpy.random.default_rng(11)
+    """A bias that is only partly the population price must come back with kappa < 1.
+
+    Seed chosen so the exact case's point estimate clears the `rho >= c_a * c_b` refusal with
+    room to spare: at `kappa_true = 1` that boundary sits exactly at the point being estimated, so
+    an unlucky seed can land the noisy point estimate on its NaN side by sampling alone.
+    """
+    rng = numpy.random.default_rng(2)
     n = 64
     p_bar = rng.normal(size=n)
     duals_a = p_bar + 0.5 * rng.normal(size=n)
@@ -482,6 +487,27 @@ def test_half_split_row_reports_a_diluted_bias_below_one():
         p_bar + 1.0 * rng.normal(size=n), duals_a, duals_b, step=0, layer=2, resamples=400, seed=3
     )
     assert diluted.kappa < 0.9 < exact.kappa
+
+
+def test_half_split_row_refuses_kappa_above_one_rather_than_reporting_it():
+    """`kappa` cannot exceed 1: `kappa**2 == c_a * c_b / rho`, so a cell whose `rho` sits below
+    `c_a * c_b` must come back NaN rather than as a value above 1.
+
+    `bias == p_bar` exactly puts `kappa_true` exactly at 1, which is exactly the `rho == c_a * c_b`
+    boundary, so this seed and noise level (already known to land on the refused side of it) pins
+    the case rather than approximating it.
+    """
+    rng = numpy.random.default_rng(11)
+    n = 64
+    p_bar = rng.normal(size=n)
+    duals_a = p_bar + 0.5 * rng.normal(size=n)
+    duals_b = p_bar + 1.5 * rng.normal(size=n)
+
+    row = probe_comparison.half_split_row(
+        p_bar, duals_a, duals_b, step=0, layer=0, resamples=50, seed=0
+    )
+    assert row.corr_bias_a * row.corr_bias_b > row.rho  # the refusal condition holds
+    assert numpy.isnan(row.kappa)
 
 
 def test_screen_batch_refuses_concentration_and_dead_experts():
@@ -705,3 +731,54 @@ def test_segment_autocorr_raises_when_a_segment_would_be_too_thin():
 
     with pytest.raises(ValueError, match="below the minimum"):
         probe_comparison.segment_autocorr(deltas, segments=3, min_per_segment=8)
+
+
+# --- the composition-axis correction --------------------------------------------------------
+
+
+def test_project_out_is_a_noop_when_the_axis_is_orthogonal_to_the_data():
+    """A vector with zero dot product against the (z-scored) axis must come back unchanged."""
+    axis = numpy.array([1.0, -1.0, 1.0, -1.0])  # already mean-zero
+    vectors = numpy.array([1.0, 1.0, -1.0, -1.0])  # dot(vectors, axis) == 0
+
+    projected = probe_comparison.project_out(vectors, axis)
+
+    numpy.testing.assert_allclose(projected, vectors)
+
+
+def test_project_out_removes_exactly_the_axis_component_and_keeps_the_additive_gauge():
+    """The residual must be orthogonal to the (z-scored) axis, and a constant shift added to
+    ``vectors`` beforehand must survive unchanged: the z-scored axis is exactly mean-zero, so it
+    has zero dot product with any constant vector, and removing its component must leave a
+    constant added to the duals exactly where it was rather than absorbing it."""
+    rng = numpy.random.default_rng(0)
+    axis = rng.normal(size=8)
+    vectors = rng.normal(size=8)
+
+    projected = probe_comparison.project_out(vectors, axis)
+    unit = probe_comparison.zscored_unit_axis(axis)
+    assert numpy.dot(projected, unit) == pytest.approx(0.0, abs=1e-10)
+
+    shifted = probe_comparison.project_out(vectors + 5.0, axis)
+    numpy.testing.assert_allclose(shifted, projected + 5.0)
+
+
+def test_project_out_applies_per_row_to_a_stack_of_vectors():
+    rng = numpy.random.default_rng(1)
+    axis = rng.normal(size=6)
+    stack = rng.normal(size=(3, 6))
+
+    projected = probe_comparison.project_out(stack, axis)
+
+    expected = [probe_comparison.project_out(v, axis) for v in stack]
+    for row, one in zip(projected, expected, strict=True):
+        numpy.testing.assert_allclose(row, one)
+
+
+def test_axis_angle_degrees_is_zero_for_the_same_direction_and_ninety_for_orthogonal():
+    axis = numpy.array([1.0, -1.0, 1.0, -1.0])
+    same_direction = 3.0 * axis
+    orthogonal = numpy.array([1.0, 1.0, -1.0, -1.0])
+
+    assert probe_comparison.axis_angle_degrees(axis, same_direction) == pytest.approx(0.0, abs=1e-6)
+    assert probe_comparison.axis_angle_degrees(axis, orthogonal) == pytest.approx(90.0)
