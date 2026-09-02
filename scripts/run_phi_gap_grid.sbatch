@@ -6,8 +6,9 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
-#SBATCH --time=04:00:00
+#SBATCH --time=06:00:00
 #SBATCH --no-requeue
+#SBATCH --network=disable_rdzv_get
 #SBATCH --output=logs/phi_gap_grid_%j.log
 #SBATCH --error=logs/phi_gap_grid_%j.log
 
@@ -19,6 +20,19 @@
 # Resuming is free and is the normal way to use this: the driver reads the CSV first and solves
 # only what is missing, so a job that runs out of time is continued by submitting it again
 # against the same output.
+#
+# To split an arm across nodes, give each job its own asset and its own output file, because two
+# jobs appending to one CSV would interleave rows with no locking:
+#
+#   for a in standing_climbmix_small_16x2048 \
+#            standing_climbmix_small_spread_off1_16x2048 \
+#            standing_climbmix_small_strided_16x2048; do
+#     sbatch scripts/run_phi_gap_grid.sbatch <run-dir> assets/results/phi-gap/<arm>.$a.csv \
+#            --asset $a
+#   done
+#
+# Then concatenate, keeping one header:
+#   awk 'FNR==1 && NR!=1 {next} {print}' assets/results/phi-gap/<arm>.*.csv > assets/results/phi-gap/<arm>.csv
 
 set -euo pipefail
 mkdir -p logs
