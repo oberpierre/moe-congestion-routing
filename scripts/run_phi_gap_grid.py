@@ -95,12 +95,18 @@ def main() -> None:
 
     done = existing_keys(args.out)
     remaining = [c for c in cells if candidate_key(c, run_id=run_id, arm=arm) not in done]
+    # Counted before --limit truncates. Counting after it charges every cell the limit excluded to
+    # the output file, which reported an empty file as holding 5662 of 5664 rows and read as a
+    # nearly finished run rather than a capped one.
+    resumed = len(cells) - len(remaining)
+    unsolved = len(remaining)
     if args.limit is not None:
         remaining = remaining[: args.limit]
 
+    capped = "" if len(remaining) == unsolved else f", capped by --limit to {len(remaining)}"
     print(
-        f"run_id={run_id} arm={arm}: {len(cells)} cells enumerated, {len(cells) - len(remaining)} "
-        f"already in {args.out}, {len(remaining)} remaining"
+        f"run_id={run_id} arm={arm}: {len(cells)} cells enumerated, {resumed} already in "
+        f"{args.out}, {unsolved} not yet solved{capped}"
     )
 
     if args.dry_run:
