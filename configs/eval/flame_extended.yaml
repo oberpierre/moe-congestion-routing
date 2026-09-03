@@ -1,0 +1,5 @@
+#   sbatch --time=02:00:00 scripts/eval_moe.sbatch configs/eval/flame_extended.yaml \
+#       $DATA_STORE/models/CMU-FLAME/FLAME-MoE-290M-1.3B 5473
+extends: flame.yaml
+
+tasks: [extended_suite]

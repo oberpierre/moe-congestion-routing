@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """Pre-fetch every dataset and tokenizer an lm-eval run needs, into $HF_HOME.
 
-Fetches the datasets for the seven benchmark tasks the evaluation suite runs
-(see ``configs/eval/tasks/flame_suite.yaml``) plus the `EleutherAI/pythia-12b` tokenizer
-FLAME's half of the evaluation needs. Our own checkpoints are evaluated with the in-tree
-`assets/tokenizer/gpt2/`, which needs no network fetch.
+Fetches the datasets for every task named by the suite group configs under
+``configs/eval/tasks/`` (flame_suite, extended_suite, ...) plus the `EleutherAI/pythia-12b`
+tokenizer FLAME's half of the evaluation needs. Our own checkpoints are evaluated with the
+in-tree `assets/tokenizer/gpt2/`, which needs no network fetch.
 
 Dataset identifiers (HF `dataset_path`/`dataset_name`) are likewise read from the pinned
 lm-evaluation-harness submodule's own task registry (`TaskManager`) rather than hand-copied here,
@@ -31,16 +31,24 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _group_config_path() -> Path:
-    return _repo_root() / "configs" / "eval" / "tasks" / "flame_suite.yaml"
+def _suite_paths() -> list[Path]:
+    return sorted((_repo_root() / "configs" / "eval" / "tasks").glob("*.yaml"))
 
 
 def _tasks() -> list[str]:
-    """The suite's task names, read from the group config rather than duplicated here -- so
-    adding a task to that file is the only edit an eval job needs; this script picks it up on
-    its next run with no second edit."""
-    data = yaml.safe_load(_group_config_path().read_text())
-    return [entry["task"] for entry in data["task"]]
+    """Task names across every suite group config, read from those files rather than duplicated
+    here -- so adding a task (or a whole suite file) is the only edit an eval job needs; this
+    script picks it up on its next run with no second edit. A member is either a plain string
+    (also how a suite references a whole harness group such as ``blimp``) or a
+    ``{task: name, ...}`` dict carrying per-suite overrides."""
+    names: list[str] = []
+    for path in _suite_paths():
+        data = yaml.safe_load(path.read_text())
+        for entry in data["task"]:
+            name = entry if isinstance(entry, str) else entry["task"]
+            if name not in names:
+                names.append(name)
+    return names
 
 
 def _ensure_hf_home() -> Path:
@@ -57,18 +65,25 @@ def _ensure_hf_home() -> Path:
 
 
 def _task_dataset_ids(tm, tasks: list[str]) -> dict[str, tuple[str, str | None]]:
-    """{task_name: (dataset_path, dataset_name)}, resolved through the harness's own
+    """{leaf_task_name: (dataset_path, dataset_name)}, resolved through the harness's own
     TaskManager (which follows each task yaml's `include:` chain, e.g. arc_challenge.yaml
-    includes arc_easy.yaml) rather than by reading the yaml files by hand."""
+    includes arc_easy.yaml) rather than by reading the yaml files by hand. A name may also be
+    a harness *group* (e.g. ``blimp``, 67 subtasks); its members are resolved recursively so
+    every leaf's dataset is accounted for -- including our own suite groups when one suite
+    nests another (the TaskManager is built with configs/eval/tasks/ as include_path)."""
     ids: dict[str, tuple[str, str | None]] = {}
     for name in tasks:
         entry = tm.task_index.get(name)
         if entry is None:
             raise KeyError(
                 f"{name!r} is not a task the pinned lm-evaluation-harness registers; "
-                "the pinned harness and configs/eval/tasks/flame_suite.yaml have drifted"
+                "the pinned harness and the suite configs under configs/eval/tasks/ have drifted"
             )
-        ids[name] = (entry.cfg["dataset_path"], entry.cfg.get("dataset_name"))
+        if entry.cfg is not None and "dataset_path" in entry.cfg:
+            ids[name] = (entry.cfg["dataset_path"], entry.cfg.get("dataset_name"))
+        else:  # a group config: its cfg lists member names instead of a dataset
+            members = [m if isinstance(m, str) else m["task"] for m in entry.cfg["task"]]
+            ids.update(_task_dataset_ids(tm, members))
     return ids
 
 
@@ -89,11 +104,19 @@ def main() -> None:
 
     from lm_eval.tasks.manager import TaskManager
 
-    tm = TaskManager()
-    dataset_ids = _task_dataset_ids(tm, tasks)
-    for name, (dataset_path, dataset_name) in dataset_ids.items():
-        suffix = f" ({dataset_name})" if dataset_name else ""
-        print(f"  {name}: {dataset_path}{suffix}")
+    # The same include_path the eval run itself gets (EvalConfig.include_path), so a suite
+    # referencing a sibling suite as a nested group (extended_suite -> flame_suite) resolves
+    # here exactly as it will at eval time.
+    tm = TaskManager(include_path=str(_repo_root() / "configs" / "eval" / "tasks"))
+    for name in tasks:
+        leaf_ids = _task_dataset_ids(tm, [name])
+        if len(leaf_ids) == 1:
+            ((dataset_path, dataset_name),) = leaf_ids.values()
+            suffix = f" ({dataset_name})" if dataset_name else ""
+            print(f"  {name}: {dataset_path}{suffix}")
+        else:  # a group, e.g. blimp: one line, not one per subtask
+            paths = sorted({p for p, _ in leaf_ids.values()})
+            print(f"  {name}: {len(leaf_ids)} subtasks from {', '.join(paths)}")
 
     if args.dry_run:
         print("--dry-run: fetched nothing")
