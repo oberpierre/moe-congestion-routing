@@ -108,8 +108,10 @@ def main() -> None:
     # referencing a sibling suite as a nested group (extended_suite -> flame_suite) resolves
     # here exactly as it will at eval time.
     tm = TaskManager(include_path=str(_repo_root() / "configs" / "eval" / "tasks"))
+    leaf_names: list[str] = []
     for name in tasks:
         leaf_ids = _task_dataset_ids(tm, [name])
+        leaf_names += [n for n in leaf_ids if n not in leaf_names]
         if len(leaf_ids) == 1:
             ((dataset_path, dataset_name),) = leaf_ids.values()
             suffix = f" ({dataset_name})" if dataset_name else ""
@@ -128,7 +130,11 @@ def main() -> None:
     # Building a ConfigurableTask calls its own .download() eagerly (lm_eval/api/task.py), so
     # this is the exact call the harness itself makes at eval time, not a reimplementation of
     # it. datasets.load_dataset() is itself cache-aware, so rerunning this is a no-op.
-    tm.load(tasks)
+    # Loaded by LEAF name, never by suite/group name: the flat scan above yields both
+    # extended_suite's nested `flame_suite` and flame_suite's own members, and load() rejects a
+    # task reached through a group and standalone in the same call ("Duplicate task"). Groups
+    # have no datasets of their own, so fetching the deduplicated leaves fetches everything.
+    tm.load(leaf_names)
 
     print(f"fetching tokenizer {FLAME_TOKENIZER}...")
     AutoTokenizer.from_pretrained(FLAME_TOKENIZER)
