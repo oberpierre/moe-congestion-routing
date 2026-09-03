@@ -38,6 +38,7 @@ CACHE_ENV_EXPORT="
 
 # Prepare the environment once, before the eval step. Identical to train_moe_climblab.sbatch's
 # env-prep step
+if [ "${MOE_PREPARE_ENV:-0}" = 1 ]; then\
 srun --nodes=1 --ntasks=1 --environment=alps6 bash -c "
   set -euo pipefail
   $CACHE_ENV_EXPORT
@@ -62,6 +63,15 @@ srun --nodes=1 --ntasks=1 --environment=alps6 bash -c "
   ./scripts/apply-patches.sh
   echo '[env] build complete'
 "
+fi
+
+# Preflight on every job, reading only. Fails fast if venv is missing or patches are not applied.
+if [ ! -f "$WORKDIR/.venv/pyvenv.cfg" ]; then
+  echo "[env] no venv at $WORKDIR/.venv." >&2
+  echo "  Run once on an idle workdir: MOE_PREPARE_ENV=1 sbatch $0 <config> <checkpoints> <ckpt-step>" >&2
+  exit 1
+fi
+"$WORKDIR/scripts/apply-patches.sh" --verify
 
 # Launch the eval. run_lm_eval.py itself launches `torch.distributed.run --standalone
 # --nproc-per-node NPROC`, one process per GPU, so this is still a single Slurm task (like
