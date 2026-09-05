@@ -1,0 +1,18 @@
+extends: base.yaml
+
+moe_router_load_balancing_type: none
+moe_aux_loss_coeff: 0.0
+
+# The lever is a NEGATIVE z-loss, which rewards large router logits instead of penalising them.
+# That saturates the gate, and once a gate probability is at 1 the gradient through it vanishes and
+# the router cannot route its way back out.
+moe_z_loss_coeff: -1.0e-3
+
+train_iters: 1000
+lr_warmup_iters: 10
+lr_wsd_decay_iters: 50
+
+# Dense throughout, because the whole run is the interesting part and it is short.
+moe_probe_dense_windows: ["0:1000"]
+
+output_dir: artifacts/collapse/induce_softmax
