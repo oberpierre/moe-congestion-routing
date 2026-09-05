@@ -5,6 +5,7 @@
 extends: ../base_cluster.yaml
 
 global_batch_size: 128
+seed: 9830
 
 eval_interval: 500
 save_interval: 250
