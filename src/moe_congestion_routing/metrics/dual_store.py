@@ -245,7 +245,16 @@ def enumerate_dual_cells(
 
 
 def _default_solve(cell: DualCell) -> DualSolveResult:
-    """The real oracle: read the dump fresh, screen the unit and, only if admissible, price it.
+    """The real oracle: read the dump fresh, screen the unit and price it regardless of the
+    screen's verdict.
+
+    A screen refusal marks a price rather than destroying it: capacity is `default_cap`, sized
+    from token/expert counts alone rather than from the observed routing, so the LP always solves
+    even for a batch the screen finds too concentrated to trust. Skipping the solve on a refusal
+    made the corrected `kappa` variant uncomputable for exactly the unit its correction is defined
+    on, the strided asset's code-heavy `u0`, so every enumerated cell is priced here and
+    `admissible` is carried alongside as the reader's advice rather than as a reason to withhold
+    the number.
 
     Prices `router_scores()`, matching `phi_gap.py` rather than `probe_comparison.py`'s
     sigmoid-only `affinities()`, so a cell from any arm's dump can be priced regardless of score
@@ -262,11 +271,8 @@ def _default_solve(cell: DualCell) -> DualSolveResult:
     start, stop = _unit_bounds(dump.meta["N"], cell.unit)
     routing = dump.routing_map()[axis_index, start:stop, :]
     screen = screen_batch(routing, dump.topk)
-    if not screen.admissible:
-        duals = np.full(dump.num_experts, np.nan)
-    else:
-        scores = dump.router_scores()[axis_index, start:stop, :]
-        duals = lp.solve(scores, dump.topk).capacity_duals
+    scores = dump.router_scores()[axis_index, start:stop, :]
+    duals = lp.solve(scores, dump.topk).capacity_duals
     return DualSolveResult(
         screen.admissible, screen.max_load_over_balanced, screen.dead_experts, duals
     )

@@ -255,6 +255,25 @@ def test_a_refused_unit_is_a_stored_row_with_nan_duals(tmp_path):
     assert all(v != v for v in row.duals)  # NaN
 
 
+def test_default_solve_prices_a_screen_refused_unit_for_real(tmp_path, monkeypatch):
+    from moe_congestion_routing.metrics import probe_comparison
+
+    monkeypatch.setattr(probe_comparison, "UNIT_TOKENS", 4)
+    # `_write_dump`'s routing_map is all-zero, so every expert is dead and the screen refuses.
+    # A screen refusal marks a price rather than destroying it, so this still solves the LP.
+    dump_path = _write_dump(
+        tmp_path / "probes" / "asset0", step=0, n_tokens=4, has_expert_bias=False
+    )
+    cell = _cell(0, dump_path=dump_path, unit="u0")
+    collected: list[DualRow] = []
+    price_cells([cell], run_id="run-a", emit=collected.append)
+    (row,) = collected
+    assert row.status == "ok"
+    assert row.admissible is False
+    assert row.dead_experts == 4
+    assert all(v == v for v in row.duals)  # no NaN
+
+
 def test_a_failed_cell_is_a_row_and_the_pass_continues(tmp_path):
     dump_path = _write_dump(tmp_path / "probes" / "asset0", step=0, has_expert_bias=False)
     cells = [_cell(0, dump_path=dump_path, unit="u0"), _cell(0, dump_path=dump_path, unit="u1")]
