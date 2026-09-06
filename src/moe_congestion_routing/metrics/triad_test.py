@@ -4,8 +4,14 @@ import numpy
 import pytest
 
 from moe_congestion_routing.metrics import triad
+from moe_congestion_routing.metrics.dual_store import DualEntry
 from moe_congestion_routing.metrics.probe_comparison import project_out
-from moe_congestion_routing.metrics.triad import priced_unit, triad_rows
+from moe_congestion_routing.metrics.triad import (
+    TriadAssets,
+    priced_unit,
+    trajectory_cells,
+    triad_rows,
+)
 
 
 def _numeric_fields_are_nan(row) -> bool:
@@ -291,3 +297,222 @@ def test_projecting_the_composition_axis_out_reconciles_the_triad():
     )
     asym_kappas, _ = _kappas_and_max_s(asym_rows)
     assert not all(k == pytest.approx(0.976, abs=0.05) for k in asym_kappas)
+
+
+# ---------------------------------------------------------------------------------------------
+# trajectory_cells: fixtures are plain dicts standing in for `dual_store.read_dual_store` /
+# `read_bias_store`'s own return shape, so no store file is ever written here.
+# ---------------------------------------------------------------------------------------------
+
+_ASSETS = TriadAssets(tail="tail_asset", strided="strided_asset", spread="spread_asset")
+
+
+def _cell_duals(
+    run_id,
+    layer,
+    step,
+    *,
+    tail=None,
+    strided=None,
+    spread0=None,
+    spread1=None,
+    axis=None,
+    inadmissible=(),
+):
+    """The subset of one cell's five possible dual-store keys the caller actually supplies,
+    matching how a real store often has some units refused or simply unpriced. Each supplied
+    vector becomes a `DualEntry` with `admissible=True` unless its role name (``"tail"``,
+    ``"strided"``, ``"spread0"``, ``"spread1"`` or ``"axis"``) is listed in `inadmissible`, which
+    matches a screen-refused-but-still-priced row: the store holds a real vector either way.
+    """
+    out = {}
+    if tail is not None:
+        out[(run_id, _ASSETS.tail, "u0", layer, step)] = DualEntry(
+            tail, admissible="tail" not in inadmissible
+        )
+    if strided is not None:
+        out[(run_id, _ASSETS.strided, "u1", layer, step)] = DualEntry(
+            strided, admissible="strided" not in inadmissible
+        )
+    if spread0 is not None:
+        out[(run_id, _ASSETS.spread, "u0", layer, step)] = DualEntry(
+            spread0, admissible="spread0" not in inadmissible
+        )
+    if spread1 is not None:
+        out[(run_id, _ASSETS.spread, "u1", layer, step)] = DualEntry(
+            spread1, admissible="spread1" not in inadmissible
+        )
+    if axis is not None:
+        out[(run_id, _ASSETS.strided, "u0", layer, step)] = DualEntry(
+            axis, admissible="axis" not in inadmissible
+        )
+    return out
+
+
+class _CountingMapping(dict):
+    """Counts `.get()` calls, standing in for an already-parsed store so a test can show one
+    parsed mapping serves both variants rather than being reparsed per variant."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.get_calls = 0
+
+    def get(self, key, default=None):
+        self.get_calls += 1
+        return super().get(key, default)
+
+
+def test_the_seed_rule_reduces_to_run_triad_pys_formula_at_step_zero():
+    rng = numpy.random.default_rng(0)
+    n = 8
+    vectors_by_run = {run_id: tuple(rng.normal(size=n) for _ in range(5)) for run_id in ("a", "b")}
+    duals: dict = {}
+    bias: dict = {}
+    for run_id, (bias_vec, tail, strided, spread0, spread1) in vectors_by_run.items():
+        duals.update(
+            _cell_duals(run_id, 3, 0, tail=tail, strided=strided, spread0=spread0, spread1=spread1)
+        )
+        bias[(run_id, 3, 0)] = bias_vec
+
+    cells = trajectory_cells(duals, bias, assets=_ASSETS, project_code_axis=False, resamples=50)
+    assert {c.run_id for c in cells} == {"a", "b"}
+    for cell in cells:
+        run_index = 0 if cell.run_id == "a" else 500
+        bias_vec, tail, strided, spread0, spread1 = vectors_by_run[cell.run_id]
+        seed = 1000 * 3 + run_index
+        expected = tuple(
+            triad_rows(
+                cell.run_id, 3, bias_vec, tail, strided, spread0, spread1, resamples=50, seed=seed
+            )
+        )
+        # NaN fields (an undefined kappa) make plain tuple equality fail even when every field
+        # agrees, since NaN != NaN, so each field is compared with NaN treated as equal to NaN.
+        for got, want in zip(cell.rows, expected, strict=True):
+            for field in got._fields:
+                g, w = getattr(got, field), getattr(want, field)
+                assert g == w or (isinstance(g, float) and math.isnan(g) and math.isnan(w))
+
+
+def test_a_missing_bias_row_refuses_its_whole_step_with_no_row_emitted():
+    n = 8
+    vec = numpy.arange(n, dtype=float) + 1.0
+    duals = _cell_duals("a", 3, 0, tail=vec, strided=vec, spread0=vec, spread1=vec)
+    cells = trajectory_cells(duals, {}, assets=_ASSETS, project_code_axis=False, resamples=10)
+    assert cells == []
+
+
+def test_refused_units_names_the_pairing_role_missing_a_price():
+    n = 8
+    vec = numpy.arange(n, dtype=float) + 1.0
+    duals = _cell_duals("a", 3, 0, strided=vec, spread0=vec, spread1=vec)  # tail missing
+    bias = {("a", 3, 0): vec}
+    [cell] = trajectory_cells(duals, bias, assets=_ASSETS, project_code_axis=False, resamples=10)
+    assert cell.refused_units == "tail"
+
+
+def test_a_pairing_units_admissible_false_refuses_it_exactly_like_a_missing_row():
+    """The two refusal kinds a pairing role can hit, `admissible=False` and no row at all, must be
+    indistinguishable to `trajectory_cells`: this is the half of the rule that stops a screen
+    refusal from being silently used as though it had passed, which is what the axis's own
+    exemption (the sibling assertion below) must NOT do for a pairing role.
+    """
+    rng = numpy.random.default_rng(2)
+    n = 8
+    bias_vec, tail, strided, spread0, spread1 = (rng.normal(size=n) for _ in range(5))
+    bias = {("a", 3, 0): bias_vec}
+
+    refused = _cell_duals(
+        "a",
+        3,
+        0,
+        tail=tail,
+        strided=strided,
+        spread0=spread0,
+        spread1=spread1,
+        inadmissible=("strided",),
+    )
+    missing = _cell_duals("a", 3, 0, tail=tail, spread0=spread0, spread1=spread1)  # strided absent
+
+    [refused_cell] = trajectory_cells(
+        refused, bias, assets=_ASSETS, project_code_axis=False, resamples=50
+    )
+    [missing_cell] = trajectory_cells(
+        missing, bias, assets=_ASSETS, project_code_axis=False, resamples=50
+    )
+    assert refused_cell.refused_units == "strided"
+    # NaN fields (an undefined rho/kappa on every row that touched the refused unit) make plain
+    # tuple equality fail even when every field agrees, since NaN != NaN.
+    for got, want in zip(refused_cell.rows, missing_cell.rows, strict=True):
+        for field in got._fields:
+            g, w = getattr(got, field), getattr(want, field)
+            assert g == w or (isinstance(g, float) and math.isnan(g) and math.isnan(w))
+
+
+def test_the_axis_is_used_despite_having_come_from_an_inadmissible_row():
+    """The store no longer nulls a screen-refused row, so the axis key can carry a real vector
+    even though the row it was read from was `admissible=False`. `trajectory_cells` must use it
+    regardless, which is the entire reason a refused cell is priced instead of NaN-filled."""
+    rng = numpy.random.default_rng(1)
+    n = 8
+    bias_vec, tail, strided, spread0, spread1, axis = (rng.normal(size=n) for _ in range(6))
+    duals = _cell_duals(
+        "a",
+        3,
+        0,
+        tail=tail,
+        strided=strided,
+        spread0=spread0,
+        spread1=spread1,
+        axis=axis,
+        inadmissible=("axis",),
+    )
+    bias = {("a", 3, 0): bias_vec}
+
+    uncorrected = trajectory_cells(
+        duals, bias, assets=_ASSETS, project_code_axis=False, resamples=50
+    )
+    corrected = trajectory_cells(duals, bias, assets=_ASSETS, project_code_axis=True, resamples=50)
+    assert len(uncorrected) == 1 and len(corrected) == 1
+    assert corrected[0].refused_units == ""  # the axis's own refusal never reaches refused_units
+    assert corrected[0].rows != uncorrected[0].rows
+
+
+def test_project_code_axis_raises_when_every_cell_is_missing_its_axis():
+    n = 8
+    vec = numpy.arange(n, dtype=float) + 1.0
+    duals = _cell_duals("a", 3, 0, tail=vec, strided=vec, spread0=vec, spread1=vec)  # no axis
+    bias = {("a", 3, 0): vec}
+    with pytest.raises(ValueError, match="axis"):
+        trajectory_cells(duals, bias, assets=_ASSETS, project_code_axis=True, resamples=10)
+
+
+def test_one_cell_missing_its_axis_is_refused_not_every_cell():
+    n = 8
+    vec = numpy.arange(n, dtype=float) + 1.0
+    axis = vec[::-1] + 1.0
+    duals = {
+        **_cell_duals("a", 3, 0, tail=vec, strided=vec, spread0=vec, spread1=vec),  # no axis
+        **_cell_duals("a", 4, 0, tail=vec, strided=vec, spread0=vec, spread1=vec, axis=axis),
+    }
+    bias = {("a", 3, 0): vec, ("a", 4, 0): vec}
+    cells = trajectory_cells(duals, bias, assets=_ASSETS, project_code_axis=True, resamples=10)
+    assert {c.layer for c in cells} == {4}  # layer 3's axis-less cell is dropped, not raised on
+
+
+def test_two_variants_come_from_one_already_parsed_store():
+    n = 8
+    vec = numpy.arange(n, dtype=float) + 1.0
+    duals = _CountingMapping(
+        _cell_duals("a", 3, 0, tail=vec, strided=vec, spread0=vec, spread1=vec, axis=vec[::-1])
+    )
+    bias = {("a", 3, 0): vec}
+
+    uncorrected = trajectory_cells(
+        duals, bias, assets=_ASSETS, project_code_axis=False, resamples=10
+    )
+    calls_after_first = duals.get_calls
+    corrected = trajectory_cells(duals, bias, assets=_ASSETS, project_code_axis=True, resamples=10)
+
+    assert len(uncorrected) == 1 and len(corrected) == 1
+    # The second call's lookups land on the same already-parsed mapping instead of a fresh parse.
+    assert duals.get_calls > calls_after_first

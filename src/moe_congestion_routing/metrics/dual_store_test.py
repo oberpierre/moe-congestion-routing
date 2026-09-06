@@ -12,6 +12,7 @@ from moe_congestion_routing.metrics.dual_store import (
     DUAL_KEY_FIELDS,
     BiasRow,
     DualCell,
+    DualEntry,
     DualRow,
     DualSolveResult,
     append_bias_rows,
@@ -25,6 +26,8 @@ from moe_congestion_routing.metrics.dual_store import (
     existing_dual_keys,
     price_bias_only_cells,
     price_cells,
+    read_bias_store,
+    read_dual_store,
 )
 from moe_congestion_routing.metrics.probe_series import IncomparableProbes
 
@@ -823,6 +826,91 @@ def test_a_partial_bias_store_is_completed_without_duplicating_existing_rows(tmp
 
     price_bias_only_cells(bias_only, run_id="run-a", emit=emit)
     assert existing_bias_keys(bias_csv) == {("run-a", "2", "0"), ("run-a", "3", "0")}
+
+
+def test_read_dual_store_keeps_a_refused_but_priced_row_and_nulls_a_failed_one(tmp_path):
+    csv_path = tmp_path / "duals.csv"
+    refused = _dual_row(_cell(0, unit="u0"))._replace(
+        admissible=False, max_load_over_balanced=5.0, dead_experts=1
+    )
+    failed = DualRow(
+        run_id="run-a",
+        asset="asset0",
+        unit="u1",
+        layer=2,
+        step=0,
+        status="failed",
+        detail="boom",
+        admissible=None,
+        max_load_over_balanced=None,
+        dead_experts=None,
+        token_sha256="",
+        dump_path="",
+        duals=tuple(float("nan") for _ in range(4)),
+    )
+    append_dual_rows(csv_path, [refused, failed])
+
+    store = read_dual_store([csv_path])
+    entry = store[("run-a", "asset0", "u0", 2, 0)]
+    assert isinstance(entry, DualEntry)
+    assert entry.admissible is False
+    assert numpy.array_equal(entry.duals, numpy.array(refused.duals))
+    assert store[("run-a", "asset0", "u1", 2, 0)] is None
+
+
+def test_read_dual_store_agrees_silently_across_files(tmp_path):
+    csv_a, csv_b = tmp_path / "a.csv", tmp_path / "b.csv"
+    row = _dual_row(_cell(0))
+    append_dual_rows(csv_a, [row])
+    append_dual_rows(csv_b, [row])
+
+    store = read_dual_store([csv_a, csv_b])
+    assert len(store) == 1
+
+
+def test_read_dual_store_raises_on_disagreement_across_files(tmp_path):
+    csv_a, csv_b = tmp_path / "a.csv", tmp_path / "b.csv"
+    row = _dual_row(_cell(0))
+    append_dual_rows(csv_a, [row])
+    append_dual_rows(csv_b, [row._replace(duals=tuple(v + 1.0 for v in row.duals))])
+
+    with pytest.raises(ValueError, match="disagrees"):
+        read_dual_store([csv_a, csv_b])
+
+
+def test_read_dual_store_raises_on_score_function_disagreement_across_files(tmp_path):
+    csv_a, csv_b = tmp_path / "a.csv", tmp_path / "b.csv"
+    append_dual_rows(csv_a, [_dual_row(_cell(0, unit="u0"))._replace(score_function="sigmoid")])
+    append_dual_rows(csv_b, [_dual_row(_cell(0, unit="u1"))._replace(score_function="softmax")])
+
+    with pytest.raises(ValueError, match="score_function"):
+        read_dual_store([csv_a, csv_b])
+
+
+def test_read_bias_store_casts_to_float32(tmp_path):
+    csv_path = tmp_path / "bias.csv"
+    append_bias_rows(csv_path, [_bias_row(run_id="run-a", layer=2, step=0, value=1.0)])
+
+    store = read_bias_store([csv_path])
+    assert store[("run-a", 2, 0)].dtype == numpy.float32
+
+
+def test_read_bias_store_agrees_silently_across_files(tmp_path):
+    csv_a, csv_b = tmp_path / "a.csv", tmp_path / "b.csv"
+    append_bias_rows(csv_a, [_bias_row(asset="asset_a", value=1.0)])
+    append_bias_rows(csv_b, [_bias_row(asset="asset_b", value=1.0)])
+
+    store = read_bias_store([csv_a, csv_b])
+    assert len(store) == 1
+
+
+def test_read_bias_store_raises_on_disagreement_across_files(tmp_path):
+    csv_a, csv_b = tmp_path / "a.csv", tmp_path / "b.csv"
+    append_bias_rows(csv_a, [_bias_row(asset="asset_a", value=1.0)])
+    append_bias_rows(csv_b, [_bias_row(asset="asset_b", value=2.0)])
+
+    with pytest.raises(ValueError, match="disagrees"):
+        read_bias_store([csv_a, csv_b])
 
 
 def test_a_refused_row_is_skipped_by_the_resume(tmp_path):

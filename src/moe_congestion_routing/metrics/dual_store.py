@@ -85,11 +85,12 @@ def bias_fields(num_experts: int) -> tuple[str, ...]:
 
 
 class DualRow(NamedTuple):
-    """One finished dual cell, `"ok"` (priced or refused) or `"failed"`.
+    """One finished dual cell, `"ok"` (priced, screen-refused or not) or `"failed"`.
 
     `admissible`/`max_load_over_balanced`/`dead_experts`/`token_sha256`/`dump_path` are `None` or
-    `""` on a failed row along with `duals`, which is NaN-filled instead of empty even on failure
-    and even on a refusal, so every row in one run's CSV carries the same number of dual columns.
+    `""` on a failed row along with `duals`, which is NaN-filled only there: a screen refusal
+    marks a price rather than destroying it, so an `"ok"` row's duals are always real and every
+    row in one run's CSV carries the same number of dual columns regardless.
     """
 
     run_id: str
@@ -785,3 +786,120 @@ def price_bias_only_cells(
                 asset=cell.asset,
             )
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# Correlating readers: a pricing pass splits by asset, writing one store file per asset, so a
+# correlating pass takes a set of store files rather than one it must first concatenate. Both
+# null the same way, so an old store written before the refusal-marks-a-price fix above is not
+# misread as a vector of NaN.
+# ---------------------------------------------------------------------------------------------
+
+
+class DualEntry(NamedTuple):
+    """One `read_dual_store` cell that survived the null rule: its price and the screen's own
+    verdict, carried together rather than the array alone, so a caller can tell a role that
+    should still respect the screen (a pairing unit) from one that must not (a composition axis).
+    """
+
+    duals: np.ndarray
+    admissible: bool
+
+
+def _dual_entries_agree(a: DualEntry | None, b: DualEntry | None) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return a.admissible == b.admissible and bool(np.array_equal(a.duals, b.duals))
+
+
+def read_dual_store(
+    paths: Sequence[Path],
+) -> dict[tuple[str, str, str, int, int], DualEntry | None]:
+    """Read one or more dual-store CSVs as one set, keyed by `(run_id, asset, unit, layer, step)`.
+
+    A value is `None` when the row is not `"ok"` or its duals are all-NaN, so a store written
+    before `_default_solve` priced every cell reads as absent rather than as a vector of NaN that
+    would silently poison a correlation. Unlike `existing_dual_keys`, an `"ok"` row is kept
+    regardless of `admissible`, because a screen refusal no longer implies NaN duals and a caller
+    may need the price a refused unit still carries, such as a composition-axis unit a correction
+    projects out. `admissible` travels alongside the array rather than being dropped, because most
+    callers (any pairing role) must still refuse on it and only a composition axis may not.
+
+    The same key reached from two different files must agree, matching `append_bias_rows`'s
+    cross-invocation rule reaching a reader instead of only a writer: agreement is silent,
+    disagreement raises. One `run_id` seen under two different `score_function` values raises
+    too, because a duals row is meaningless without knowing which score space it was priced in.
+    """
+    result: dict[tuple[str, str, str, int, int], DualEntry | None] = {}
+    score_function_of: dict[str, str] = {}
+    for path in paths:
+        with Path(path).open(newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or ()
+            dual_cols = sorted(
+                (name for name in fieldnames if name.startswith("dual_")),
+                key=lambda name: int(name.removeprefix("dual_")),
+            )
+            for raw in reader:
+                run_id = raw["run_id"]
+                score_function = raw.get("score_function") or ""
+                if score_function:
+                    prev = score_function_of.setdefault(run_id, score_function)
+                    if prev != score_function:
+                        raise ValueError(
+                            f"run {run_id!r}: score_function {score_function!r} in {path} "
+                            f"disagrees with already-seen {prev!r}"
+                        )
+                key = (run_id, raw["asset"], raw["unit"], int(raw["layer"]), int(raw["step"]))
+                if raw.get("status") != "ok":
+                    value = None
+                else:
+                    duals = np.array([float(raw[c]) for c in dual_cols], dtype=np.float64)
+                    value = (
+                        None
+                        if np.all(np.isnan(duals))
+                        else DualEntry(duals=duals, admissible=raw["admissible"] == "True")
+                    )
+                if key in result:
+                    if not _dual_entries_agree(result[key], value):
+                        raise ValueError(
+                            f"dual store: key {key!r} disagrees across {list(paths)!r}"
+                        )
+                    continue
+                result[key] = value
+    return result
+
+
+def read_bias_store(paths: Sequence[Path]) -> dict[tuple[str, int, int], np.ndarray]:
+    """Read one or more bias-store CSVs as one set, keyed by `(run_id, layer, step)`.
+
+    Each per-asset file repeats the same bias rows, since the bias is a property of the weights
+    rather than of any one asset, so the same key reached from two files is compared rather than
+    overwritten: agreement is silent, disagreement raises, matching `append_bias_rows`'s own
+    cross-invocation check reaching across a reader too. Bias vectors come back `float32`, because
+    `expert_bias()` is float32-native and a CSV round trip through decimal strings widens it,
+    moving correlations computed from it by roughly 1e-8.
+    """
+    result: dict[tuple[str, int, int], np.ndarray] = {}
+    for path in paths:
+        with Path(path).open(newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or ()
+            bias_cols = sorted(
+                (name for name in fieldnames if name.startswith("bias_")),
+                key=lambda name: int(name.removeprefix("bias_")),
+            )
+            for raw in reader:
+                if raw.get("status") != "ok":
+                    continue
+                key = (raw["run_id"], int(raw["layer"]), int(raw["step"]))
+                bias = np.array([float(raw[c]) for c in bias_cols], dtype=np.float32)
+                if key in result:
+                    if not np.array_equal(result[key], bias):
+                        raise ValueError(
+                            f"bias store: run {key[0]!r} layer {key[1]} step {key[2]} in {path} "
+                            "disagrees with an already-read row"
+                        )
+                    continue
+                result[key] = bias
+    return result
