@@ -133,7 +133,7 @@ class DualSolveResult(NamedTuple):
     admissible: bool
     max_load_over_balanced: float
     dead_experts: int
-    duals: np.ndarray  # NaN-filled [E] when `admissible` is False
+    duals: np.ndarray  # [E], a real price even when `admissible` is False, never NaN-filled
 
 
 def _key_tuple(run_id: str, asset: str, unit: str, layer: int, step: int) -> tuple[str, ...]:
@@ -817,9 +817,10 @@ def read_dual_store(
 ) -> dict[tuple[str, str, str, int, int], DualEntry | None]:
     """Read one or more dual-store CSVs as one set, keyed by `(run_id, asset, unit, layer, step)`.
 
-    A value is `None` when the row is not `"ok"` or its duals are all-NaN, so a store written
-    before `_default_solve` priced every cell reads as absent rather than as a vector of NaN that
-    would silently poison a correlation. Unlike `existing_dual_keys`, an `"ok"` row is kept
+    A `"failed"` row is skipped, so a cell that only ever failed is absent rather than present
+    and `None`. A value is `None` when an `"ok"` row's duals are all-NaN, which is how a store
+    written before `_default_solve` priced every cell reads as absent rather than as a vector of
+    NaN that would silently poison a correlation. An `"ok"` row is kept
     regardless of `admissible`, because a screen refusal no longer implies NaN duals and a caller
     may need the price a refused unit still carries, such as a composition-axis unit a correction
     projects out. `admissible` travels alongside the array rather than being dropped, because most
@@ -850,16 +851,20 @@ def read_dual_store(
                             f"run {run_id!r}: score_function {score_function!r} in {path} "
                             f"disagrees with already-seen {prev!r}"
                         )
-                key = (run_id, raw["asset"], raw["unit"], int(raw["layer"]), int(raw["step"]))
+                # A `"failed"` row is skipped rather than stored as `None`, matching
+                # `read_bias_store` and `existing_dual_keys`. The writer deliberately lets a key
+                # appear twice, once failed and once `"ok"`, because that is what a resume after a
+                # crashed cell produces, so treating the failed row as a value made the retry look
+                # like a cross-file disagreement and refused the whole shard.
                 if raw.get("status") != "ok":
-                    value = None
-                else:
-                    duals = np.array([float(raw[c]) for c in dual_cols], dtype=np.float64)
-                    value = (
-                        None
-                        if np.all(np.isnan(duals))
-                        else DualEntry(duals=duals, admissible=raw["admissible"] == "True")
-                    )
+                    continue
+                key = (run_id, raw["asset"], raw["unit"], int(raw["layer"]), int(raw["step"]))
+                duals = np.array([float(raw[c]) for c in dual_cols], dtype=np.float64)
+                value = (
+                    None
+                    if np.all(np.isnan(duals))
+                    else DualEntry(duals=duals, admissible=raw["admissible"] == "True")
+                )
                 if key in result:
                     if not _dual_entries_agree(result[key], value):
                         raise ValueError(

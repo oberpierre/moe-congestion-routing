@@ -245,7 +245,13 @@ def test_price_cells_emits_one_row_per_cell_serially(tmp_path):
     assert all(row.run_id == "run-a" for row in dual_rows)
 
 
-def test_a_refused_unit_is_a_stored_row_with_nan_duals(tmp_path):
+def test_a_custom_solve_returning_nan_duals_is_stored_verbatim(tmp_path):
+    """What a `solve=` callable returns reaches the row unchanged, NaN included.
+
+    This is about the injected `_refused_solve`, not about the store's rule: the default solve
+    prices a screen-refused unit for real, which the test below pins. The two sit together on
+    purpose, because the earlier name for this one claimed the opposite of that rule.
+    """
     dump_path = _write_dump(tmp_path / "probes" / "asset0", step=0, has_expert_bias=False)
     cells = [_cell(0, dump_path=dump_path, unit="u0")]
     collected: list[DualRow] = []
@@ -828,7 +834,7 @@ def test_a_partial_bias_store_is_completed_without_duplicating_existing_rows(tmp
     assert existing_bias_keys(bias_csv) == {("run-a", "2", "0"), ("run-a", "3", "0")}
 
 
-def test_read_dual_store_keeps_a_refused_but_priced_row_and_nulls_a_failed_one(tmp_path):
+def test_read_dual_store_keeps_a_refused_but_priced_row_and_drops_a_failed_one(tmp_path):
     csv_path = tmp_path / "duals.csv"
     refused = _dual_row(_cell(0, unit="u0"))._replace(
         admissible=False, max_load_over_balanced=5.0, dead_experts=1
@@ -855,7 +861,56 @@ def test_read_dual_store_keeps_a_refused_but_priced_row_and_nulls_a_failed_one(t
     assert isinstance(entry, DualEntry)
     assert entry.admissible is False
     assert numpy.array_equal(entry.duals, numpy.array(refused.duals))
-    assert store[("run-a", "asset0", "u1", 2, 0)] is None
+    # A cell that only ever failed is absent rather than present-and-None. Both read as `None`
+    # through `.get`, which is how every consumer reaches it, so this pins the behaviour rather
+    # than the representation.
+    assert ("run-a", "asset0", "u1", 2, 0) not in store
+    assert store.get(("run-a", "asset0", "u1", 2, 0)) is None
+
+
+def test_read_dual_store_takes_the_ok_row_when_a_cell_failed_then_succeeded(tmp_path):
+    """A crashed cell retried on resume writes its key twice, once failed and once `"ok"`, which
+    `append_dual_rows` deliberately permits. Treating the failed row as a value made that pair
+    look like a cross-file disagreement and refused the whole shard after the pricing was paid
+    for."""
+    csv_path = tmp_path / "duals.csv"
+    ok = _dual_row(_cell(0, unit="u0"))
+    failed = DualRow(
+        run_id=ok.run_id,
+        asset=ok.asset,
+        unit=ok.unit,
+        layer=ok.layer,
+        step=ok.step,
+        status="failed",
+        detail="boom",
+        admissible=None,
+        max_load_over_balanced=None,
+        dead_experts=None,
+        token_sha256="",
+        dump_path="",
+        duals=tuple(float("nan") for _ in range(len(ok.duals))),
+    )
+    append_dual_rows(csv_path, [failed])
+    append_dual_rows(csv_path, [ok])
+
+    store = read_dual_store([csv_path])
+    entry = store[(ok.run_id, ok.asset, ok.unit, ok.layer, ok.step)]
+    assert isinstance(entry, DualEntry)
+    assert numpy.array_equal(entry.duals, numpy.array(ok.duals))
+
+
+def test_read_dual_store_nulls_an_ok_row_whose_duals_are_all_nan(tmp_path):
+    """A store written before `_default_solve` priced every cell carries `"ok"` rows with NaN
+    duals for the units its screen refused. They must read as absent, because a NaN vector
+    reaching a correlation poisons it silently instead of raising."""
+    csv_path = tmp_path / "duals.csv"
+    stale = _dual_row(_cell(0, unit="u0"))._replace(
+        admissible=False, duals=tuple(float("nan") for _ in range(4))
+    )
+    append_dual_rows(csv_path, [stale])
+
+    store = read_dual_store([csv_path])
+    assert store[("run-a", "asset0", "u0", 2, 0)] is None
 
 
 def test_read_dual_store_agrees_silently_across_files(tmp_path):
