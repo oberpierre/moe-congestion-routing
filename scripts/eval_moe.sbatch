@@ -38,7 +38,7 @@ CACHE_ENV_EXPORT="
 
 # Prepare the environment once, before the eval step. Identical to train_moe_climblab.sbatch's
 # env-prep step
-if [ "${MOE_PREPARE_ENV:-0}" = 1 ]; then\
+if [ "${MOE_PREPARE_ENV:-0}" = 1 ]; then
 srun --nodes=1 --ntasks=1 --environment=alps6 bash -c "
   set -euo pipefail
   $CACHE_ENV_EXPORT
