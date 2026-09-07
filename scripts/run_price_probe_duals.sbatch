@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
-#SBATCH --time=06:00:00
+#SBATCH --time=01:00:00
 #SBATCH --no-requeue
 #SBATCH --network=disable_rdzv_get
 #SBATCH --output=logs/price_probe_duals_%j.log
