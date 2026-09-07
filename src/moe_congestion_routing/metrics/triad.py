@@ -38,6 +38,9 @@ from moe_congestion_routing.metrics.probe_comparison import (
 # primary with "u1" emitted separately as a robustness check.
 PRIMARY_UNIT = {"tail": "u0", "strided": "u1", "spread": "u0"}
 SPREAD_ROBUSTNESS_UNIT = "u1"
+# The strided cell's code-heavy half, used only as a direction for the composition
+# correction, never as a price. It is the one unit the screen refuses at every step.
+CODE_AXIS_UNIT = "u0"
 
 
 class TriadRow(NamedTuple):
@@ -364,10 +367,20 @@ def trajectory_cells(
         if bias_vec is None:
             continue
 
-        tail_u0 = _pairing_price(duals.get((run_id, assets.tail, "u0", layer, step)))
-        strided_u1 = _pairing_price(duals.get((run_id, assets.strided, "u1", layer, step)))
-        spread_u0 = _pairing_price(duals.get((run_id, assets.spread, "u0", layer, step)))
-        spread_u1 = _pairing_price(duals.get((run_id, assets.spread, "u1", layer, step)))
+        # Read through `PRIMARY_UNIT` rather than repeating its literals, so changing which unit
+        # a role prices on cannot leave the trajectory silently on the old one.
+        tail_u0 = _pairing_price(
+            duals.get((run_id, assets.tail, PRIMARY_UNIT["tail"], layer, step))
+        )
+        strided_u1 = _pairing_price(
+            duals.get((run_id, assets.strided, PRIMARY_UNIT["strided"], layer, step))
+        )
+        spread_u0 = _pairing_price(
+            duals.get((run_id, assets.spread, PRIMARY_UNIT["spread"], layer, step))
+        )
+        spread_u1 = _pairing_price(
+            duals.get((run_id, assets.spread, SPREAD_ROBUSTNESS_UNIT, layer, step))
+        )
 
         refused = []
         if tail_u0 is None:
@@ -386,7 +399,9 @@ def trajectory_cells(
         )
         if project_code_axis:
             axis_considered += 1
-            axis_entry = duals.get((run_id, assets.strided, "u0", layer, step))
+            # Deliberately not `PRIMARY_UNIT["strided"]`: the axis is the code-heavy half the
+            # screen refuses, which is exactly why the pairing uses the other one.
+            axis_entry = duals.get((run_id, assets.strided, CODE_AXIS_UNIT, layer, step))
             if axis_entry is None:
                 continue
             axis_found += 1

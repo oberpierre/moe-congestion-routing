@@ -34,7 +34,9 @@ DEFAULT_TAIL_ASSET = "standing_climbmix_small_16x2048"
 DEFAULT_STRIDED_ASSET = "standing_climbmix_small_strided_16x2048"
 DEFAULT_SPREAD_ASSET = "standing_climbmix_small_spread_off1_16x2048"
 
-OUT_FIELDS = ("run_id", "step", "layer", "projected", "refused_units") + TriadRow._fields
+_ROW_FIELDS = tuple(f for f in TriadRow._fields if f not in ("run", "layer"))
+OUT_FIELDS = ("run_id", "step", "layer", "projected", "refused_units") + _ROW_FIELDS
+_ROW_INDEX = tuple(TriadRow._fields.index(f) for f in _ROW_FIELDS)
 
 
 def main() -> None:
@@ -91,7 +93,7 @@ def main() -> None:
             for row in cell.rows:
                 writer.writerow(
                     (cell.run_id, cell.step, cell.layer, cell.projected, cell.refused_units)
-                    + tuple(row)
+                    + tuple(row[i] for i in _ROW_INDEX)
                 )
                 n_rows += 1
     os.replace(tmp_path, args.out)

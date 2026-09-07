@@ -514,5 +514,118 @@ def test_two_variants_come_from_one_already_parsed_store():
     corrected = trajectory_cells(duals, bias, assets=_ASSETS, project_code_axis=True, resamples=10)
 
     assert len(uncorrected) == 1 and len(corrected) == 1
-    # The second call's lookups land on the same already-parsed mapping instead of a fresh parse.
-    assert duals.get_calls > calls_after_first
+    # The corrected pass costs exactly one lookup more than the uncorrected one, which is the
+    # axis and nothing else. `> calls_after_first` would be true of any second call under any
+    # implementation, so it constrained nothing.
+    assert calls_after_first == 4
+    assert duals.get_calls - calls_after_first == 5
+    # And the two variants are genuinely different, so neither was silently skipped.
+    assert uncorrected[0].projected is False and corrected[0].projected is True
+    assert uncorrected[0].rows[0].kappa != corrected[0].rows[0].kappa
+
+
+# ---------------------------------------------------------------------------------------------
+# The driver. Testing `scripts/run_triad_trajectory.py`.
+# ---------------------------------------------------------------------------------------------
+
+
+def _write_trajectory_stores(tmp_path, num_experts=8):
+    """A minimal dual and bias store holding one full cell: the four pairing units and the axis."""
+    import csv as _csv
+
+    from moe_congestion_routing.metrics.dual_store import bias_fields, dual_fields
+
+    assets = TriadAssets(tail="tail-asset", strided="strided-asset", spread="spread-asset")
+    units = [
+        (assets.tail, "u0"),
+        (assets.strided, "u1"),
+        (assets.spread, "u0"),
+        (assets.spread, "u1"),
+        (assets.strided, "u0"),
+    ]
+    duals_path = tmp_path / "d.csv"
+    fields = dual_fields(num_experts)
+    with duals_path.open("w", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for i, (asset, unit) in enumerate(units):
+            row = dict.fromkeys(fields, "")
+            row.update(
+                run_id="a",
+                asset=asset,
+                unit=unit,
+                layer=3,
+                step=0,
+                status="ok",
+                detail="",
+                admissible="True",
+                max_load_over_balanced="1.0",
+                dead_experts="0",
+                token_sha256="t",
+                dump_path="d.npz",
+                score_function="sigmoid",
+            )
+            for e in range(num_experts):
+                row[f"dual_{e}"] = str(float((e + 1) * (i + 1) % 7) + 0.5 * e)
+            w.writerow(row)
+
+    bias_path = tmp_path / "b.csv"
+    bfields = bias_fields(num_experts)
+    with bias_path.open("w", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=bfields)
+        w.writeheader()
+        row = dict.fromkeys(bfields, "")
+        row.update(
+            run_id="a", layer=3, step=0, status="ok", detail="", asset=assets.tail, token_sha256="t"
+        )
+        for e in range(num_experts):
+            row[f"bias_{e}"] = str(0.25 * e)
+        w.writerow(row)
+    return duals_path, bias_path, assets
+
+
+def test_run_triad_trajectory_header_has_no_duplicate_column(tmp_path):
+    """`TriadRow` carries its own `run` and `layer`, which always duplicate the cell's, so
+    emitting the whole row after the cell columns put `layer` in the header twice. `csv.DictReader`
+    collapses a repeated name onto one key and pandas renames it, so both silently drop a value.
+    """
+    import csv as _csv
+    import subprocess
+    import sys
+
+    duals_path, bias_path, assets = _write_trajectory_stores(tmp_path)
+    out = tmp_path / "traj.csv"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_triad_trajectory.py",
+            "--duals",
+            str(duals_path),
+            "--bias",
+            str(bias_path),
+            "--out",
+            str(out),
+            "--resamples",
+            "10",
+            "--asset-tail",
+            assets.tail,
+            "--asset-strided",
+            assets.strided,
+            "--asset-spread",
+            assets.spread,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    with out.open(newline="") as f:
+        header = next(_csv.reader(f))
+    assert len(header) == len(set(header)), f"duplicate column in {header}"
+
+    with out.open(newline="") as f:
+        rows = list(_csv.DictReader(f))
+    # Every written value survives the round trip a keyed reader makes, which is the property a
+    # duplicate name breaks without raising.
+    assert all(len(r) == len(header) for r in rows)
+    assert {r["projected"] for r in rows} == {"True", "False"}
