@@ -8,11 +8,16 @@ moe_aux_loss_coeff: 0.0
 # the router cannot route its way back out.
 moe_z_loss_coeff: -1.0e-3
 
-train_iters: 1000
+# 500, not 1000. The negative z-loss has no fixed point: it rewards logit magnitude without
+# bound, so it does not converge, it runs away. The first 1000-step run collapsed cleanly by
+# step ~150 and then destabilised from step ~660, with layers 1 to 3 oscillating between 15 and
+# 60 live experts to the end and a broad spike across layers 2 to 7 at step 680. More steps make
+# that worse rather than deeper, so the induction stops while every layer is still flat.
+train_iters: 500
 lr_warmup_iters: 10
 lr_wsd_decay_iters: 50
 
 # Dense throughout, because the whole run is the interesting part and it is short.
-moe_probe_dense_windows: ["0:1000"]
+moe_probe_dense_windows: ["0:500"]
 
 output_dir: artifacts/collapse/induce_softmax
