@@ -27,8 +27,87 @@ if not (set(DEFAULT_LAMBDA) == set(COST_EXPONENTS) == set(COST_FAMILIES)):
     )
 
 
+class _PowerCost(NamedTuple):
+    """``c(x) = lam * x**exponent``, the shape every trainable family currently has."""
+
+    exponent: int
+
+
+class _BarrierCost(NamedTuple):
+    """``c(x) = lam * softplus((x - 1) / tau)``, with a registry default for ``tau``."""
+
+    tau: float
+
+
+# The oracle's family set is a superset of COST_FAMILIES: the router can only train what
+# COST_FAMILIES names, but the offline LP/incremental-arc oracles can price a soft capacity
+# barrier too, which is why this dict is keyed separately rather than folded into COST_EXPONENTS.
+# Built from COST_EXPONENTS rather than COST_FAMILIES directly, so the two stay in lockstep
+# through the same invariant check above.
+_ORACLE_RECORDS: dict[str, _PowerCost | _BarrierCost] = {
+    family: _PowerCost(exponent) for family, exponent in COST_EXPONENTS.items()
+}
+_ORACLE_RECORDS["softplus_barrier"] = _BarrierCost(tau=0.1)
+ORACLE_COST_FAMILIES: tuple[str, ...] = tuple(_ORACLE_RECORDS)
+
+
+def _oracle_family(cost_family: str) -> _PowerCost | _BarrierCost:
+    """The record backing ``cost_family`` for the oracle-side price functions, or raise."""
+    if cost_family not in _ORACLE_RECORDS:
+        raise ValueError(
+            f"unknown cost family {cost_family!r}; expected one of {ORACLE_COST_FAMILIES}"
+        )
+    return _ORACLE_RECORDS[cost_family]
+
+
+def _resolve_tau(record: _PowerCost | _BarrierCost, cost_family: str, tau: float | None) -> float:
+    """``tau`` for a barrier record, defaulted from the registry, or raise if it was passed to a
+    power family, which has no shape to override and would leave a caller measuring nothing."""
+    if isinstance(record, _PowerCost):
+        if tau is not None:
+            raise ValueError(
+                f"tau is not a parameter of cost_family {cost_family!r}; only "
+                "'softplus_barrier' takes tau"
+            )
+        return 0.0
+    resolved = record.tau if tau is None else tau
+    # Both failures below are silent without this guard, which is why it is a raise and not a
+    # clamp. At tau == 0 the price is 0/0 = NaN exactly at balanced load and +inf above it, and
+    # at tau < 0 the barrier runs backwards, so marginal_cost stops increasing in j and
+    # first_arc_above_price returns an arc whose price is below the threshold it was given.
+    if resolved <= 0:
+        raise ValueError(
+            f"tau must be positive, got {resolved}: at tau == 0 the price is NaN at balanced "
+            f"load and infinite above it, and at tau < 0 the barrier decreases in load, which "
+            f"breaks the monotonicity first_arc_above_price inverts"
+        )
+    return resolved
+
+
+def _softplus(z: np.ndarray) -> np.ndarray:
+    """Numerically stable ``log(1 + exp(z))``, avoiding overflow at the ``z`` up to ~70 this
+    fleet's loads reach at ``tau = 0.1``, where a direct ``np.exp(z)`` would already be inf."""
+    return np.maximum(z, 0.0) + np.log1p(np.exp(-np.abs(z)))
+
+
+def _softplus_inverse(y: float) -> float:
+    """``log(exp(y) - 1)``, the inverse of softplus, for ``y > 0``.
+
+    ``math.expm1(y)`` is exact for small ``y`` but its argument overflows once ``y`` is a few
+    hundred, so past that point this rewrites to ``y + log1p(-exp(-y))``, which is stable because
+    ``exp(-y)`` alone underflows to 0 rather than the whole expression overflowing to inf.
+    """
+    if y > 30.0:
+        return y + math.log1p(-math.exp(-y))
+    return math.log(math.expm1(y))
+
+
 def cost_exponent(cost_family: str) -> int:
-    """The exponent ``p`` of ``c(x) = lam * x**p`` for ``cost_family``, or raise."""
+    """The exponent ``p`` of ``c(x) = lam * x**p`` for ``cost_family``, or raise.
+
+    Only the power families have a ``p``, so this raises for ``'softplus_barrier'`` exactly as it
+    raises for any other name COST_EXPONENTS does not carry, rather than inventing one.
+    """
     if cost_family not in COST_EXPONENTS:
         raise ValueError(f"unknown cost family {cost_family!r}; expected one of {COST_FAMILIES}")
     return COST_EXPONENTS[cost_family]
@@ -40,16 +119,23 @@ def marginal_cost(
     *,
     lam: float = 1.0,
     cost_family: str = "linear",
+    tau: float | None = None,
 ) -> np.ndarray:
-    """Marginal price of the ``j``-th (1-based) token routed to an expert, ``lam*(j/L)**p``.
+    """Marginal price of the ``j``-th (1-based) token routed to an expert.
 
-    ``j`` is the arc index in the oracle's per-expert cost-flow graph, so this is the price the LP
-    oracle assigns to that arc. Float64, matching the LP's own precision rather than the torch
-    loss's float32.
+    ``lam*(j/L)**p`` for a power family, or ``lam*softplus((j/L - 1)/tau)`` for the barrier,
+    where ``tau`` defaults to the family's own registry value and raises if given to a power
+    family. ``j`` is the arc index in the oracle's per-expert cost-flow graph, so this is the
+    price the LP oracle assigns to that arc. Float64, matching the LP's own precision rather than
+    the torch loss's float32.
     """
-    p = cost_exponent(cost_family)
+    record = _oracle_family(cost_family)
+    tau_value = _resolve_tau(record, cost_family, tau)
     j_arr = np.asarray(j, dtype=np.float64)
-    return lam * (j_arr / balanced_load) ** p
+    x = j_arr / balanced_load
+    if isinstance(record, _PowerCost):
+        return lam * x**record.exponent
+    return lam * _softplus((x - 1.0) / tau_value)
 
 
 def first_arc_above_price(
@@ -58,17 +144,23 @@ def first_arc_above_price(
     *,
     lam: float = 1.0,
     cost_family: str = "linear",
+    tau: float | None = None,
 ) -> int:
     """The smallest 1-based ``j`` with ``marginal_cost(j, ...) > threshold``, in closed form.
 
-    ``marginal_cost`` is strictly increasing in ``j`` for ``lam > 0``, so the crossing point
-    ``x* = balanced_load * (threshold/lam)**(1/p)`` is unique and ``j = floor(x*) + 1``.
-    ``threshold <= 0`` returns 1 directly, because ``marginal_cost(1, ...) > 0`` already, and the
-    real branch's fractional power would otherwise be taken of a negative base under the quadratic
-    family. This is the inverse of ``marginal_cost`` and is what lets a caller size an arc schedule
-    from a price bound without building the schedule first.
+    ``marginal_cost`` is strictly increasing in ``j`` for ``lam > 0``, so the crossing point is
+    unique. For a power family it is ``x* = balanced_load * (threshold/lam)**(1/p)``, unchanged.
+    For the barrier it inverts softplus, ``x* = balanced_load * (1 + tau*log(exp(threshold/lam)
+    - 1))``, which can fall below the ``j=1`` arc when even the very first arc's price already
+    exceeds ``threshold``, so the result is clamped to ``max(1, floor(x*) + 1)`` rather than
+    returned negative or zero. ``threshold <= 0`` returns 1 directly, because
+    ``marginal_cost(1, ...) > 0`` already, and the real branch's fractional power would otherwise
+    be taken of a negative base under the quadratic family. This is the inverse of
+    ``marginal_cost`` and is what lets a caller size an arc schedule from a price bound without
+    building the schedule first.
     """
-    p = cost_exponent(cost_family)
+    record = _oracle_family(cost_family)
+    tau_value = _resolve_tau(record, cost_family, tau)
     if lam <= 0:
         raise ValueError(
             f"lam must be positive, got {lam}: at lam <= 0 every marginal cost is 0, so no j "
@@ -76,8 +168,11 @@ def first_arc_above_price(
         )
     if threshold <= 0:
         return 1
-    x_star = balanced_load * (threshold / lam) ** (1.0 / p)
-    return math.floor(x_star) + 1
+    if isinstance(record, _PowerCost):
+        x_star = balanced_load * (threshold / lam) ** (1.0 / record.exponent)
+    else:
+        x_star = balanced_load * (1.0 + tau_value * _softplus_inverse(threshold / lam))
+    return max(1, math.floor(x_star) + 1)
 
 
 def discrete_potential(
@@ -86,24 +181,30 @@ def discrete_potential(
     *,
     lam: float = 1.0,
     cost_family: str = "linear",
+    tau: float | None = None,
 ) -> float:
-    """Discrete Rosenthal potential ``sum_e sum_{j=1..n_e} lam*(j/L)**p`` over realized loads.
+    """Discrete Rosenthal potential ``sum_e sum_{j=1..n_e} marginal_cost(j, ...)`` over realized
+    loads.
 
     Raw sum, unnormalized by ``N*K``, unlike ``rosenthal.congestion_potential``, because this is
     the scored quantity the LP oracle's objective is checked against.
     """
-    # Validate eagerly, because an all-zero load vector never enters the loop and would otherwise
-    # accept an unknown family silently.
-    cost_exponent(cost_family)
+    # Validated eagerly against the oracle's wider family set, because an all-zero load vector
+    # never enters the loop and would otherwise accept an unknown family (or a misused tau)
+    # silently.
+    record = _oracle_family(cost_family)
+    _resolve_tau(record, cost_family, tau)
     total = 0.0
     for n in np.asarray(loads):
         n_int = int(n)
         if n_int <= 0:
             continue
         j = np.arange(1, n_int + 1, dtype=np.float64)
-        # Through marginal_cost rather than inline, so the exponent is applied in exactly one place
-        # and a defect in the price cannot cancel itself out of the potential.
-        total += float(np.sum(marginal_cost(j, balanced_load, lam=lam, cost_family=cost_family)))
+        # Through marginal_cost rather than inline, so the price is computed in exactly one place
+        # and a defect there cannot cancel itself out of the potential.
+        total += float(
+            np.sum(marginal_cost(j, balanced_load, lam=lam, cost_family=cost_family, tau=tau))
+        )
     return total
 
 

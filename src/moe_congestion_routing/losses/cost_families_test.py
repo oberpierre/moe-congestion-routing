@@ -1,3 +1,4 @@
+import math
 import pathlib
 import subprocess
 import sys
@@ -11,8 +12,11 @@ from moe_congestion_routing.losses.cost_families import (
     COST_EXPONENTS,
     COST_FAMILIES,
     DEFAULT_LAMBDA,
+    ORACLE_COST_FAMILIES,
     ROSENTHAL_TYPES,
     VARIANTS,
+    _softplus,
+    _softplus_inverse,
     check_variant,
     cost_exponent,
     discrete_potential,
@@ -21,6 +25,7 @@ from moe_congestion_routing.losses.cost_families import (
     pressure_bound,
 )
 from moe_congestion_routing.losses.rosenthal import congestion_potential
+from moe_congestion_routing.training.pretrain_config import MoEPretrainConfig, build_megatron_args
 
 
 def test_no_torch_import():
@@ -284,3 +289,161 @@ def test_first_arc_above_price_nonpositive_lam_raises():
 def test_first_arc_above_price_unknown_cost_family_raises():
     with pytest.raises(ValueError, match="bogus"):
         first_arc_above_price(1.0, 10.0, cost_family="bogus")
+
+
+# A fixed grid of j and balanced_load unrelated to any other test in this file, so a defect that
+# happens to cancel out on the tables above would still show up here. The reference is the power
+# law spelled out again directly, `lam*(j/L)**p`, rather than a value snapshotted before the
+# registry became record-based, so a change to how the record is stored cannot silently change
+# what "bit-identical" means.
+_GRID_J = np.arange(1, 4001, dtype=np.float64)
+_GRID_L = 733.0
+
+
+@pytest.mark.parametrize("cost_family,p", [("linear", 1), ("quadratic", 2)])
+@pytest.mark.parametrize("lam", [1.0, 0.4, 3.1])
+def test_power_families_are_bit_identical_to_the_direct_formula(cost_family, p, lam):
+    expected = lam * (_GRID_J / _GRID_L) ** p
+    assert marginal_cost(_GRID_J, _GRID_L, lam=lam, cost_family=cost_family) == pytest.approx(
+        expected, rel=0, abs=0
+    )
+
+    loads = np.array([50, 0, 733, 4000], dtype=np.int64)
+    expected_potential = sum(
+        float(np.sum(lam * (np.arange(1, int(n) + 1, dtype=np.float64) / _GRID_L) ** p))
+        for n in loads
+    )
+    assert discrete_potential(loads, _GRID_L, lam=lam, cost_family=cost_family) == pytest.approx(
+        expected_potential, rel=0, abs=0
+    )
+
+    for threshold in (0.01, 0.5, 2.0, 10.0):
+        expected_j = math.floor(_GRID_L * (threshold / lam) ** (1.0 / p)) + 1
+        assert (
+            first_arc_above_price(threshold, _GRID_L, lam=lam, cost_family=cost_family)
+            == expected_j
+        )
+
+
+def test_barrier_price_is_near_zero_below_balance_and_rises_sharply_above_it():
+    # x = j/L. Below 1 (under-loaded) the barrier should sit near 0, whereas above 1 it should
+    # rise steeply, which is the whole point of a capacity barrier over a power-law cost.
+    below = marginal_cost(0.1 * _GRID_L, _GRID_L, cost_family="softplus_barrier", tau=0.1)
+    at_balance = marginal_cost(1.0 * _GRID_L, _GRID_L, cost_family="softplus_barrier", tau=0.1)
+    above = marginal_cost(1.5 * _GRID_L, _GRID_L, cost_family="softplus_barrier", tau=0.1)
+    assert float(below) < 0.01
+    assert float(at_balance) < float(above)
+    assert float(above) > 4.0
+
+
+def test_barrier_price_does_not_overflow_at_x_eight():
+    # (x-1)/tau = 70 at x=8, tau=0.1, the largest relative load this fleet reaches, so a direct
+    # np.exp of that argument would already be inf.
+    value = marginal_cost(8.0 * _GRID_L, _GRID_L, lam=1.0, cost_family="softplus_barrier", tau=0.1)
+    assert math.isfinite(float(value))
+    assert float(value) == pytest.approx(70.0, abs=1e-6)
+
+
+_BARRIER_THRESHOLD_CASES = [0.0, -3.0, 1e-4, 0.01, 0.1, 0.5, 2.0, 10.0]
+
+
+@pytest.mark.parametrize("tau", [0.5, 0.1, 0.02])
+@pytest.mark.parametrize("threshold", _BARRIER_THRESHOLD_CASES)
+def test_first_arc_above_price_round_trips_for_the_barrier(threshold, tau):
+    j = first_arc_above_price(threshold, _GRID_L, cost_family="softplus_barrier", tau=tau)
+    assert j >= 1
+    assert float(marginal_cost(j, _GRID_L, cost_family="softplus_barrier", tau=tau)) > threshold
+    if j > 1:
+        below = float(marginal_cost(j - 1, _GRID_L, cost_family="softplus_barrier", tau=tau))
+        assert below <= threshold
+
+
+def test_first_arc_above_price_nonpositive_threshold_returns_the_first_arc():
+    # The stated branch: threshold <= 0 returns 1 directly for every family, power or barrier,
+    # because marginal_cost(1, ...) is already > 0 and the general formula is not even evaluated.
+    assert first_arc_above_price(0.0, _GRID_L, cost_family="linear") == 1
+    assert first_arc_above_price(-5.0, _GRID_L, cost_family="quadratic") == 1
+    assert first_arc_above_price(0.0, _GRID_L, cost_family="softplus_barrier", tau=0.1) == 1
+    assert first_arc_above_price(-5.0, _GRID_L, cost_family="softplus_barrier", tau=0.1) == 1
+
+
+@pytest.mark.parametrize("cost_family", COST_FAMILIES)
+def test_tau_on_a_power_family_raises(cost_family):
+    with pytest.raises(ValueError, match="tau"):
+        marginal_cost(1, _GRID_L, cost_family=cost_family, tau=0.1)
+    with pytest.raises(ValueError, match="tau"):
+        first_arc_above_price(1.0, _GRID_L, cost_family=cost_family, tau=0.1)
+    with pytest.raises(ValueError, match="tau"):
+        discrete_potential(np.array([1, 2]), _GRID_L, cost_family=cost_family, tau=0.1)
+
+
+def test_barrier_with_no_tau_uses_the_registry_default():
+    default = marginal_cost(1.5 * _GRID_L, _GRID_L, cost_family="softplus_barrier")
+    explicit = marginal_cost(1.5 * _GRID_L, _GRID_L, cost_family="softplus_barrier", tau=0.1)
+    assert float(default) == pytest.approx(float(explicit))
+    other_tau = marginal_cost(1.5 * _GRID_L, _GRID_L, cost_family="softplus_barrier", tau=0.5)
+    assert float(default) != pytest.approx(float(other_tau))
+
+
+def test_trainable_set_is_a_strict_subset_of_the_oracle_set():
+    assert set(COST_FAMILIES) < set(ORACLE_COST_FAMILIES)
+    assert set(ORACLE_COST_FAMILIES) - set(COST_FAMILIES) == {"softplus_barrier"}
+
+
+def test_cost_exponent_softplus_barrier_raises():
+    with pytest.raises(ValueError, match="softplus_barrier"):
+        cost_exponent("softplus_barrier")
+
+
+def test_marginal_cost_and_discrete_potential_accept_softplus_barrier():
+    # The registry change's whole point: the oracle-side functions must price a family
+    # cost_exponent itself still refuses, rather than the two disagreeing on what exists.
+    assert math.isfinite(float(marginal_cost(1, _GRID_L, cost_family="softplus_barrier", tau=0.1)))
+    assert math.isfinite(
+        discrete_potential(np.array([10, 20]), _GRID_L, cost_family="softplus_barrier", tau=0.1)
+    )
+
+
+def test_config_naming_softplus_barrier_is_rejected():
+    # Asserted through the public config path, training/pretrain_config.py's own validation,
+    # rather than by reading COST_FAMILIES out of this module, because that validation is what a
+    # yaml file actually goes through and is the thing (b) requires stays rejecting.
+    cfg = MoEPretrainConfig(
+        train_data_path="/data/train",
+        lr_wsd_decay_iters=10,
+        moe_router_load_balancing_type="rosenthal",
+        moe_rosenthal_cost="softplus_barrier",
+    )
+    with pytest.raises(ValueError, match="moe_rosenthal_cost"):
+        build_megatron_args(cfg)
+
+
+@pytest.mark.parametrize("bad_tau", [0.0, -0.1])
+def test_a_non_positive_tau_raises_on_every_entry_point(bad_tau):
+    """Both failures are silent without the guard, and `tau=0` is the natural thing to type
+    when probing the hard-capacity limit the calibration sweep converges toward.
+
+    At `tau == 0` the price is `0/0` at balanced load and `+inf` above it, and at `tau < 0` the
+    barrier decreases in load, so `first_arc_above_price` returns an arc whose price sits *below*
+    the threshold it was asked to exceed.
+    """
+    for call in (
+        lambda: marginal_cost(733, 733.0, cost_family="softplus_barrier", tau=bad_tau),
+        lambda: first_arc_above_price(0.5, 733.0, cost_family="softplus_barrier", tau=bad_tau),
+        lambda: discrete_potential(
+            np.array([1.0]), 733.0, cost_family="softplus_barrier", tau=bad_tau
+        ),
+    ):
+        with pytest.raises(ValueError, match="tau must be positive"):
+            call()
+
+
+@pytest.mark.parametrize("y", [50.0, 300.0, 700.0])
+def test_softplus_inverse_round_trips_in_the_large_y_branch(y):
+    """The stable rewrite for large `y` is the whole point of `_softplus_inverse`, and nothing
+    else in the suite reaches it: the barrier thresholds this repo actually prices sit near 0.2
+    to 3.5, so the branch would ship unexercised. A naive `log(exp(y) - 1)` overflows near 709.
+    """
+    z = _softplus_inverse(np.float64(y))
+    assert np.isfinite(z)
+    assert _softplus(z) == pytest.approx(y, rel=1e-12)

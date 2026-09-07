@@ -82,7 +82,14 @@ def _balanced_assignment(n: int, k: int, e: int) -> np.ndarray:
 
 
 def arc_schedule_length(
-    n: int, k: int, e: int, max_span: float, *, lam: float, cost_family: str
+    n: int,
+    k: int,
+    e: int,
+    max_span: float,
+    *,
+    lam: float,
+    cost_family: str,
+    tau: float | None = None,
 ) -> int:
     """The arc budget ``J`` every expert's schedule is truncated to at this ``lam``.
 
@@ -90,10 +97,14 @@ def arc_schedule_length(
     price exceeds the unit's own largest per-token affinity span. The feasibility floor
     ``ceil(n*k/e)`` alone leaves no aggregate slack, so pigeonhole saturates the first solve
     whatever the prices are, and doubling it starts one growth ahead where a caller-supplied
-    schedule allows it.
+    schedule allows it. ``tau`` is forwarded to ``first_arc_above_price`` unchanged, so passing it
+    with a power family **raises** rather than being ignored, and omitting it for the barrier
+    takes the registry default.
     """
     balanced_load = n * k / e
-    j_span = first_arc_above_price(max_span, balanced_load, lam=lam, cost_family=cost_family)
+    j_span = first_arc_above_price(
+        max_span, balanced_load, lam=lam, cost_family=cost_family, tau=tau
+    )
     # Integer ceiling of n*k/e without float rounding, matching solve_incremental's own floor.
     feasibility_floor = -(-n * k // e)
     return min(n, 2 * max(j_span, feasibility_floor))

@@ -6,6 +6,7 @@ import sys
 import numpy
 import pytest
 
+from moe_congestion_routing.game import lp
 from moe_congestion_routing.game.incremental import solve_incremental
 from moe_congestion_routing.losses.cost_families import marginal_cost
 from moe_congestion_routing.metrics import probe_comparison
@@ -441,3 +442,63 @@ def test_lam_negative_raises(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="lam"):
         phi_gap_rows(read_dump(path), layer=2, unit="u0", lam=-1.0)
+
+
+def test_arc_schedule_length_threads_tau():
+    # A barrier's price at a fixed relative load depends on tau, so the initial arc budget must
+    # move with it too. max_span=5.0 is well past the feasibility floor that governs the real
+    # shape's own max_span (0.202505, see _SCHEDULE_TABLE above), so J_span rather than the floor
+    # decides the result and a tau that is not threaded through would leave it unchanged.
+    n, k, e, max_span = 16384, 8, 64, 5.0
+    tight = arc_schedule_length(
+        n, k, e, max_span, lam=1.0, cost_family="softplus_barrier", tau=0.01
+    )
+    loose = arc_schedule_length(n, k, e, max_span, lam=1.0, cost_family="softplus_barrier", tau=0.5)
+    default = arc_schedule_length(n, k, e, max_span, lam=1.0, cost_family="softplus_barrier")
+    explicit = arc_schedule_length(
+        n, k, e, max_span, lam=1.0, cost_family="softplus_barrier", tau=0.1
+    )
+    assert tight != loose
+    assert default == explicit
+
+
+def test_barrier_oracle_approaches_the_capacity_lp_as_tau_falls():
+    # A small, capacity-divisible synthetic instance so the LP and incremental oracles both solve
+    # in milliseconds. Expert 0 is made much more attractive to every token than the others, so
+    # the capacity constraint actually binds and a loose (large-tau) barrier visibly overloads it
+    # relative to the LP's hard cap. This is rem:calibration's own content, stated empirically:
+    # as tau -> 0 the soft barrier's optimum converges to the capacity-constrained assignment.
+    rng = numpy.random.default_rng(7)
+    n, k, e = 12, 2, 4
+    a = rng.uniform(0, 1, size=(n, e))
+    a[:, 0] += 3.0
+    cap = n * k // e
+    assert cap * e == n * k  # divisible, so the LP oracle's cap has no rounding slack
+
+    lp_result = lp.solve(a, k, cap=cap)
+    balanced_load = n * k / e
+    max_span = float((a.max(axis=1) - a.min(axis=1)).max())
+
+    diffs_affinity = []
+    for tau in (0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005):
+        num_arcs = arc_schedule_length(
+            n, k, e, max_span, lam=1.0, cost_family="softplus_barrier", tau=tau
+        )
+        arc_prices = marginal_cost(
+            numpy.arange(1, num_arcs + 1),
+            balanced_load,
+            lam=1.0,
+            cost_family="softplus_barrier",
+            tau=tau,
+        )
+        oracle = solve_incremental(a, k, arc_prices)
+        assert oracle.arc_growths == 0
+        diffs_affinity.append(abs(oracle.affinity - lp_result.objective))
+        if tau == 0.005:
+            assert int(oracle.x.sum(axis=0).max()) == lp_result.max_load
+            assert oracle.affinity == pytest.approx(lp_result.objective, abs=1e-6)
+
+    # Non-increasing overall and strictly smaller at the end than at the start, which is the
+    # direction rem:calibration predicts rather than a fixed tolerance at one fixed tau.
+    assert diffs_affinity[-1] < diffs_affinity[0]
+    assert all(a >= b - 1e-9 for a, b in zip(diffs_affinity, diffs_affinity[1:], strict=False))
