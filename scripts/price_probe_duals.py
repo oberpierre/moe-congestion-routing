@@ -12,9 +12,10 @@ store.
 Splitting a sweep is by asset: run this once per asset, each invocation with its own
 `--duals-out`/`--bias-out`. A later correlating pass takes several store files as a set rather
 than concatenating them, so there is no join step to botch, unlike the phi-gap grid's one file
-per arm. Two invocations against the same bias file, for two assets probing the same checkpoint,
-is exactly what makes `append_bias_rows`'s cross-invocation comparison live: the second invocation's
-bias row is checked against the first's rather than silently dropped.
+per arm. Concurrent invocations must never share a `--bias-out`: `append_bias_rows` re-reads and
+appends with no lock, so two processes writing the same bias key at once interleave rows. The
+cross-asset comparison this used to force at write time now happens at read time, in
+`dual_store.read_bias_store`, which takes the shards as a set and raises on disagreement.
 
 Usage:
     uv run python scripts/price_probe_duals.py --run-dir artifacts/exp1/control/control-trunk \\
