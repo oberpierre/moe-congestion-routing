@@ -134,7 +134,7 @@ def test_rosenthal_hard_linear_equals_switch_grad_wrt_scores(topk):
 
 
 # ---------------------------------------------------------------------------------------------
-# TransformerConfig validation rules 1-6 raise; rule 8 warns.
+# TransformerConfig validation rules
 # ---------------------------------------------------------------------------------------------
 
 
@@ -153,14 +153,14 @@ def test_rule3_nonpositive_lambda_raises():
         _quiet_transformer_config(moe_rosenthal_lambda=0.0)
 
 
-def test_rule4_sigmoid_score_function_raises():
-    with pytest.raises(ValueError, match="moe_router_score_function"):
-        _quiet_transformer_config(moe_router_score_function="sigmoid")
+def test_rule4_retired_sigmoid_score_function_no_longer_rejected():
+    # Rule 4 is retired. compute_routing_scores_for_aux_loss already per-token normalizes sigmoid
+    # scores the same way it normalizes softmax, so the loss's conservation invariant holds under
+    # sigmoid too and a rosenthal type must construct without raising.
+    _quiet_transformer_config(moe_router_score_function="sigmoid")
 
 
 def test_global_rosenthal_soft_no_longer_rejected():
-    # Rules 5 and 6 are retired. The synced-coefficient construction makes 'soft' correct at any
-    # reduce-group size, so global_rosenthal with soft must construct without raising.
     _quiet_transformer_config(
         moe_router_load_balancing_type="global_rosenthal", moe_rosenthal_variant="soft"
     )
@@ -210,7 +210,7 @@ def test_rule8_pressure_above_sanity_bound_warns():
     # Deliberately not routed through _quiet_transformer_config, whose blanket
     # simplefilter("ignore") would swallow our own warning along with the unrelated ones.
     # pytest.warns needs only one matching warning, so the unrelated ones are harmless here.
-    with pytest.warns(UserWarning, match="congestion pressure at full imbalance"):
+    with pytest.warns(UserWarning, match="exceeds the sanity bound of 1 at full imbalance"):
         TransformerConfig(**_base_kwargs(moe_rosenthal_lambda=100.0))
 
 
@@ -218,7 +218,7 @@ def test_rule8_pressure_within_sanity_bound_does_not_warn_about_pressure():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         _quiet_transformer_config(moe_rosenthal_lambda=1.0)
-    assert not any("congestion pressure" in str(w.message) for w in caught)
+    assert not any("sanity bound" in str(w.message) for w in caught)
 
 
 def test_rule8_soft_variant_warns_with_the_soft_bound_expression():
@@ -237,14 +237,15 @@ def test_rule8_soft_variant_warns_with_the_soft_bound_expression():
 # ---------------------------------------------------------------------------------------------
 
 
-def test_rule4_sigmoid_score_function_raises_for_rosenthal_combined_with_another_type():
-    with pytest.raises(ValueError, match="moe_router_score_function"):
-        _quiet_transformer_config(
-            moe_router_load_balancing_type=["seq_aux_loss", "rosenthal"],
-            # One coefficient per entry, as Megatron's own list-form validation requires.
-            moe_aux_loss_coeff=[0.01, 0.01],
-            moe_router_score_function="sigmoid",
-        )
+def test_rule4_retired_sigmoid_score_function_no_longer_rejected_when_combined_with_another_type():
+    # Same retirement as the scalar case above, checked through the list-form path so a future
+    # change to that path's own normalization is not missed just because it always tests scalar.
+    _quiet_transformer_config(
+        moe_router_load_balancing_type=["seq_aux_loss", "rosenthal"],
+        # One coefficient per entry, as Megatron's own list-form validation requires.
+        moe_aux_loss_coeff=[0.01, 0.01],
+        moe_router_score_function="sigmoid",
+    )
 
 
 def test_rosenthal_and_global_rosenthal_together_raises_exclusivity_error():

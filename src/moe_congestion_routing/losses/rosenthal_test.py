@@ -5,7 +5,10 @@ import torch
 
 from moe_congestion_routing.losses.cost_families import pressure_bound
 from moe_congestion_routing.losses.rosenthal import (
+    _assert_conserves_global_mass,
+    balanced_load,
     congestion_potential,
+    cost,
     cost_antiderivative,
     pressure,
     relative_loads,
@@ -569,22 +572,111 @@ def test_unknown_cost_family_raises_with_offending_value():
         congestion_potential(tokens_per_expert, 10.0, 2, 3, cost_family="bogus")
 
 
+def test_cost_antiderivative_raises_for_the_barrier_naming_the_dilogarithm():
+    with pytest.raises(ValueError, match="dilogarithm"):
+        cost_antiderivative(torch.tensor([1.0, 2.0]), "softplus_barrier", lam=1.0)
+
+
+def test_rosenthal_loss_soft_variant_raises_for_the_barrier():
+    prob_sum = torch.ones(3)
+    tokens_per_expert = torch.ones(3)
+    with pytest.raises(ValueError, match="dilogarithm"):
+        rosenthal_loss(
+            prob_sum,
+            tokens_per_expert,
+            10.0,
+            2,
+            3,
+            coeff=1.0,
+            lam=1.0,
+            variant="soft",
+            cost_family="softplus_barrier",
+        )
+
+
 def test_potential_closed_forms_key_mismatch_raises_at_import():
     # Same shape as cost_families.py's own guard: _POTENTIAL_CLOSED_FORMS must be checked against
-    # COST_FAMILIES as well as COST_EXPONENTS, since COST_FAMILIES is the literal every consumer
-    # actually validates membership against. Dropping a family's closed form here, with
-    # COST_EXPONENTS/COST_FAMILIES left untouched, must fail at import rather than falling through
-    # to whichever branch happened to be checked last in congestion_potential.
+    # COST_FAMILIES, the literal every consumer actually validates membership against. Dropping a
+    # family's closed form here, with COST_FAMILIES left untouched, must fail at import rather
+    # than falling through to whichever branch happened to be checked last in
+    # congestion_potential.
     import moe_congestion_routing.losses.rosenthal as rosenthal_module
 
     source = pathlib.Path(rosenthal_module.__file__).read_text()
     mutated = source.replace(
         "_POTENTIAL_CLOSED_FORMS: dict[str, Callable[[torch.Tensor, torch.Tensor, float], "
         'torch.Tensor]] = {\n    "linear": _potential_closed_form_linear,\n    '
-        '"quadratic": _potential_closed_form_quadratic,\n}',
+        '"quadratic": _potential_closed_form_quadratic,\n    '
+        '"softplus_barrier": _potential_closed_form_barrier,\n}',
         "_POTENTIAL_CLOSED_FORMS: dict[str, Callable[[torch.Tensor, torch.Tensor, float], "
         'torch.Tensor]] = {\n    "linear": _potential_closed_form_linear,\n}',
     )
     assert mutated != source  # guard against the replacement silently matching nothing
     with pytest.raises(ValueError, match="disagree"):
         exec(compile(mutated, "<mutated rosenthal>", "exec"), {"__name__": "mutated"})
+
+
+def test_barrier_potential_prefix_sum_matches_the_naive_per_expert_sum():
+    # The barrier has no closed form, so its potential is a prefix sum over one shared price
+    # vector rather than a loop of per-expert aranges. This pins that rewrite against the naive
+    # definition, and includes an idle expert because indexing a prefix sum built without a
+    # leading zero would charge every zero-count expert for its first arc, which is a silent
+    # overcount rather than a crash.
+    num_experts = 6
+    topk = 2
+    tokens_per_expert = torch.tensor([0.0, 1.0, 7.0, 20.0, 41.0, 3.0])
+    total_num_tokens = 20.0 * num_experts / topk  # N such that L = 20
+    load = balanced_load(total_num_tokens, topk, num_experts)
+    lam = 0.2
+
+    naive = sum(
+        float(cost(torch.arange(1, int(n) + 1).float() / load, "softplus_barrier", lam).sum())
+        for n in tokens_per_expert.tolist()
+        if int(n) > 0
+    )
+    phi = congestion_potential(
+        tokens_per_expert,
+        total_num_tokens,
+        topk,
+        num_experts,
+        lam=lam,
+        cost_family="softplus_barrier",
+    )
+    assert torch.allclose(phi, torch.tensor(naive / (total_num_tokens * topk)), atol=1e-6)
+
+
+def test_barrier_potential_is_zero_when_every_expert_is_idle():
+    # max_n == 0 is the branch the arange cannot take, and it must not raise.
+    phi = congestion_potential(torch.zeros(4), 40.0, 2, 4, lam=0.2, cost_family="softplus_barrier")
+    assert float(phi) == 0.0
+
+
+def test_conserves_global_mass_accepts_sigmoid_shaped_prob_sum():
+    # A sigmoid-normalized router sums each token's per-expert scores to 1, not to E times
+    # anything: rows here sum to 1 rather than to a softmax row's usual E/topk-scaled mass, and
+    # the invariant must still hold because it is a property of per-token normalization, not of
+    # softmax specifically.
+    num_experts = 6
+    total_num_tokens = 40
+    torch.manual_seed(3)
+    raw = torch.rand(total_num_tokens, num_experts)
+    scores = torch.sigmoid(raw)
+    scores = scores / scores.sum(dim=-1, keepdim=True)
+    prob_sum = scores.sum(dim=0)
+    u_glob, _ = relative_loads(prob_sum, torch.zeros(num_experts), total_num_tokens, 2, num_experts)
+    _assert_conserves_global_mass(u_glob, num_experts)  # must not raise
+
+
+def test_conserves_global_mass_rejects_unnormalized_prob_sum():
+    # If a future upstream change stopped normalizing the score function before summing (the
+    # fused kernel path this loss deliberately does not support), sum_e u_glob != E and this must
+    # fail here rather than surface only as a wrong number in a GPU log.
+    num_experts = 6
+    total_num_tokens = 40
+    torch.manual_seed(3)
+    raw = torch.rand(total_num_tokens, num_experts)
+    unnormalized_scores = torch.sigmoid(raw)  # rows do not sum to 1
+    prob_sum = unnormalized_scores.sum(dim=0)
+    u_glob, _ = relative_loads(prob_sum, torch.zeros(num_experts), total_num_tokens, 2, num_experts)
+    with pytest.raises(AssertionError, match="conservation invariant"):
+        _assert_conserves_global_mass(u_glob, num_experts)

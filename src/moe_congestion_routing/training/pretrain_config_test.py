@@ -743,14 +743,14 @@ def test_rosenthal_lambda_omitted_resolves_to_the_cost_familys_default():
         assert _pairs(args)["--moe-rosenthal-lambda"] == str(default)
 
 
-def test_rosenthal_rule4_requires_softmax_score_function():
-    with pytest.raises(ValueError, match="moe_router_score_function"):
-        build_megatron_args(
-            _cfg(
-                moe_router_load_balancing_type="rosenthal",
-                moe_router_score_function="sigmoid",
-            )
+def test_rosenthal_allows_sigmoid_score_function():
+    args = build_megatron_args(
+        _cfg(
+            moe_router_load_balancing_type="rosenthal",
+            moe_router_score_function="sigmoid",
         )
+    )
+    assert _pairs(args)["--moe-router-score-function"] == "sigmoid"
 
 
 def test_global_rosenthal_soft_no_longer_rejected():

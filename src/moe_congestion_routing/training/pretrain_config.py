@@ -12,7 +12,6 @@ from ..losses.cost_families import (
     DEFAULT_LAMBDA,
     ROSENTHAL_TYPES,
     VARIANTS,
-    cost_exponent,
     pressure_bound,
 )
 from ..paths import expand_path
@@ -140,14 +139,18 @@ class MoEPretrainConfig:
 
     moe_rosenthal_cost: str = "linear"
     """Congestion cost family, live only under a rosenthal balancing type: ``linear`` (default,
-    ``c(x) = lambda*x``) or ``quadratic`` (``c(x) = lambda*x**2``)."""
+    ``c(x) = lambda*x``), ``quadratic`` (``c(x) = lambda*x**2``), or ``softplus_barrier``
+    (``c(x) = lambda*softplus((x-1)/tau)``, implemented for ``moe_rosenthal_variant == 'hard'``
+    only so far). ``tau`` is fixed at the registry's calibrated value in
+    ``losses/cost_families.py`` and is not a config field this round, so a yaml key naming it
+    (e.g. ``moe_rosenthal_tau``) raises ``TypeError`` as unrecognized."""
 
     moe_rosenthal_lambda: float | None = None
     """Congestion cost coefficient (lambda), live only under a rosenthal balancing type. ``None``
     (the default) resolves to the cost family's own slope-matched default from
-    ``DEFAULT_LAMBDA`` in ``losses/cost_families.py`` (1.0 for linear, 0.5 for quadratic) when the
-    flag is emitted, so paired arms stay slope-matched without the config author restating it. An
-    explicit value overrides that and must be > 0."""
+    ``DEFAULT_LAMBDA`` in ``losses/cost_families.py`` (1.0 for linear, 0.5 for quadratic, 0.2 for
+    softplus_barrier) when the flag is emitted, so paired arms stay slope-matched without the
+    config author restating it. An explicit value overrides that and must be > 0."""
 
     moe_rosenthal_log_grad_ratio: bool = False
     """Log the logit-space gradient norm the congestion loss injects, relative to the task
@@ -735,6 +738,13 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
             raise ValueError(
                 f"moe_rosenthal_cost must be one of {COST_FAMILIES}, got {cfg.moe_rosenthal_cost!r}"
             )
+        if cfg.moe_rosenthal_cost == "softplus_barrier" and cfg.moe_rosenthal_variant == "soft":
+            raise ValueError(
+                "moe_rosenthal_cost='softplus_barrier' is implemented for "
+                "moe_rosenthal_variant='hard' only. 'soft' additionally needs the barrier's "
+                "antiderivative, a dilogarithm that torch has no primitive for, for its logged "
+                "value alone, so lifting this needs quadrature rather than new theory"
+            )
         # None means "use this cost family's own slope-matched default". Resolving it here means
         # the sanity bound below and the emitted flag both see one concrete value.
         _lambda = (
@@ -744,28 +754,7 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         )
         if _lambda <= 0:
             raise ValueError(f"moe_rosenthal_lambda must be > 0, got {_lambda}")
-        if cfg.moe_router_score_function != "softmax":
-            raise ValueError(
-                "a rosenthal balancing type requires moe_router_score_function == 'softmax' "
-                "(sigmoid needs mean-centering to define the congestion loss, which is out of "
-                f"scope), got {cfg.moe_router_score_function!r}"
-            )
-        # Rules 5 and 6 rejected soft with global_rosenthal, and required
-        # tensor_model_parallel_size == 1 for soft with rosenthal. Both are retired: the
-        # synced-coefficient construction replaced the potential-form soft loss, which had needed a
-        # size-1 reduce group, and is correct at any reduce-group size. The numbers stay retired
-        # rather than being reused, because they are pinned into test names here and in
-        # megatron_rosenthal_test.py. The survivors are rules 1-4, 7 and 8.
-        #
-        # Rule 8 is a sanity bound on the pressure at full imbalance rather than a correctness
-        # condition, so it warns instead of blocking what may be a deliberate high-lambda
-        # experiment. The bound expression lives in losses/cost_families.py, imported both here and
-        # by the Megatron patch's copy of this check, so it is written out once. pressure_bound
-        # returns the expression string alongside the value so this caller does not decide which
-        # branch produced it a second time. Getting that second branch wrong would print a
-        # plausible but wrong expression beside a correct number, in a warning string no test
-        # asserts on.
-        _p = cost_exponent(cfg.moe_rosenthal_cost)
+
         _bound = pressure_bound(
             cfg.moe_aux_loss_coeff,
             _lambda,
@@ -776,10 +765,10 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         )
         if _bound.value > 1:
             warnings.warn(
-                f"moe_rosenthal_lambda * moe_aux_loss_coeff * {_bound.expr}**{_p} = "
-                f"{_bound.value:.4g} > 1 -- the congestion pressure at full imbalance exceeds the "
-                "sanity bound; not an error, but check moe_rosenthal_lambda and moe_aux_loss_coeff "
-                "are what you intend.",
+                f"moe_rosenthal_lambda * moe_aux_loss_coeff * {_bound.expr} = "
+                f"{_bound.value:.4g} exceeds the sanity bound of 1 at full imbalance. Not an "
+                "error, but check moe_rosenthal_lambda and moe_aux_loss_coeff are what you "
+                "intend.",
                 stacklevel=2,
             )
         args += [

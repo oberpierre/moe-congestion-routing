@@ -1,7 +1,19 @@
-"""Registry of congestion cost family names, exponents and lambda defaults.
+"""Registry of congestion cost family names, exponents, lambda defaults and shape parameters.
+
+``COST_FAMILIES`` is what the trainable Rosenthal loss supports and what a config may name:
+``linear`` and ``quadratic`` at either variant, plus ``softplus_barrier`` at ``hard`` only, since
+its antiderivative has no closed form and ``soft`` needs one. A family with no exponent (the
+barrier) is represented as a record rather than forced into ``COST_EXPONENTS``, which is why
+``marginal_cost``, ``first_arc_above_price`` and ``discrete_potential`` route through
+``_oracle_family`` instead of ``cost_exponent`` for every family, power or barrier alike.
+``ORACLE_COST_FAMILIES`` names the same set today, but it stays a separate registry because it
+answers a different question (priceable by the offline LP/incremental-arc oracle, vs. trainable
+by the router) and may diverge again if a future family is ever oracle-only.
 
 Deliberately ``torch``-free: ``training/pretrain_config.py`` imports the names
-from here to validate a config, and ``--dry-run`` should not require ``torch``.
+from here to validate a config, and ``--dry-run`` should not require ``torch``. The one function
+that needs a torch price for the barrier (``cost()`` in ``losses/rosenthal.py``) reads its shape
+parameter, ``tau``, from ``barrier_tau()`` below rather than restating it.
 """
 
 import math
@@ -9,21 +21,26 @@ from typing import NamedTuple
 
 import numpy as np
 
-COST_FAMILIES: tuple[str, ...] = ("linear", "quadratic")
+COST_FAMILIES: tuple[str, ...] = ("linear", "quadratic", "softplus_barrier")
 VARIANTS: tuple[str, ...] = ("hard", "soft")
 COST_EXPONENTS: dict[str, int] = {"linear": 1, "quadratic": 2}
-DEFAULT_LAMBDA: dict[str, float] = {"linear": 1.0, "quadratic": 0.5}
+DEFAULT_LAMBDA: dict[str, float] = {"linear": 1.0, "quadratic": 0.5, "softplus_barrier": 0.2}
 
 # The two Megatron ``moe_router_load_balancing_type`` values that select the congestion loss
 # (micro-batch vs global-batch reduction).
 ROSENTHAL_TYPES: tuple[str, ...] = ("rosenthal", "global_rosenthal")
 
-# Keeps the three declarations in sync. A family added to one and forgotten in another becomes an
-# import-time failure here rather than a KeyError at some later call site.
-if not (set(DEFAULT_LAMBDA) == set(COST_EXPONENTS) == set(COST_FAMILIES)):
+# The barrier has no exponent, so only DEFAULT_LAMBDA has to cover every family. A power family
+# left out of COST_EXPONENTS is not caught here, and fails at its first cost() call instead.
+if not (set(COST_EXPONENTS) <= set(COST_FAMILIES)):
     raise ValueError(
-        "COST_FAMILIES, COST_EXPONENTS and DEFAULT_LAMBDA disagree on cost families: "
-        f"{sorted(COST_FAMILIES)} != {sorted(COST_EXPONENTS)} != {sorted(DEFAULT_LAMBDA)}"
+        "COST_EXPONENTS names a family COST_FAMILIES does not: "
+        f"{sorted(set(COST_EXPONENTS) - set(COST_FAMILIES))}"
+    )
+if set(DEFAULT_LAMBDA) != set(COST_FAMILIES):
+    raise ValueError(
+        "COST_FAMILIES and DEFAULT_LAMBDA disagree on cost families: "
+        f"{sorted(COST_FAMILIES)} != {sorted(DEFAULT_LAMBDA)}"
     )
 
 
@@ -39,11 +56,8 @@ class _BarrierCost(NamedTuple):
     tau: float
 
 
-# The oracle's family set is a superset of COST_FAMILIES: the router can only train what
-# COST_FAMILIES names, but the offline LP/incremental-arc oracles can price a soft capacity
-# barrier too, which is why this dict is keyed separately rather than folded into COST_EXPONENTS.
-# Built from COST_EXPONENTS rather than COST_FAMILIES directly, so the two stay in lockstep
-# through the same invariant check above.
+# Numbers, not callables, so this file needs no torch and a config can be checked without it.
+# The two price functions (numpy here, torch in rosenthal.py) read the shape from this one place.
 _ORACLE_RECORDS: dict[str, _PowerCost | _BarrierCost] = {
     family: _PowerCost(exponent) for family, exponent in COST_EXPONENTS.items()
 }
@@ -55,9 +69,24 @@ def _oracle_family(cost_family: str) -> _PowerCost | _BarrierCost:
     """The record backing ``cost_family`` for the oracle-side price functions, or raise."""
     if cost_family not in _ORACLE_RECORDS:
         raise ValueError(
-            f"unknown cost family {cost_family!r}; expected one of {ORACLE_COST_FAMILIES}"
+            f"unknown cost family {cost_family!r}, expected one of {ORACLE_COST_FAMILIES}"
         )
     return _ORACLE_RECORDS[cost_family]
+
+
+def barrier_tau(cost_family: str) -> float:
+    """``tau`` for a barrier family, read from the one registry rather than restated at each
+    caller. Raises for a power family, mirroring ``_resolve_tau``'s guard, since a power family
+    has no ``tau`` to read. The only caller outside this module is ``losses/rosenthal.py``'s
+    ``cost()``, which needs ``tau`` but must stay the only place that knows about ``torch``.
+    """
+    record = _oracle_family(cost_family)
+    if isinstance(record, _PowerCost):
+        raise ValueError(
+            f"tau is not a parameter of cost_family {cost_family!r} because only "
+            "'softplus_barrier' has a tau"
+        )
+    return record.tau
 
 
 def _resolve_tau(record: _PowerCost | _BarrierCost, cost_family: str, tau: float | None) -> float:
@@ -109,7 +138,11 @@ def cost_exponent(cost_family: str) -> int:
     raises for any other name COST_EXPONENTS does not carry, rather than inventing one.
     """
     if cost_family not in COST_EXPONENTS:
-        raise ValueError(f"unknown cost family {cost_family!r}; expected one of {COST_FAMILIES}")
+        raise ValueError(
+            f"{cost_family!r} has no power-law exponent, expected one of "
+            f"{tuple(COST_EXPONENTS)}. COST_EXPONENTS is a strict subset of COST_FAMILIES, so a "
+            "trainable family may be absent from it without being unknown."
+        )
     return COST_EXPONENTS[cost_family]
 
 
@@ -211,7 +244,7 @@ def discrete_potential(
 def check_variant(variant: str) -> None:
     """Raise unless ``variant`` is a known loss variant."""
     if variant not in VARIANTS:
-        raise ValueError(f"unknown variant {variant!r}; expected one of {VARIANTS}")
+        raise ValueError(f"unknown variant {variant!r}, expected one of {VARIANTS}")
 
 
 class PressureBound(NamedTuple):
@@ -251,13 +284,26 @@ def pressure_bound(
     field's name, ``num_experts`` for ``MoEPretrainConfig`` and ``num_moe_experts`` for Megatron's
     ``TransformerConfig``, while the branch deciding which expression applies stays here rather
     than being repeated at every call site.
+
+    ``expr`` is the COMPLETE price expression, exponent or softplus-form included, rather than a
+    base a caller then exponentiates itself: a caller re-deriving which price applies by testing
+    ``cost_family`` a second time could print an expression that does not match ``value``.
     """
     check_variant(variant)
     if variant == "hard":
         base = num_experts / topk
-        expr = f"({num_experts_name}/{topk_name})"
+        base_expr = f"({num_experts_name}/{topk_name})"
     else:
         base = num_experts
-        expr = num_experts_name
-    value = coeff * lam * base ** cost_exponent(cost_family)
+        base_expr = num_experts_name
+    record = _oracle_family(cost_family)
+    if isinstance(record, _PowerCost):
+        value = coeff * lam * base**record.exponent
+        expr = f"{base_expr}**{record.exponent}"
+    else:
+        # _resolve_tau, not record.tau, because it is the only place tau is checked positive.
+        # A negative tau prints a bound from a backwards barrier, and no test reads warning text.
+        tau = _resolve_tau(record, cost_family, None)
+        value = coeff * lam * float(_softplus(np.asarray((base - 1.0) / tau)))
+        expr = f"softplus(({base_expr} - 1)/{tau})"
     return PressureBound(value, expr)
