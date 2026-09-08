@@ -1,0 +1,42 @@
+# Pass the collapsed checkpoint on the command line:
+# sbatch scripts/train_moe_climblab.sbatch configs/train/collapse/race/<arm>.yaml
+#   artifacts/collapse/induce_sigmoid/<run_dir>/checkpoints artifacts/collapse/race/<arm>
+# The third param (run_dir) is required, otherwise the launcher writes back into the run it loaded.
+extends: base.yaml
+
+# Load the weights, restart the counter at zero, take no optimizer, scheduler or RNG state. Every
+# arm therefore begins from identical weights on an identical fresh schedule, with no stale Adam
+# moments for the dead experts that could manufacture an apparent recovery on their own.
+finetune: true
+exit_on_missing_checkpoint: true
+
+# ZERO, not base_cluster's 1.0e-3, and this is the single most important line in the file. The
+# collapse was induced by a negative z-loss, so restoring a positive one makes part of every arm's
+# recovery a matter of undoing the induction rather than balancing.
+moe_z_loss_coeff: 0.0
+
+# Different from the induction because `finetune` does not restore `consumed_train_samples`,
+# so each arm restarts its data iterator at sample 0. So this would replay the tokens the
+# induction just saw. Shared by every arm so that all arms get the same data stream.
+seed: 2687
+
+# 4000 steps at base.yaml's batch is 1.05B tokens, the same horizon for every arm. The length is
+# set by the criterion rather than by when recovery starts: balance has to hold for 1000 steps to
+# count, and the control arm needs enough runway that "it did not recover" is credible. 1% warmup,
+# and a 5% anneal kept short because a decaying learning rate freezes whatever state an arm is in.
+train_iters: 4000
+lr_warmup_iters: 40
+lr_wsd_decay_iters: 200
+
+# Dense early, because recovery happens early: the local pilot's arms reached their thresholds
+# between steps 40 and 140, so 25-step spacing over the first 500 is where the ranking is decided.
+# The second window brackets the anneal.
+moe_probe_dense_windows: ["0:500", "3600:4000"]
+
+# Sigmoid, for every arm. ALF-LB needs it (expert bias is only valid under sigmoid or
+# sqrtsoftplus), and running the other arms on a different score function would compare a method
+# against a checkpoint rather than against another method. The bias buffer is present but frozen,
+# matching the induction checkpoint, so only the ALF-LB arm raises its update rate.
+moe_router_score_function: sigmoid
+moe_router_enable_expert_bias: true
+moe_router_bias_update_rate: 0.0
