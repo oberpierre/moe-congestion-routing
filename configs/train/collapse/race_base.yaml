@@ -1,7 +1,9 @@
 # Pass the collapsed checkpoint on the command line:
-# sbatch scripts/train_moe_climblab.sbatch configs/train/collapse/race/<arm>.yaml
-#   artifacts/collapse/induce_sigmoid/<run_dir>/checkpoints artifacts/collapse/race/<arm>
-# The third param (run_dir) is required, otherwise the launcher writes back into the run it loaded.
+# sbatch scripts/train_moe_climblab.sbatch configs/train/collapse/race/<arm>.yaml \
+#   artifacts/collapse/induce_sigmoid/<run_dir>/checkpoints <name>
+# The third param is required, otherwise the launcher writes back into the run it loaded. It is a
+# NAME joined under this arm's output_dir, not a path, and it becomes the W&B run id verbatim, so
+# it has to be unique across the whole W&B project.
 extends: base.yaml
 
 # Load the weights, restart the counter at zero, take no optimizer, scheduler or RNG state. Every
@@ -10,10 +12,11 @@ extends: base.yaml
 finetune: true
 exit_on_missing_checkpoint: true
 
-# ZERO, not base_cluster's 1.0e-3, and this is the single most important line in the file. The
-# collapse was induced by a negative z-loss, so restoring a positive one makes part of every arm's
-# recovery a matter of undoing the induction rather than balancing.
-moe_z_loss_coeff: 0.0
+# base_cluster's value, and this is the single most important line in the file. The induction
+# saturates the gate until the router's gradient vanishes, and the z-loss is the only term that
+# penalises logit magnitude and so brings that gradient back, which every balancing loss needs to
+# act through. The control arm bounds what it recovers alone, which locally was nothing.
+moe_z_loss_coeff: 1.0e-3
 
 # Different from the induction because `finetune` does not restore `consumed_train_samples`,
 # so each arm restarts its data iterator at sample 0. So this would replay the tokens the
