@@ -140,10 +140,9 @@ class MoEPretrainConfig:
     moe_rosenthal_cost: str = "linear"
     """Congestion cost family, live only under a rosenthal balancing type: ``linear`` (default,
     ``c(x) = lambda*x``), ``quadratic`` (``c(x) = lambda*x**2``), or ``softplus_barrier``
-    (``c(x) = lambda*softplus((x-1)/tau)``, implemented for ``moe_rosenthal_variant == 'hard'``
-    only so far). ``tau`` is fixed at the registry's calibrated value in
-    ``losses/cost_families.py`` and is not a config field this round, so a yaml key naming it
-    (e.g. ``moe_rosenthal_tau``) raises ``TypeError`` as unrecognized."""
+    (``c(x) = lambda*softplus((x-1)/tau)``, both variants). ``tau`` is fixed at the registry's
+    calibrated value in ``losses/cost_families.py`` and is not a config field this round, so a
+    yaml key naming it (e.g. ``moe_rosenthal_tau``) raises ``TypeError`` as unrecognized."""
 
     moe_rosenthal_lambda: float | None = None
     """Congestion cost coefficient (lambda), live only under a rosenthal balancing type. ``None``
@@ -737,13 +736,6 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         if cfg.moe_rosenthal_cost not in COST_FAMILIES:
             raise ValueError(
                 f"moe_rosenthal_cost must be one of {COST_FAMILIES}, got {cfg.moe_rosenthal_cost!r}"
-            )
-        if cfg.moe_rosenthal_cost == "softplus_barrier" and cfg.moe_rosenthal_variant == "soft":
-            raise ValueError(
-                "moe_rosenthal_cost='softplus_barrier' is implemented for "
-                "moe_rosenthal_variant='hard' only. 'soft' additionally needs the barrier's "
-                "antiderivative, a dilogarithm that torch has no primitive for, for its logged "
-                "value alone, so lifting this needs quadrature rather than new theory"
             )
         # None means "use this cost family's own slope-matched default". Resolving it here means
         # the sanity bound below and the emitted flag both see one concrete value.

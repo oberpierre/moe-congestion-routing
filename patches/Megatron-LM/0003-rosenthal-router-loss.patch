@@ -126,8 +126,8 @@ index 95150103f..665cc1819 100644
 +    moe_rosenthal_cost: str = "linear"
 +    """Congestion cost family for the Rosenthal loss (moe_congestion_routing patch): "linear"
 +    (reduces to switch_load_balancing_loss_func exactly when moe_rosenthal_variant is "hard" and
-+    moe_rosenthal_lambda is 1.0), "quadratic", or "softplus_barrier" (moe_rosenthal_variant ==
-+    "hard" only so far). softplus_barrier's tau is fixed in
++    moe_rosenthal_lambda is 1.0), "quadratic", or "softplus_barrier" (both variants).
++    softplus_barrier's tau is fixed in
 +    moe_congestion_routing.losses.cost_families and is not a field here."""
 +
 +    moe_rosenthal_lambda: float = 1.0
@@ -157,7 +157,7 @@ index 95150103f..665cc1819 100644
              if self.moe_expert_capacity_factor < 0:
                  self.moe_expert_capacity_factor = None
              if isinstance(self.moe_router_load_balancing_type, list):
-@@ -1489,21 +1527,129 @@ class TransformerConfig(ModelParallelConfig):
+@@ -1489,21 +1527,119 @@ class TransformerConfig(ModelParallelConfig):
                          "aux_loss",
                          "seq_aux_loss",
                          "global_aux_loss",
@@ -229,16 +229,6 @@ index 95150103f..665cc1819 100644
 +                raise ValueError(
 +                    f"moe_rosenthal_cost must be one of {COST_FAMILIES}, got "
 +                    f"{self.moe_rosenthal_cost!r}"
-+                )
-+            if (
-+                self.moe_rosenthal_cost == "softplus_barrier"
-+                and self.moe_rosenthal_variant == "soft"
-+            ):
-+                raise ValueError(
-+                    "moe_rosenthal_cost='softplus_barrier' is implemented for "
-+                    "moe_rosenthal_variant='hard' only. 'soft' additionally needs the "
-+                    "barrier's antiderivative, a dilogarithm that torch has no primitive "
-+                    "for, for its logged value alone, so lifting this needs quadrature"
 +                )
 +            if self.moe_rosenthal_lambda <= 0:
 +                raise ValueError(

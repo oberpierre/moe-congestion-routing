@@ -1,9 +1,8 @@
 """Registry of congestion cost family names, exponents, lambda defaults and shape parameters.
 
 ``COST_FAMILIES`` is what the trainable Rosenthal loss supports and what a config may name:
-``linear`` and ``quadratic`` at either variant, plus ``softplus_barrier`` at ``hard`` only, since
-its antiderivative has no closed form and ``soft`` needs one. A family with no exponent (the
-barrier) is represented as a record rather than forced into ``COST_EXPONENTS``, which is why
+``linear``, ``quadratic`` and ``softplus_barrier``, each at either variant. A family with no
+exponent (the barrier) is a record rather than an entry in ``COST_EXPONENTS``, which is why
 ``marginal_cost``, ``first_arc_above_price`` and ``discrete_potential`` route through
 ``_oracle_family`` instead of ``cost_exponent`` for every family, power or barrier alike.
 ``ORACLE_COST_FAMILIES`` names the same set today, but it stays a separate registry because it

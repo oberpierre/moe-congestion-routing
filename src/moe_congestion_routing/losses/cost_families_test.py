@@ -442,7 +442,8 @@ def test_config_naming_softplus_barrier_hard_is_accepted():
     build_megatron_args(cfg)  # must not raise
 
 
-def test_config_naming_softplus_barrier_soft_is_rejected_naming_the_dilogarithm():
+def test_config_naming_softplus_barrier_soft_is_accepted():
+    # Both variants, so a config cannot reach a cost family that only half works.
     cfg = MoEPretrainConfig(
         train_data_path="/data/train",
         lr_wsd_decay_iters=10,
@@ -450,8 +451,7 @@ def test_config_naming_softplus_barrier_soft_is_rejected_naming_the_dilogarithm(
         moe_rosenthal_cost="softplus_barrier",
         moe_rosenthal_variant="soft",
     )
-    with pytest.raises(ValueError, match="dilogarithm"):
-        build_megatron_args(cfg)
+    build_megatron_args(cfg)  # must not raise
 
 
 @pytest.mark.parametrize("bad_tau", [0.0, -0.1])

@@ -1,9 +1,10 @@
+import math
 import pathlib
 
 import pytest
 import torch
 
-from moe_congestion_routing.losses.cost_families import pressure_bound
+from moe_congestion_routing.losses.cost_families import barrier_tau, pressure_bound
 from moe_congestion_routing.losses.rosenthal import (
     _assert_conserves_global_mass,
     balanced_load,
@@ -572,26 +573,52 @@ def test_unknown_cost_family_raises_with_offending_value():
         congestion_potential(tokens_per_expert, 10.0, 2, 3, cost_family="bogus")
 
 
-def test_cost_antiderivative_raises_for_the_barrier_naming_the_dilogarithm():
-    with pytest.raises(ValueError, match="dilogarithm"):
-        cost_antiderivative(torch.tensor([1.0, 2.0]), "softplus_barrier", lam=1.0)
+def test_cost_antiderivative_barrier_matches_scipy_spence_across_the_inversion_branch():
+    # Pins the closed-form dilogarithm integral against scipy.special.spence, which computes the
+    # same function under spence(y) == Li2(1-y). The grid crosses the z > 0 fold the code
+    # branches on, and separately z = 88.7 where a naive exp would overflow float32, because a
+    # grid on one side of the fold would miss the failure it exists to catch.
+    #
+    # Compared relatively per point rather than with allclose, because C(x) falls to 9e-7 as
+    # z goes very negative, where an absolute tolerance would pass an implementation that
+    # returned zero. Worst measured relative error here is 3.5e-7, so 1e-5 keeps margin without
+    # asserting past float32.
+    from scipy.special import spence
+
+    lam, tau = 0.2, 0.1
+    zs = [-500.0, -50.0, -1.0, -0.001, 0.0, 0.001, 1.0, 50.0, 88.7, 200.0, 500.0, 629.9]
+    xs = torch.tensor([1.0 + z * tau for z in zs])
+
+    def li2(w: float) -> float:
+        return spence(1.0 - w)
+
+    const = li2(-math.exp(-1.0 / tau))
+    reference = torch.tensor(
+        [lam * tau * (const - li2(-math.exp(z))) for z in zs], dtype=torch.float32
+    )
+    mine = cost_antiderivative(xs, "softplus_barrier", lam=lam)
+    assert torch.isfinite(mine).all()
+    rel = ((mine - reference).abs() / reference.abs()).max().item()
+    assert rel < 1e-5, f"worst relative error {rel:.3g} over z={zs}"
 
 
-def test_rosenthal_loss_soft_variant_raises_for_the_barrier():
+def test_rosenthal_loss_soft_variant_is_finite_for_the_barrier():
+    # The barrier's antiderivative is now an exact dilogarithm, so 'soft' must return a finite
+    # value instead of raising.
     prob_sum = torch.ones(3)
     tokens_per_expert = torch.ones(3)
-    with pytest.raises(ValueError, match="dilogarithm"):
-        rosenthal_loss(
-            prob_sum,
-            tokens_per_expert,
-            10.0,
-            2,
-            3,
-            coeff=1.0,
-            lam=1.0,
-            variant="soft",
-            cost_family="softplus_barrier",
-        )
+    loss = rosenthal_loss(
+        prob_sum,
+        tokens_per_expert,
+        10.0,
+        2,
+        3,
+        coeff=1.0,
+        lam=1.0,
+        variant="soft",
+        cost_family="softplus_barrier",
+    )
+    assert torch.isfinite(loss)
 
 
 def test_potential_closed_forms_key_mismatch_raises_at_import():
@@ -680,3 +707,24 @@ def test_conserves_global_mass_rejects_unnormalized_prob_sum():
     u_glob, _ = relative_loads(prob_sum, torch.zeros(num_experts), total_num_tokens, 2, num_experts)
     with pytest.raises(AssertionError, match="conservation invariant"):
         _assert_conserves_global_mass(u_glob, num_experts)
+
+
+def test_power_families_are_unchanged_by_the_barrier_branch():
+    # The barrier added a branch to cost() and cost_antiderivative(). These pin the power
+    # families to their own closed forms, so a future edit to that branch cannot quietly move
+    # the arms the fleet has already trained.
+    x = torch.tensor([0.0, 0.25, 1.0, 3.0, 64.0])
+    for lam in (0.5, 1.0, 2.0):
+        assert torch.equal(cost(x, "linear", lam), lam * x)
+        assert torch.equal(cost(x, "quadratic", lam), lam * x**2)
+        assert torch.equal(cost_antiderivative(x, "linear", lam), lam * x**2 / 2)
+        assert torch.equal(cost_antiderivative(x, "quadratic", lam), lam * x**3 / 3)
+
+
+def test_barrier_cost_is_unchanged_by_the_antiderivative_branch():
+    # cost() is what the hard variant trains against, and hard is the arm already running on the
+    # cluster, so it is pinned to softplus directly rather than to the code under test.
+    x = torch.tensor([0.0, 0.5, 1.0, 1.555, 9.9, 64.0])
+    tau, lam = barrier_tau("softplus_barrier"), 0.2
+    want = lam * torch.nn.functional.softplus((x - 1.0) / tau)
+    assert torch.equal(cost(x, "softplus_barrier", lam), want)

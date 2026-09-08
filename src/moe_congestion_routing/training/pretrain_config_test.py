@@ -763,6 +763,21 @@ def test_global_rosenthal_soft_no_longer_rejected():
     assert _pairs(args)["--moe-rosenthal-variant"] == "soft"
 
 
+def test_softplus_barrier_soft_no_longer_rejected():
+    # softplus_barrier's antiderivative is now an exact dilogarithm, so 'soft' must parse and
+    # emit the same flags as every other cost family, with no validation error.
+    args = build_megatron_args(
+        _cfg(
+            moe_router_load_balancing_type="rosenthal",
+            moe_rosenthal_cost="softplus_barrier",
+            moe_rosenthal_variant="soft",
+        )
+    )
+    pairs = _pairs(args)
+    assert pairs["--moe-rosenthal-cost"] == "softplus_barrier"
+    assert pairs["--moe-rosenthal-variant"] == "soft"
+
+
 def test_rosenthal_soft_no_longer_requires_tensor_model_parallel_size_one():
     args = build_megatron_args(
         _cfg(

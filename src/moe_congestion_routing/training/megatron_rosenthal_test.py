@@ -166,6 +166,13 @@ def test_global_rosenthal_soft_no_longer_rejected():
     )
 
 
+def test_softplus_barrier_soft_no_longer_rejected():
+    # softplus_barrier's antiderivative is now an exact dilogarithm, so the patched
+    # TransformerConfig must construct without raising at the soft variant, mirroring the
+    # global_rosenthal retirement above.
+    _quiet_transformer_config(moe_rosenthal_cost="softplus_barrier", moe_rosenthal_variant="soft")
+
+
 def test_rosenthal_soft_no_longer_requires_tensor_model_parallel_size_one():
     _quiet_transformer_config(
         moe_rosenthal_variant="soft",

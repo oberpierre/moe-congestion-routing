@@ -36,9 +36,9 @@ Two power-law cost families, `c(x)` the marginal cost of relative load `x` and
     quadratic:  p=2  c(x) = lam*x**2  C(x) = lam*x**3/3  default lam = 0.5
                                        (slope-matched to linear at x=1: lam_p = lam_1/p)
 
-A third family, `softplus_barrier` (`c(x) = lam*softplus((x-1)/tau)`), trains only at the `hard`
-variant below, because its `C(x)` is a dilogarithm with no closed form and `cost_antiderivative`
-(the one extra thing `soft` needs beyond `cost`) raises for it. See `losses/cost_families.py` for
+A third family, `softplus_barrier` (`c(x) = lam*softplus((x-1)/tau)`), trains at both variants.
+Its `C(x)` has no elementary form but is an exact dilogarithm (see `cost_antiderivative` and
+`_dilog_neg_exp` below), needed only by `soft`'s logged value. See `losses/cost_families.py` for
 its registry entry and `tau`.
 
 Both loss variants share the prefactor ``alpha/E`` (``alpha = moe_aux_loss_coeff``), which equals
@@ -75,6 +75,7 @@ That is the same ``lam/(2L)`` the discretization-gap identity pins at ``u == u_h
 case is its special instance.
 """
 
+import math
 from collections.abc import Callable
 
 import torch
@@ -122,14 +123,42 @@ def cost(x: torch.Tensor, cost_family: str, lam: float = 1.0) -> torch.Tensor:
     return lam * x.float() ** p
 
 
+# 24 terms because the series argument never exceeds 0.5, so the tail is under 0.5**24/576,
+# about 1e-10, which is far below what float32 carries.
+_DILOG_SERIES_TERMS = 24
+
+
+def _dilog_neg_exp(z: torch.Tensor) -> torch.Tensor:
+    """``Li2(-e^z)`` for any real ``z``, staying finite where ``exp(z)`` alone would overflow.
+
+    Two folds, each needed. ``Li2(-e^z) = -pi^2/6 - z^2/2 - Li2(-e^-z)`` moves ``z > 0`` onto a
+    negative exponent, which is what avoids the overflow. The Landen transform
+    ``Li2(w) = -0.5*log(1-w)**2 - Li2(w/(w-1))`` then shrinks the series argument to at most 0.5,
+    without which the series at ``w = -1`` would need thousands of terms.
+    """
+    z = z.float()
+    w = -torch.exp(-z.abs())  # always in [-1, 0], never overflows since the exponent is <= 0
+    v = w / (w - 1.0)  # in [0, 0.5]
+    series = torch.zeros_like(v)
+    v_pow = torch.ones_like(v)
+    for k in range(1, _DILOG_SERIES_TERMS + 1):
+        v_pow = v_pow * v
+        series = series + v_pow / (k * k)
+    li2_w = -0.5 * torch.log1p(-w) ** 2 - series
+    return torch.where(z > 0, -(math.pi**2) / 6 - z**2 / 2 - li2_w, li2_w)
+
+
 def cost_antiderivative(x: torch.Tensor, cost_family: str, lam: float = 1.0) -> torch.Tensor:
-    """``C(x) = integral_0^x c``, i.e. ``lam * x**(p+1) / (p+1)`` for a power family."""
+    """``C(x) = integral_0^x c``: ``lam * x**(p+1) / (p+1)`` for a power family, or the exact
+    dilogarithm form for ``softplus_barrier``. Only the ``soft`` variant calls this, for its
+    logged value, because ``hard``'s loss never needs an antiderivative.
+    """
     if cost_family == "softplus_barrier":
-        raise ValueError(
-            "cost_antiderivative is not implemented for 'softplus_barrier': its integral is a "
-            "dilogarithm, which torch has no primitive for and which would need quadrature. Only "
-            "the 'soft' variant calls this, and only for its logged value, so 'hard' is unaffected"
-        )
+        tau = barrier_tau(cost_family)
+        x = x.float()
+        z = (x - 1.0) / tau
+        const = _dilog_neg_exp(torch.tensor(-1.0 / tau, dtype=x.dtype, device=x.device))
+        return lam * tau * (const - _dilog_neg_exp(z))
     p = cost_exponent(cost_family)
     return lam * x.float() ** (p + 1) / (p + 1)
 
@@ -286,7 +315,10 @@ def _potential_closed_form_quadratic(
 def _potential_closed_form_barrier(
     n: torch.Tensor, balanced_load: torch.Tensor, lam: float
 ) -> torch.Tensor:
-    """``sum_{j=1..n_e} c(j/L)`` for the barrier, which has no closed form, by prefix sum.
+    """``sum_{j=1..n_e} c(j/L)`` for the barrier, by prefix sum.
+
+    This is the DISCRETE sum over token ranks, not the integral ``cost_antiderivative`` computes.
+    No closed form is known for it, whereas the integral has one.
 
     One arange sized at the largest realized count answers every expert at once, because expert
     ``e``'s partial sum is entry ``n_e`` of it. A per-expert loop instead costs a device sync and
@@ -304,7 +336,7 @@ def _potential_closed_form_barrier(
     return prefix[counts.clamp(min=0, max=max_n)].sum()
 
 
-# A closed form avoids summing over per-expert token rank. The barrier has none, so it sums.
+# A closed form for the discrete rank sum avoids the loop. Only the power families have one.
 _POTENTIAL_CLOSED_FORMS: dict[str, Callable[[torch.Tensor, torch.Tensor, float], torch.Tensor]] = {
     "linear": _potential_closed_form_linear,
     "quadratic": _potential_closed_form_quadratic,
