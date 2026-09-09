@@ -35,6 +35,12 @@ _MOE_ROUTER_LOAD_BALANCING_TYPES = (
 # congestion cost instead.
 _BIAS_UPDATE_RULES = ("sign", "rosenthal_price")
 
+# Every value Megatron's compute_routing_scores_for_aux_loss accepts, same set as
+# --moe-router-score-function. Checked here rather than left to Megatron's own argparse choices
+# because --dry-run never reaches argparse, so an unchecked typo would build cleanly and only fail
+# at the front of a cluster queue.
+_MOE_ROUTER_SCORE_FUNCTIONS = ("softmax", "sigmoid", "sqrtsoftplus")
+
 
 @dataclass(frozen=True)
 class MoEPretrainConfig:
@@ -164,6 +170,12 @@ class MoEPretrainConfig:
     moe_router_score_function: str = "softmax"
     """Router scoring: ``softmax`` or ``sigmoid`` (Deepseek-V3 style). Megatron REQUIRES sigmoid
     whenever expert bias is on, so ALF-LB must use ``sigmoid`` (or sqrtsoftplus)."""
+
+    moe_router_aux_score_function: str | None = None
+    """Score function the balancing loss is computed on, independent of what selection uses.
+    ``None`` (the default) means "use ``moe_router_score_function``", reproducing prior behaviour
+    exactly. A saturated sigmoid gate can drive the loss to its uniform-score floor without moving
+    a token, so setting this to ``softmax`` closes that route while selection stays as-is."""
 
     moe_router_enable_expert_bias: bool = False
     """ALF-LB / aux-loss-free load balancing: maintain a per-expert selection bias updated
@@ -528,6 +540,14 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
             f"moe_router_load_balancing_type must be one of {_MOE_ROUTER_LOAD_BALANCING_TYPES}, "
             f"got {cfg.moe_router_load_balancing_type!r}"
         )
+    if (
+        cfg.moe_router_aux_score_function is not None
+        and cfg.moe_router_aux_score_function not in _MOE_ROUTER_SCORE_FUNCTIONS
+    ):
+        raise ValueError(
+            f"moe_router_aux_score_function must be one of {_MOE_ROUTER_SCORE_FUNCTIONS} or None, "
+            f"got {cfg.moe_router_aux_score_function!r}"
+        )
     args = [
         # model
         "--num-layers",
@@ -635,6 +655,8 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         args += ["--moe-router-pre-softmax"]
     if cfg.moe_router_dtype is not None:
         args += ["--moe-router-dtype", cfg.moe_router_dtype]
+    if cfg.moe_router_aux_score_function is not None:
+        args += ["--moe-router-aux-score-function", cfg.moe_router_aux_score_function]
     if cfg.moe_grouped_gemm:
         args += ["--moe-grouped-gemm"]
     if cfg.use_distributed_optimizer:

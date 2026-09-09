@@ -134,6 +134,86 @@ def test_rosenthal_hard_linear_equals_switch_grad_wrt_scores(topk):
 
 
 # ---------------------------------------------------------------------------------------------
+# The equivalence above uses an arbitrary probability tensor, so it holds regardless of which
+# score function produced it. Patch 0008 lets the aux-loss carrier differ from selection, and the
+# risk it introduces is plumbing, not math: every aux-loss consumer (switch, rosenthal) reads the
+# same `scores_for_aux_loss` tensor from one `compute_routing_scores_for_aux_loss` call, so a
+# change that routed the carrier override to one loss and not the other would desync them. These
+# two tests run that real function under both score functions to pin against that.
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("carrier", ["sigmoid", "softmax"])
+def test_rosenthal_hard_linear_equals_switch_under_both_carriers(carrier):
+    torch.manual_seed(0)
+    num_tokens, num_experts, topk, coeff = 37, 8, 2, 0.02
+    logits = torch.randn(num_tokens, num_experts)
+    _, scores = _moe_utils.compute_routing_scores_for_aux_loss(logits, topk, carrier)
+    counts = torch.randint(0, 10, (num_experts,)).float()
+
+    switch = switch_load_balancing_loss_func(
+        probs=scores,
+        tokens_per_expert=counts,
+        total_num_tokens=num_tokens,
+        topk=topk,
+        num_experts=num_experts,
+        moe_aux_loss_coeff=coeff,
+        fused=False,
+    )
+    rosenthal = rosenthal_loss(
+        prob_sum=scores.sum(dim=0),
+        tokens_per_expert=counts,
+        total_num_tokens=num_tokens,
+        topk=topk,
+        num_experts=num_experts,
+        coeff=coeff,
+        lam=1.0,
+        variant="hard",
+        cost_family="linear",
+    )
+    assert torch.allclose(switch, rosenthal, atol=1e-5)
+
+
+@pytest.mark.parametrize("carrier", ["sigmoid", "softmax"])
+def test_rosenthal_hard_linear_equals_switch_grad_under_both_carriers(carrier):
+    torch.manual_seed(0)
+    num_tokens, num_experts, topk, coeff = 37, 8, 2, 0.02
+    counts = torch.randint(0, 10, (num_experts,)).float()
+
+    logits_switch = torch.randn(num_tokens, num_experts, requires_grad=True)
+    _, scores_switch = _moe_utils.compute_routing_scores_for_aux_loss(logits_switch, topk, carrier)
+    switch = switch_load_balancing_loss_func(
+        probs=scores_switch,
+        tokens_per_expert=counts,
+        total_num_tokens=num_tokens,
+        topk=topk,
+        num_experts=num_experts,
+        moe_aux_loss_coeff=coeff,
+        fused=False,
+    )
+    (switch_grad,) = torch.autograd.grad(switch, logits_switch)
+
+    logits_rosenthal = logits_switch.detach().clone().requires_grad_(True)
+    _, scores_rosenthal = _moe_utils.compute_routing_scores_for_aux_loss(
+        logits_rosenthal, topk, carrier
+    )
+    rosenthal = rosenthal_loss(
+        prob_sum=scores_rosenthal.sum(dim=0),
+        tokens_per_expert=counts,
+        total_num_tokens=num_tokens,
+        topk=topk,
+        num_experts=num_experts,
+        coeff=coeff,
+        lam=1.0,
+        variant="hard",
+        cost_family="linear",
+    )
+    (rosenthal_grad,) = torch.autograd.grad(rosenthal, logits_rosenthal)
+
+    assert torch.allclose(switch_grad, rosenthal_grad, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------------------------
 # TransformerConfig validation rules
 # ---------------------------------------------------------------------------------------------
 

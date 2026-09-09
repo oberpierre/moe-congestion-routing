@@ -1,0 +1,60 @@
+# Patch: Let the auxiliary balancing loss use a different score function than selection
+# ==================================
+# Problem: compute_routing_scores_for_aux_loss always scores on self.score_function, the same
+#   function top-k selection uses. Under sigmoid that score is unbounded, so every balancing loss
+#   defined on it (Switch, Rosenthal) has a route to its uniform-score floor that raises every
+#   winner's sigmoid toward 1 without moving a single token: once all scores are near 1 they read
+#   as balanced regardless of the underlying load. compute_routing_scores_for_aux_loss already
+#   accepts a score_function argument distinct from the one used at selection, so nothing else in
+#   the call chain needs to change to decouple the two.
+#
+# What this patch does:
+#   - router.py: at the single call to compute_routing_scores_for_aux_loss, pass
+#     config.moe_router_aux_score_function if it is set, otherwise fall back to self.score_function
+#     as before. Selection is untouched: it still reads self.score_function directly.
+#   - transformer_config.py: adds moe_router_aux_score_function, defaulting to None.
+#
+# Where in the code:
+#   File: megatron/core/transformer/moe/router.py
+#   Function: TopKRouter.routing(), the compute_routing_scores_for_aux_loss call inside the
+#     aux-loss branch.
+#   File: megatron/core/transformer/transformer_config.py
+#   Location: immediately after moe_router_score_function.
+#
+# How to fix on a future version:
+#   Find the compute_routing_scores_for_aux_loss call in router.py's routing() and confirm it
+#   still takes the score function as its third positional argument. Re-derive the field's CLI
+#   flag rather than hand-adding one: TransformerConfig fields are exposed to argparse by
+#   ArgumentGroupFactory in megatron/training/argument_utils.py, so no arguments.py edit is
+#   required or expected.
+#
+# Applied to: Megatron-LM core_v0.18.0
+#
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index a6ebd4d3c..998ae2b06 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -840,7 +840,7 @@ class TopKRouter(Router):
+             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+                 logits_for_cg,
+                 self.topk,
+-                self.score_function,
++                self.config.moe_router_aux_score_function or self.score_function,
+                 fused=self.config.moe_router_fusion,
+                 padding_mask=padding_mask,
+             )
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index e8e8bd054..0ac5bee83 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -730,6 +730,10 @@ class TransformerConfig(ModelParallelConfig):
+     moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
+     """Score function for MoE routing. Can be "softmax", "sigmoid" or "sqrtsoftplus"."""
+ 
++    moe_router_aux_score_function: Optional[Literal['softmax', 'sigmoid', 'sqrtsoftplus']] = None
++    """Score function used only for the auxiliary balancing loss (moe_congestion_routing patch).
++    None means use moe_router_score_function, unchanged from before this field existed."""
++
+     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
+     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
+     improve stability especially when the number of experts is large (e.g. finegrained-moe).

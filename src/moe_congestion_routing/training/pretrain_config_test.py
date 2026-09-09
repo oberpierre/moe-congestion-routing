@@ -357,6 +357,18 @@ def test_router_pre_softmax_and_dtype_opt_in():
     assert _pairs(on)["--moe-router-dtype"] == "fp32"
 
 
+def test_aux_score_function_opt_in_and_defaults_absent():
+    off = build_megatron_args(_cfg())
+    assert "--moe-router-aux-score-function" not in off
+    on = build_megatron_args(_cfg(moe_router_aux_score_function="softmax"))
+    assert _pairs(on)["--moe-router-aux-score-function"] == "softmax"
+
+
+def test_unknown_aux_score_function_rejected():
+    with pytest.raises(ValueError, match="quux"):
+        build_megatron_args(_cfg(moe_router_aux_score_function="quux"))
+
+
 def test_grouped_gemm_and_distributed_optimizer_opt_in():
     # Both are pure throughput and memory levers with no effect on routing or loss, but grouped
     # GEMM swaps the expert module, so it has to be recorded in the launch command.
