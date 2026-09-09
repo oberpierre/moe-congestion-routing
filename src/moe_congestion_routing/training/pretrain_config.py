@@ -30,6 +30,11 @@ _MOE_ROUTER_LOAD_BALANCING_TYPES = (
     *ROSENTHAL_TYPES,
 )
 
+# The two expert-bias update rules patch 0007 adds to Megatron's argparse: the upstream
+# sign(mean_load - load) rule, and the Rosenthal-price rule that steps against the marginal
+# congestion cost instead.
+_BIAS_UPDATE_RULES = ("sign", "rosenthal_price")
+
 
 @dataclass(frozen=True)
 class MoEPretrainConfig:
@@ -167,6 +172,14 @@ class MoEPretrainConfig:
 
     moe_router_bias_update_rate: float = 1e-3
     """Step size for the expert-bias update (only used when expert bias is enabled)."""
+
+    moe_router_bias_update_rule: str = "sign"
+    """Which rule steps the expert bias: ``sign`` (default, Megatron's own
+    ``sign(mean_load - load)``, unchanged) or ``rosenthal_price`` (steps against the centered,
+    clipped marginal congestion cost from ``moe_rosenthal_cost``/``moe_rosenthal_lambda``
+    instead). Orthogonal to ``moe_router_load_balancing_type``: a ``rosenthal_price`` run can
+    carry no congestion loss at all, or stack one on top. Requires
+    ``moe_router_enable_expert_bias``."""
 
     moe_z_loss_coeff: float | None = None
     """Router z-loss coefficient (ST-MoE). ``None`` disables it."""
@@ -626,11 +639,27 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         args += ["--moe-grouped-gemm"]
     if cfg.use_distributed_optimizer:
         args += ["--use-distributed-optimizer"]
+    if cfg.moe_router_bias_update_rule not in _BIAS_UPDATE_RULES:
+        raise ValueError(
+            f"moe_router_bias_update_rule must be one of {_BIAS_UPDATE_RULES}, got "
+            f"{cfg.moe_router_bias_update_rule!r}"
+        )
+    _price_rule_without_bias = (
+        cfg.moe_router_bias_update_rule == "rosenthal_price"
+        and not cfg.moe_router_enable_expert_bias
+    )
+    if _price_rule_without_bias:
+        raise ValueError(
+            "moe_router_bias_update_rule: rosenthal_price requires moe_router_enable_expert_bias: "
+            "true, since there is no expert-bias buffer to step without it"
+        )
     if cfg.moe_router_enable_expert_bias:
         args += [
             "--moe-router-enable-expert-bias",
             "--moe-router-bias-update-rate",
             str(cfg.moe_router_bias_update_rate),
+            "--moe-router-bias-update-rule",
+            cfg.moe_router_bias_update_rule,
         ]
     if cfg.moe_z_loss_coeff is not None:
         args += ["--moe-z-loss-coeff", str(cfg.moe_z_loss_coeff)]
@@ -715,10 +744,13 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
             args += ["--moe-probe-dense-windows", *cfg.moe_probe_dense_windows]
         if cfg.moe_probe_dir:
             args += ["--moe-probe-dir", cfg.moe_probe_dir]
-    # Rosenthal congestion-loss balancing types. Validated here and again on Megatron's own
-    # TransformerConfig. The duplication is deliberate rather than a leftover: this copy saves
-    # cluster queue time by failing at --dry-run, and the TransformerConfig copy is the one no
-    # launch path can bypass.
+    # Rosenthal congestion-loss balancing types, and/or the rosenthal_price bias rule: both price
+    # load through the same cost-family/lambda pair, so the family check, lambda resolution and
+    # the two value flags are shared here. Each is also validated on Megatron's own
+    # TransformerConfig, by its own independent check reached whichever way this arm selects the
+    # cost family. The duplication is deliberate rather than a leftover: this copy saves cluster
+    # queue time by failing at --dry-run, and the TransformerConfig copy is the one no launch path
+    # can bypass.
     if (
         cfg.moe_rosenthal_log_grad_ratio
         and cfg.moe_router_load_balancing_type not in ROSENTHAL_TYPES
@@ -727,12 +759,13 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
             "moe_rosenthal_log_grad_ratio requires moe_router_load_balancing_type to be "
             f"'rosenthal' or 'global_rosenthal', got {cfg.moe_router_load_balancing_type!r}"
         )
-    if cfg.moe_router_load_balancing_type in ROSENTHAL_TYPES:
-        if cfg.moe_rosenthal_variant not in VARIANTS:
-            raise ValueError(
-                f"moe_rosenthal_variant must be one of {VARIANTS}, got "
-                f"{cfg.moe_rosenthal_variant!r}"
-            )
+    _rosenthal_loss = cfg.moe_router_load_balancing_type in ROSENTHAL_TYPES
+    _rosenthal_price = cfg.moe_router_bias_update_rule == "rosenthal_price"
+    if _rosenthal_loss and cfg.moe_rosenthal_variant not in VARIANTS:
+        raise ValueError(
+            f"moe_rosenthal_variant must be one of {VARIANTS}, got {cfg.moe_rosenthal_variant!r}"
+        )
+    if _rosenthal_loss or _rosenthal_price:
         if cfg.moe_rosenthal_cost not in COST_FAMILIES:
             raise ValueError(
                 f"moe_rosenthal_cost must be one of {COST_FAMILIES}, got {cfg.moe_rosenthal_cost!r}"
@@ -747,6 +780,9 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         if _lambda <= 0:
             raise ValueError(f"moe_rosenthal_lambda must be > 0, got {_lambda}")
 
+    if _rosenthal_loss:
+        # The pressure bound sizes a LOSS coefficient (moe_aux_loss_coeff), which a
+        # rosenthal_price-only arm never trains against, so it stays out of that arm's warning.
         _bound = pressure_bound(
             cfg.moe_aux_loss_coeff,
             _lambda,
@@ -773,6 +809,13 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         ]
         if cfg.moe_rosenthal_log_grad_ratio:
             args += ["--moe-rosenthal-log-grad-ratio"]
+    elif _rosenthal_price:
+        args += [
+            "--moe-rosenthal-cost",
+            cfg.moe_rosenthal_cost,
+            "--moe-rosenthal-lambda",
+            str(_lambda),
+        ]
     if cfg.log_throughput:
         args += ["--log-throughput"]
     if cfg.tensorboard_dir:

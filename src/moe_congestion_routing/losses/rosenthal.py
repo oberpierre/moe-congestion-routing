@@ -101,6 +101,7 @@ __all__ = [
     "cost_antiderivative",
     "hard_relative_load",
     "pressure",
+    "price_bias_step",
     "relative_loads",
     "rosenthal_loss",
 ]
@@ -298,6 +299,32 @@ def pressure(
         _assert_conserves_global_mass(u_glob, num_experts)
     load = u_glob if variant == "soft" else u_hat
     return (coeff * cost(load.detach(), cost_family, lam)).float()
+
+
+def price_bias_step(
+    tokens_per_expert: torch.Tensor, *, cost_family: str, lam: float
+) -> torch.Tensor:
+    """Rosenthal-price step for the ``rosenthal_price`` expert-bias update rule.
+
+    ``clip(c(u/L) - mean(c(u/L)), -1, 1)`` along the last axis, ``L = mean(u)``. Runs under
+    ``no_grad`` in float32 and always returns a detached tensor. The caller applies
+    ``bias <- bias - rate * price_bias_step(...)``, which reduces to ALF-LB's own
+    ``sign(mean(u) - u)`` rule elementwise-in-sign for the linear cost family, because a linear
+    price is monotone in ``u`` and centering never changes that monotonicity.
+
+    Accepts ``(experts,)`` or stacked ``(layers, experts)`` counts, matching what
+    ``get_updated_expert_bias`` holds after its all-reduce: both the mean and the centering run
+    along the last axis so layers never mix. A layer whose counts are all zero has an undefined
+    ``u/L`` and steps by zero there, matching what ``sign(0 - 0)`` already gives on that input.
+    """
+    with torch.no_grad():
+        u = tokens_per_expert.float()
+        load = u.mean(dim=-1, keepdim=True)
+        safe_load = torch.where(load == 0, torch.ones_like(load), load)
+        price = cost(u / safe_load, cost_family, lam)
+        centered = price - price.mean(dim=-1, keepdim=True)
+        step = torch.clamp(centered, -1.0, 1.0)
+        return torch.where(load == 0, torch.zeros_like(step), step).detach()
 
 
 def _potential_closed_form_linear(

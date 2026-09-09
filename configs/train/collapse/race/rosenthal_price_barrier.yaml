@@ -1,0 +1,7 @@
+extends: ../race_base.yaml
+moe_router_load_balancing_type: none
+moe_aux_loss_coeff: 0.0
+moe_router_bias_update_rate: 1.0e-3
+moe_router_bias_update_rule: rosenthal_price
+moe_rosenthal_cost: softplus_barrier
+output_dir: artifacts/collapse/recovery/rosenthal-price-barrier

@@ -1,6 +1,7 @@
 import dataclasses
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -1108,3 +1109,80 @@ def test_pretrain_config_module_imports_no_torch():
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_bias_update_rule_defaults_to_sign_and_emits_nothing_extra_by_default():
+    args = build_megatron_args(_cfg(moe_router_enable_expert_bias=True))
+    assert _pairs(args)["--moe-router-bias-update-rule"] == "sign"
+    assert "--moe-rosenthal-cost" not in args
+    assert "--moe-rosenthal-lambda" not in args
+
+
+def test_bias_update_rule_rejects_unknown_value():
+    with pytest.raises(ValueError, match="moe_router_bias_update_rule"):
+        build_megatron_args(
+            _cfg(moe_router_enable_expert_bias=True, moe_router_bias_update_rule="magnitude")
+        )
+
+
+def test_rosenthal_price_requires_expert_bias():
+    with pytest.raises(ValueError, match="moe_router_enable_expert_bias"):
+        build_megatron_args(
+            _cfg(
+                moe_router_enable_expert_bias=False,
+                moe_router_bias_update_rule="rosenthal_price",
+            )
+        )
+
+
+def test_rosenthal_price_emits_the_rule_and_the_cost_family_flags_with_no_balancing_loss():
+    # This arm's balancing type stays "none": without lifting the cost-family emission out of the
+    # ROSENTHAL_TYPES branch, this would silently price with linear/lam=1.0 instead of the family
+    # the config names.
+    cfg = _cfg(
+        moe_router_load_balancing_type="none",
+        moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+        moe_router_bias_update_rule="rosenthal_price",
+        moe_rosenthal_cost="softplus_barrier",
+    )
+    pairs = _pairs(build_megatron_args(cfg))
+    assert pairs["--moe-router-bias-update-rule"] == "rosenthal_price"
+    assert pairs["--moe-rosenthal-cost"] == "softplus_barrier"
+    assert pairs["--moe-rosenthal-lambda"] == str(DEFAULT_LAMBDA["softplus_barrier"])
+    # No loss-side flags: this arm carries no rosenthal balancing type.
+    assert "--moe-rosenthal-variant" not in build_megatron_args(cfg)
+
+
+def test_rosenthal_price_does_not_warn_the_pressure_bound_a_loss_coefficient_does_not_use():
+    # pressure_bound sizes moe_aux_loss_coeff, which a rosenthal_price-only arm never trains
+    # against, so an extreme lambda here must not raise the loss-side sanity warning.
+    cfg = _cfg(
+        moe_router_load_balancing_type="none",
+        moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+        moe_router_bias_update_rule="rosenthal_price",
+        moe_rosenthal_cost="linear",
+        moe_rosenthal_lambda=1000.0,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        build_megatron_args(cfg)  # must not raise
+
+
+def test_rosenthal_price_and_rosenthal_loss_together_emit_each_flag_once():
+    # A rosenthal_price bias rule stacked on top of a rosenthal balancing type shares the same
+    # cost-family/lambda pair, so --moe-rosenthal-cost/--moe-rosenthal-lambda must appear once,
+    # not twice, alongside the loss-only --moe-rosenthal-variant.
+    cfg = _cfg(
+        moe_router_load_balancing_type="rosenthal",
+        moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+        moe_router_bias_update_rule="rosenthal_price",
+        moe_rosenthal_cost="quadratic",
+    )
+    args = build_megatron_args(cfg)
+    assert args.count("--moe-rosenthal-cost") == 1
+    assert args.count("--moe-rosenthal-lambda") == 1
+    assert _pairs(args)["--moe-rosenthal-variant"] == "hard"
+    assert _pairs(args)["--moe-router-bias-update-rule"] == "rosenthal_price"

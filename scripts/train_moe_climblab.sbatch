@@ -41,10 +41,10 @@ if [ "${SLURM_NNODES:-1}" -gt 1 ]; then
     DIST_ARGS="--nnodes $SLURM_NNODES --rdzv-endpoint $MASTER_ADDR:25678"
 fi
 
-# A FRESH run gets its own timestamped <output_dir>/<tag> dir; the shared tag lets every node agree
-# on it (multi-node: c10d assigns ranks, so rank 0 isn't pinned to a node). On RESUME the launcher
-# derives the run dir from --load instead, so this tag only names fresh runs. Export MOE_RUN_TAG to
-# override the timestamp with a memorable name.
+# A FRESH run gets its own timestamped <output_dir>/<tag> dir, and the shared tag lets every node
+# agree on it, because c10d assigns ranks and rank 0 is not pinned to a node. MOE_RUN_TAG renames
+# it, but it is the weakest of the three: the third argument beats it and --load beats it, so a run
+# given either one ignores the tag entirely and takes its W&B run id from the winner instead.
 RUN_TAG="${MOE_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 
 DATA_ENV_EXPORT=""

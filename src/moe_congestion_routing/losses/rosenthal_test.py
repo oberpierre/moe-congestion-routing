@@ -4,14 +4,16 @@ import pathlib
 import pytest
 import torch
 
-from moe_congestion_routing.losses.cost_families import barrier_tau, pressure_bound
+from moe_congestion_routing.losses.cost_families import DEFAULT_LAMBDA, barrier_tau, pressure_bound
 from moe_congestion_routing.losses.rosenthal import (
     _assert_conserves_global_mass,
     balanced_load,
     congestion_potential,
     cost,
     cost_antiderivative,
+    hard_relative_load,
     pressure,
+    price_bias_step,
     relative_loads,
     rosenthal_loss,
 )
@@ -728,3 +730,89 @@ def test_barrier_cost_is_unchanged_by_the_antiderivative_branch():
     tau, lam = barrier_tau("softplus_barrier"), 0.2
     want = lam * torch.nn.functional.softplus((x - 1.0) / tau)
     assert torch.equal(cost(x, "softplus_barrier", lam), want)
+
+
+def _hot_cool_load(num_experts: int, hot_n: int, hot_level: float) -> torch.Tensor:
+    """A load vector conserving ``sum(u) == num_experts`` (mass-conserving, as every ``u`` here
+    must be): ``hot_n`` experts at ``hot_level`` and the rest at whatever level makes the mean 1.
+    """
+    cool_n = num_experts - hot_n
+    cool_level = (num_experts - hot_n * hot_level) / cool_n
+    u = torch.full((num_experts,), cool_level)
+    u[:hot_n] = hot_level
+    return u
+
+
+@pytest.mark.parametrize("cost_family", ["linear", "quadratic", "softplus_barrier"])
+def test_price_bias_step_matches_alflb_gap_at_total_collapse(cost_family):
+    # 8 winners carry the whole batch (8x the mean each) and 56 experts are dead, which is the
+    # two-valued load every family saturates its clip on. The applied bias delta (-step) must
+    # then match ALF-LB's +/- rate exactly: -1 on the winners, +1 on the dead.
+    u = torch.zeros(64)
+    u[:8] = 8.0
+    step = price_bias_step(u, cost_family=cost_family, lam=DEFAULT_LAMBDA[cost_family])
+    assert step[:8].tolist() == pytest.approx([1.0] * 8)
+    assert step[8:].tolist() == pytest.approx([-1.0] * 56)
+    delta = -step
+    assert delta[:8].tolist() == pytest.approx([-1.0] * 8)
+    assert delta[8:].tolist() == pytest.approx([1.0] * 56)
+    gap = (step[:8].mean() - step[8:].mean()).item()
+    assert gap == pytest.approx(2.0, abs=1e-4)
+
+
+@pytest.mark.parametrize(
+    "cost_family,expected_spread",
+    [("linear", 0.6667), ("quadratic", 0.7778), ("softplus_barrier", 0.9667)],
+)
+def test_price_bias_step_decelerates_near_balance(cost_family, expected_spread):
+    # 16 experts at 1.5x the mean and 48 at 0.8333x sit inside the clip for every family, so the
+    # step shrinks with the price gap instead of saturating at +/- rate, and the families order by
+    # how steeply their cost rises.
+    u = _hot_cool_load(num_experts=64, hot_n=16, hot_level=1.5)
+    step = price_bias_step(u, cost_family=cost_family, lam=DEFAULT_LAMBDA[cost_family])
+    assert step.abs().max().item() < 1.0  # nothing saturates the clip
+    spread = (step[:16].mean() - step[16:].mean()).item()
+    assert spread == pytest.approx(expected_spread, abs=1e-4)
+
+
+def test_price_bias_step_is_alflb_at_the_linear_family_by_sign():
+    # ALF-LB is the special case: a linear price through a sign nonlinearity is exactly
+    # sign(mean(u) - u), Megatron's own offset. Checked elementwise, including two experts tied
+    # at zero, where both rules must agree the step is zero.
+    u = torch.tensor([5.0, 3.0, 0.0, 0.0, 2.0, 4.0, 1.0, 1.0])
+    step = price_bias_step(u, cost_family="linear", lam=1.0)
+    alflb_offset = u.mean() - u
+    assert torch.equal(torch.sign(-step), torch.sign(alflb_offset))
+
+
+def test_price_bias_step_zero_layer_steps_by_zero_without_mixing_other_layers():
+    # Stacked (layers, experts) input: one all-zero layer's mean load is 0, which would make
+    # u/L a 0/0 without the guard. That layer must return exactly zero while a live layer in the
+    # same tensor is priced normally, matching sign(0 - 0) == 0 on the same degenerate input.
+    zero_layer = torch.zeros(8)
+    live_layer = torch.tensor([5.0, 3.0, 0.0, 0.0, 2.0, 4.0, 1.0, 1.0])
+    stacked = torch.stack([zero_layer, live_layer])
+    step = price_bias_step(stacked, cost_family="linear", lam=1.0)
+    assert torch.equal(step[0], torch.zeros(8))
+    assert torch.equal(step[1], price_bias_step(live_layer, cost_family="linear", lam=1.0))
+
+
+def test_price_bias_step_load_matches_hard_relative_load():
+    # price_bias_step divides by u.mean(dim=-1), which is algebraically hard_relative_load's
+    # E*n/(N*K) once counts conserve mass (sum(n) == N*K), the fourth site in this file computing
+    # that quantity. Linear cost at lam=1 is the identity, so this pins the two computations
+    # together directly instead of leaving them free to drift apart.
+    n = torch.tensor([1.0, 3.0, 5.0, 2.0, 4.0, 0.0, 6.0, 3.0])
+    total_num_tokens, topk, num_experts = 8, 3, 8
+    assert n.sum().item() == total_num_tokens * topk
+    u_hat = hard_relative_load(n, total_num_tokens, topk, num_experts)
+    expected = torch.clamp(u_hat - u_hat.mean(), -1.0, 1.0)
+    step = price_bias_step(n, cost_family="linear", lam=1.0)
+    assert torch.equal(step, expected)
+
+
+def test_price_bias_step_1d_and_2d_agree():
+    u = torch.tensor([5.0, 3.0, 0.0, 0.0, 2.0, 4.0, 1.0, 1.0])
+    flat = price_bias_step(u, cost_family="quadratic", lam=0.5)
+    stacked = price_bias_step(u.unsqueeze(0), cost_family="quadratic", lam=0.5)
+    assert torch.equal(flat, stacked.squeeze(0))
