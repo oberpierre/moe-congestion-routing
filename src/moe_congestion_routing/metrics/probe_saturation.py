@@ -16,6 +16,12 @@ mean nothing about that router. ``reduce_dump`` refuses one outright rather than
 
 ``numpy`` and stdlib only, matching every other reader in ``metrics/`` (``probe_dump_format.py``'s
 module docstring explains why: this has to load on a login node with no torch installed).
+
+``frac_tok_frozen`` is the fraction of tokens whose K *selected* experts are all saturated. It used
+to max ``sigp`` over all experts, so one responsive unselected expert kept a token counted as
+unfrozen no matter how stuck its own winners were. Any CSV produced before this fix predates the
+corrected definition, so its ``frac_tok_frozen`` column cannot be compared against rows from this
+version.
 """
 
 import json
@@ -216,6 +222,10 @@ def reduce_dump(
         sel_only = numpy.where(sel_mask, layer_logits, numpy.inf)
         unsel_only = numpy.where(sel_mask, -numpy.inf, layer_logits)
         margin_mean = float((sel_only.min(axis=1) - unsel_only.max(axis=1)).mean())
+        # A token's own K selected experts, not the full 64, is what its gate can actually move
+        # load away from. Maxing sigp over every expert let one responsive unselected expert keep
+        # a token counted as unfrozen even while all K of its winners were saturated.
+        sel_sigp = numpy.where(sel_mask, sigp, -numpy.inf)
 
         # Ambiguity in compute_topk's tie-break needs more than K experts saturated: with exactly
         # K, every winner is pinned and there is no K+1'th saturated loser to be tied against.
@@ -270,7 +280,7 @@ def reduce_dump(
                 frac_sel_tied=float(numpy.mean(sel_logits >= SATURATED_SIGMOID_LOGIT)),
                 frac_tok_tie_ambiguous=frac_tok_tie_ambiguous,
                 frac_sel_sat=float(numpy.mean(sig[sel_mask] >= sat)),
-                frac_tok_frozen=float(numpy.mean(sigp.max(axis=1) < resp)),
+                frac_tok_frozen=float(numpy.mean(sel_sigp.max(axis=1) < resp)),
                 margin_mean=margin_mean,
                 n_zero_token=n_zero_token,
                 n_eff_2=n_eff_2,

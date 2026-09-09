@@ -178,6 +178,24 @@ def test_saturated_router_has_lower_sel_sigp_and_more_frozen_tokens_than_healthy
     assert healthy_row.frac_sel_tied == pytest.approx(0.0)
 
 
+def test_frac_tok_frozen_ignores_a_responsive_unselected_expert(tmp_path):
+    # Every token's two selected experts sit saturated (logit 30) while every unselected expert
+    # sits mid-range (logit 0, sigp = 0.25, well above resp). A max over all experts would call
+    # these tokens unfrozen because of the unselected experts, whereas restricted to the K
+    # selected ones, as it must be, they are frozen.
+    path = _one_layer_dump(
+        tmp_path,
+        run="mixed",
+        asset="a",
+        iteration=0,
+        winner_logit=30.0,
+        loser_logit=0.0,
+        winners=[0, 1],
+    )
+    _, _, rows, _ = reduce_dump(path, sat=0.99, resp=0.01, baseline=None)
+    assert rows[0].frac_tok_frozen == pytest.approx(1.0)
+
+
 # --- n_eff_2 / n_zero_token against a direct routing-map computation ----------------------------
 
 
