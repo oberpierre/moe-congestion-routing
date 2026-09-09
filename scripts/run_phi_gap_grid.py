@@ -21,6 +21,7 @@ from pathlib import Path
 
 from moe_congestion_routing.losses.cost_families import COST_FAMILIES
 from moe_congestion_routing.metrics.phi_gap_grid import (
+    REFERENCE_COSTS,
     append_rows,
     candidate_key,
     enumerate_cells,
@@ -50,7 +51,8 @@ def main() -> None:
         action="append",
         dest="cost_families",
         choices=COST_FAMILIES,
-        help="repeatable, defaults to both declared reference costs",
+        help=f"repeatable, defaults to the declared reference costs {REFERENCE_COSTS}. A "
+        "trainable family outside them is refused rather than solved",
     )
     parser.add_argument("--asset", action="append", dest="assets", help="repeatable")
     parser.add_argument("--layer", action="append", dest="layers", type=int, help="repeatable")
@@ -81,7 +83,15 @@ def main() -> None:
     run_dir = args.run_dir
     run_id = args.run_id or run_dir.name
     arm = args.arm or run_dir.parent.name
-    cost_families = tuple(args.cost_families) if args.cost_families else COST_FAMILIES
+    cost_families = tuple(args.cost_families) if args.cost_families else REFERENCE_COSTS
+    undeclared = [f for f in cost_families if f not in REFERENCE_COSTS]
+    if undeclared:
+        parser.error(
+            f"cost family {undeclared} is not a declared reference cost {REFERENCE_COSTS}. The "
+            "grid has no tau column and no per-family lam, so its rows would not record which "
+            "cost priced them. Adding a reference cost is a change to the declared ranking, "
+            "not a flag"
+        )
     lams = tuple(args.lams) if args.lams else (1.0,)
 
     cells = enumerate_cells(

@@ -24,6 +24,12 @@ from moe_congestion_routing.metrics.phi_gap import PhiGapRow, phi_gap_rows
 from moe_congestion_routing.metrics.probe_comparison import probe_units
 from moe_congestion_routing.metrics.probe_series import read_dump
 
+# The reference costs every arm is ranked under, both priced at lam = 1.0. Deliberately not
+# `cost_families.COST_FAMILIES`, which is what the trainable loss supports and grows with the arm
+# list: a yardstick must not widen because a router learned a new cost. A family belongs here only
+# if one lam and no shape parameter describe it, because a row records neither.
+REFERENCE_COSTS: tuple[str, ...] = ("linear", "quadratic")
+
 
 class Cell(NamedTuple):
     """One grid cell: which dump, which asset it came from, and which slice of it to score.
@@ -98,7 +104,7 @@ def enumerate_cells(
     run_dir: Path,
     *,
     lams: Sequence[float] = (1.0,),
-    cost_families: Sequence[str] = ("linear", "quadratic"),
+    cost_families: Sequence[str] = REFERENCE_COSTS,
     assets: Sequence[str] | None = None,
     layers: Sequence[int] | None = None,
     steps: Sequence[int] | None = None,

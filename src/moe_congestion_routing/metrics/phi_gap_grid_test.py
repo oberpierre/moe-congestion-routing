@@ -11,6 +11,7 @@ from moe_congestion_routing.metrics.phi_gap import PhiGapRow
 from moe_congestion_routing.metrics.phi_gap_grid import (
     CSV_FIELDS,
     KEY_FIELDS,
+    REFERENCE_COSTS,
     Cell,
     GridRow,
     append_rows,
@@ -567,3 +568,98 @@ def test_a_row_describing_another_cell_raises(tmp_path):
     # a different coordinate would be filed under the wrong key instead of caught downstream.
     with pytest.raises(ValueError, match="coordinates"):
         run_grid([_cell(0)], run_id="r", arm="c", emit=lambda row: None, solve=_wrong_coordinates)
+
+
+# ---------------------------------------------------------------------------------------------
+# REFERENCE_COSTS and the driver default
+# ---------------------------------------------------------------------------------------------
+
+
+def test_enumerate_cells_defaults_to_the_declared_reference_costs(tmp_path, monkeypatch):
+    """The default sweep is read from the constant rather than restated, so a family added to
+    the trainable registry cannot widen it."""
+    from moe_congestion_routing.metrics import probe_comparison
+
+    monkeypatch.setattr(probe_comparison, "UNIT_TOKENS", 4)
+    run_dir = tmp_path / "run"
+    _write_dump(run_dir / "probes" / "asset0", step=0, num_layers=1, n_tokens=4)
+
+    cells = enumerate_cells(run_dir)
+    assert {c.cost_family for c in cells} == set(REFERENCE_COSTS)
+
+
+def test_every_reference_cost_is_one_the_oracle_can_price():
+    """`REFERENCE_COSTS` is decoupled from the trainable registry, so nothing else stops it from
+    naming a family `phi_gap_rows` would raise on partway through a fleet sweep."""
+    from moe_congestion_routing.losses.cost_families import ORACLE_COST_FAMILIES
+
+    assert set(REFERENCE_COSTS) <= set(ORACLE_COST_FAMILIES)
+
+
+def test_the_driver_default_is_the_reference_pair_not_the_trainable_registry(tmp_path):
+    """The driver's default is the ranking's yardstick, so it must not follow the trainable
+    registry: a family the router learns would otherwise join every resumed fleet sweep, priced at
+    the reference lam and recorded by nothing.
+    """
+    import subprocess
+    import sys
+
+    from moe_congestion_routing.losses.cost_families import COST_FAMILIES
+
+    run_dir = tmp_path / "arm" / "run"
+    _write_dump(run_dir / "probes" / "asset0", step=0, num_layers=1, n_tokens=16384)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_phi_gap_grid.py",
+            "--run-dir",
+            str(run_dir),
+            "--out",
+            str(tmp_path / "out.csv"),
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    named = {
+        line.split("cost_family=")[1].split()[0]
+        for line in result.stdout.splitlines()
+        if "cost_family=" in line
+    }
+    assert named == set(REFERENCE_COSTS)
+    for family in set(COST_FAMILIES) - set(REFERENCE_COSTS):
+        assert family not in named
+
+
+def test_the_driver_refuses_a_trainable_family_that_is_not_a_reference_cost(tmp_path):
+    """Loud rather than solved: a row records no shape parameter and one lam for every family,
+    so such cells would not say which cost priced them."""
+    import subprocess
+    import sys
+
+    from moe_congestion_routing.losses.cost_families import COST_FAMILIES
+
+    outside = sorted(set(COST_FAMILIES) - set(REFERENCE_COSTS))
+    if not outside:
+        pytest.skip("every trainable family is a declared reference cost, so nothing to refuse")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_phi_gap_grid.py",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--out",
+            str(tmp_path / "out.csv"),
+            "--cost-family",
+            outside[0],
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert outside[0] in result.stderr
+    assert "reference cost" in result.stderr
