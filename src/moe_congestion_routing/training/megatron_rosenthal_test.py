@@ -458,6 +458,12 @@ def test_is_aux_loss_enabled_false_for_none_balancing():
     assert _bare_router("none", 0.0).is_aux_loss_enabled() is False
 
 
+def test_is_aux_loss_enabled_true_for_negative_coeff():
+    # A negative coefficient rewards concentration instead of penalizing it (the collapse
+    # induction's lever), so the router must not treat it as off the way it treats zero.
+    assert _bare_router("rosenthal", -0.01).is_aux_loss_enabled() is True
+
+
 # ---------------------------------------------------------------------------------------------
 # rosenthal_price sign convention, checked through the real get_updated_expert_bias.
 # torch.distributed.all_reduce inside it is unconditional, so a single-rank no-op gloo group
