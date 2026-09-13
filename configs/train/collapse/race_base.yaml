@@ -1,6 +1,6 @@
 # Pass the collapsed checkpoint on the command line:
 # sbatch scripts/train_moe_climblab.sbatch configs/train/collapse/race/<arm>.yaml \
-#   artifacts/collapse/induce_sigmoid/<run_dir>/checkpoints <name>
+#   artifacts/collapse/induce_negaux/induce-negaux/checkpoints negaux-<arm>
 # The third param is required, otherwise the launcher writes back into the run it loaded. It is a
 # NAME joined under this arm's output_dir, not a path, and it becomes the W&B run id verbatim, so
 # it has to be unique across the whole W&B project.
@@ -11,6 +11,10 @@ extends: base.yaml
 # moments for the dead experts that could manufacture an apparent recovery on their own.
 finetune: true
 exit_on_missing_checkpoint: true
+
+# The earliest induction checkpoint with the collapse complete and the gates still responsive.
+# A later one only lets the surviving experts train alone for longer.
+ckpt_step: 50
 
 # base_cluster's value, and this is the single most important line in the file. The induction
 # saturates the gate until the router's gradient vanishes, and the z-loss is the only term that
@@ -43,3 +47,7 @@ moe_probe_dense_windows: ["0:500", "3600:4000"]
 moe_router_score_function: sigmoid
 moe_router_enable_expert_bias: true
 moe_router_bias_update_rate: 0.0
+
+# Every step, because recovery is decided early. The logged loss is a mean over this interval, so
+# these runs cannot be compared step for step with runs logged at another interval.
+log_interval: 1
