@@ -123,6 +123,12 @@ class MoEPretrainConfig:
     """Upcast router logits / expert-output weighting to ``fp32`` (or ``fp64``). ``None`` keeps
     them in bf16. Recommended at large expert counts, where bf16 logit drift can reorder top-k."""
 
+    moe_router_force_load_balancing: bool = False
+    """Replace router logits with random ones before routing, so the forward pass measures what
+    the AVERAGE expert does instead of what the trained router selects. Used to read a quality gap
+    off a frozen checkpoint: the same pass with this off measures the survivors, with it on the
+    population."""
+
     moe_grouped_gemm: bool = False
     """Batch the per-expert GEMMs into one grouped kernel instead of looping over experts
     sequentially. Big throughput win at high expert counts; falls back to the sequential path when
@@ -309,6 +315,11 @@ class MoEPretrainConfig:
 
     eval_iters: int = 0
     """Batches per validation pass; 0 disables eval entirely."""
+
+    skip_train: bool = False
+    """Run only the validation pass on a loaded checkpoint, skipping the training loop entirely.
+    Megatron then sets ``--no-load-optim`` itself and builds no optimizer, which is what lets a
+    checkpoint too large to train on one GPU still be evaluated on it."""
 
     # Checkpointing, in Megatron's semantics. save and load are directories rather than single
     # checkpoints: each save drops an iter_<N>/ subdir and a latest_checkpointed_iteration.txt
@@ -657,6 +668,8 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         args += ["--moe-router-dtype", cfg.moe_router_dtype]
     if cfg.moe_router_aux_score_function is not None:
         args += ["--moe-router-aux-score-function", cfg.moe_router_aux_score_function]
+    if cfg.moe_router_force_load_balancing:
+        args += ["--moe-router-force-load-balancing"]
     if cfg.moe_grouped_gemm:
         args += ["--moe-grouped-gemm"]
     if cfg.use_distributed_optimizer:
@@ -898,6 +911,8 @@ def build_megatron_args(cfg: MoEPretrainConfig) -> list[str]:
         args += ["--finetune"]
     if cfg.exit_on_missing_checkpoint:
         args += ["--exit-on-missing-checkpoint"]
+    if cfg.skip_train:
+        args += ["--skip-train"]
     if cfg.exit_interval:
         args += ["--exit-interval", str(cfg.exit_interval)]
     return args

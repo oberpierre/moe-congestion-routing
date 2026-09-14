@@ -166,6 +166,13 @@ def test_exit_on_missing_checkpoint_flag():
     assert "--exit-on-missing-checkpoint" not in build_megatron_args(_cfg())
 
 
+def test_skip_train_flag():
+    # A bare flag, present only when True. Megatron's own argparse adds --no-load-optim on its
+    # own, so this harness emits nothing else for it.
+    assert "--skip-train" in build_megatron_args(_cfg(skip_train=True))
+    assert "--skip-train" not in build_megatron_args(_cfg())
+
+
 def test_resolved_expands_env_vars_in_paths(tmp_path, monkeypatch):
     # Committed configs reference ${DATA_STORE}, so resolved() has to expand it or Megatron gets a
     # literal "${DATA_STORE}" path. An unset variable must fail loud rather than yield a bad path.
@@ -355,6 +362,13 @@ def test_router_pre_softmax_and_dtype_opt_in():
     on = build_megatron_args(_cfg(moe_router_pre_softmax=True, moe_router_dtype="fp32"))
     assert "--moe-router-pre-softmax" in on
     assert _pairs(on)["--moe-router-dtype"] == "fp32"
+
+
+def test_force_load_balancing_opt_in():
+    off = build_megatron_args(_cfg())
+    assert "--moe-router-force-load-balancing" not in off
+    on = build_megatron_args(_cfg(moe_router_force_load_balancing=True))
+    assert "--moe-router-force-load-balancing" in on
 
 
 def test_aux_score_function_opt_in_and_defaults_absent():
