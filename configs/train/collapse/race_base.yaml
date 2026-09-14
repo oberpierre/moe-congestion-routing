@@ -1,6 +1,6 @@
 # Pass the collapsed checkpoint on the command line:
 # sbatch scripts/train_moe_climblab.sbatch configs/train/collapse/race/<arm>.yaml \
-#   artifacts/collapse/induce_negaux/induce-negaux/checkpoints negaux-<arm>
+#   artifacts/collapse/induce_negaux/induce-negaux/checkpoints step125-<arm>
 # The third param is required, otherwise the launcher writes back into the run it loaded. It is a
 # NAME joined under this arm's output_dir, not a path, and it becomes the W&B run id verbatim, so
 # it has to be unique across the whole W&B project.
@@ -12,14 +12,13 @@ extends: base.yaml
 finetune: true
 exit_on_missing_checkpoint: true
 
-# The earliest induction checkpoint with the collapse complete and the gates still responsive.
-# A later one only lets the surviving experts train alone for longer.
-ckpt_step: 50
+# The last induction checkpoint before its learning-rate anneal. The collapse is as complete as at
+# step 50, but the surviving experts have trained alone for longer, so the starved experts start
+# further behind. Step 150 is avoided because the anneal itself widens that gap.
+ckpt_step: 125
 
-# base_cluster's value, and this is the single most important line in the file. The induction
-# saturates the gate until the router's gradient vanishes, and the z-loss is the only term that
-# penalises logit magnitude and so brings that gradient back, which every balancing loss needs to
-# act through. The control arm bounds what it recovers alone, which locally was nothing.
+# base_cluster's value. The z-loss is the only term that penalises logit magnitude, so it is what
+# keeps the gate responsive for every balancing loss to act through.
 moe_z_loss_coeff: 1.0e-3
 
 # Different from the induction because `finetune` does not restore `consumed_train_samples`,
@@ -27,18 +26,18 @@ moe_z_loss_coeff: 1.0e-3
 # induction just saw. Shared by every arm so that all arms get the same data stream.
 seed: 2687
 
-# 4000 steps at base.yaml's batch is 1.05B tokens, the same horizon for every arm. The length is
-# set by the criterion rather than by when recovery starts: balance has to hold for 1000 steps to
-# count, and the control arm needs enough runway that "it did not recover" is credible. 1% warmup,
-# and a 5% anneal kept short because a decaying learning rate freezes whatever state an arm is in.
-train_iters: 4000
+# 2000 steps at base.yaml's batch is 0.52B tokens, the same horizon for every arm. Every balancing
+# arm recovered within about 150 steps from step 50, so this still leaves over 1000 steps of held
+# balance, which is what the criterion counts. Warmup and anneal keep the lengths the step-50 race
+# used, so the schedules match up to step 1800.
+train_iters: 2000
 lr_warmup_iters: 40
 lr_wsd_decay_iters: 200
 
 # Dense early, because recovery happens early: the local pilot's arms reached their thresholds
 # between steps 40 and 140, so 25-step spacing over the first 500 is where the ranking is decided.
 # The second window brackets the anneal.
-moe_probe_dense_windows: ["0:500", "3600:4000"]
+moe_probe_dense_windows: ["0:500", "1600:2000"]
 
 # Sigmoid, for every arm. ALF-LB needs it (expert bias is only valid under sigmoid or
 # sqrtsoftplus), and running the other arms on a different score function would compare a method
