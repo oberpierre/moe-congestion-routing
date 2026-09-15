@@ -27,9 +27,9 @@ moe_z_loss_coeff: 1.0e-3
 seed: 2687
 
 # 2000 steps at base.yaml's batch is 0.52B tokens, the same horizon for every arm. Every balancing
-# arm recovered within about 150 steps from step 50, so this still leaves over 1000 steps of held
-# balance, which is what the criterion counts. Warmup and anneal keep the lengths the step-50 race
-# used, so the schedules match up to step 1800.
+# arm revived its dead experts within about 150 steps of the step-150 checkpoint, so this still
+# leaves over 1000 steps of held balance, which is what the criterion counts. Warmup and anneal keep
+# the lengths the 4000-step race used, so the schedules match up to step 1800.
 train_iters: 2000
 lr_warmup_iters: 40
 lr_wsd_decay_iters: 200

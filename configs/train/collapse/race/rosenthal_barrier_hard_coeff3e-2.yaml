@@ -1,0 +1,8 @@
+# Tests whether the barrier loss's residual imbalance is a force balance against the task gradient.
+# A stronger coefficient should lower both the plateau and how much of the overload sits on the
+# experts that survived the induction.
+extends: rosenthal_barrier_hard.yaml
+
+moe_aux_loss_coeff: 0.03
+
+output_dir: artifacts/collapse/recovery/rosenthal-barrier-hard-coeff3e-2

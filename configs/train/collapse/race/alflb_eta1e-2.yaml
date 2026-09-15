@@ -1,0 +1,6 @@
+# Tests whether the bias arm's residual imbalance is limited by how far the bias may move per step.
+extends: alflb.yaml
+
+moe_router_bias_update_rate: 1.0e-2
+
+output_dir: artifacts/collapse/recovery/alflb-eta1e-2

@@ -1,0 +1,7 @@
+# Tests whether the price-bias arm's residual imbalance is limited by how far the bias may move per
+# step.
+extends: rosenthal_price_barrier.yaml
+
+moe_router_bias_update_rate: 1.0e-2
+
+output_dir: artifacts/collapse/recovery/rosenthal-price-barrier-eta1e-2
