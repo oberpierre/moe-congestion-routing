@@ -15,3 +15,7 @@ select = [
     "C4",  # flake8-comprehensions
     "SIM", # flake8-simplify
 ]
+
+[lint.per-file-ignores]
+# The analysis notebooks print long labels and captions, and zip() over columns of one table.
+"notebooks/**" = ["E501", "B905"]

@@ -1,7 +1,7 @@
 [project]
 name = "moe-congestion-routing"
 version = "0.1.0"
-description = "Add your description here"
+description = "Game-theoretic routing for Mixture-of-Experts models: congestion losses, equilibrium diagnostics and experiments"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

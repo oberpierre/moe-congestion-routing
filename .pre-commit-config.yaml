@@ -16,9 +16,10 @@ repos:
       - id: check-yaml
       - id: check-toml
       - id: check-added-large-files
-        # The executed analysis notebook carries its figures inline as base64 PNGs, which is the
-        # reason it is committed at all, so it sits above the default limit by design.
-        exclude: ^(assets/tokenizer/gpt2/tokenizer\.json|assets/results/phi-gap/.*\.csv|notebooks/.*\.ipynb)$
+        # The executed analysis notebooks carry their figures inline as base64 PNGs, which is the
+        # reason they are committed at all. The released results and the thesis figures are
+        # committed on purpose too, so all of them sit above the default limit by design.
+        exclude: ^(assets/tokenizer/gpt2/tokenizer\.json|assets/results/.*\.csv|assets/thesis/figures/.*\.pdf|notebooks/.*\.ipynb)$
       - id: check-merge-conflict
       - id: mixed-line-ending
       - id: name-tests-test
