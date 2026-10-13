@@ -1,0 +1,204 @@
+# Patch: Rosenthal-price expert-bias update rule
+# ==================================
+# Problem: every congestion loss acts in score space, so its gradient carries sigma'(z), which
+#   goes to zero exactly on the experts that most need to move once the router gate saturates.
+#   ALF-LB's own sign(mean_load - load) rule reaches the router through selection instead of a
+#   gradient and so bypasses that gate, but it throws away the congestion price itself and steps
+#   every expert by the same +/- rate regardless of how far it sits from balance.
+#
+# What this patch does:
+#   - moe_utils.py: get_updated_expert_bias() gains keyword-only bias_update_rule, cost_family and
+#     lam. Dispatch happens after the existing all-reduce, so the "sign" expression is unchanged,
+#     reflowed only by the new indent, and the reduce runs once whichever rule is selected. "rosenthal_price" calls
+#     moe_congestion_routing.losses.rosenthal.price_bias_step, imported function-locally as patch
+#     0001 already does for this package's other math.
+#   - finalize_model_grads.py: the one call site passes moe_router_bias_update_rule,
+#     moe_rosenthal_cost and moe_rosenthal_lambda through.
+#   - transformer_config.py: the moe_router_bias_update_rule field, and __post_init__ validation
+#     for it outside the existing rosenthal-loss validation block, which this arm's usual
+#     moe_router_load_balancing_type="none" never reaches.
+#   - arguments.py: excludes moe_router_bias_update_rule from the auto-generated TransformerConfig
+#     argument group, because a restricted choices=[...] is only derived automatically from a
+#     Literal-typed field and this field stays plain str to match moe_rosenthal_variant's own
+#     precedent, then hand-adds --moe-router-bias-update-rule beside its existing hand-written
+#     neighbor --moe-router-load-balancing-type.
+#
+# Where in the code:
+#   File: megatron/core/transformer/moe/moe_utils.py
+#   Function: get_updated_expert_bias()
+#   Location: ~line 1128.
+#
+#   File: megatron/core/distributed/finalize_model_grads.py
+#   Function: _update_router_expert_bias()
+#   Location: the get_updated_expert_bias() call, ~line 364.
+#
+#   File: megatron/core/transformer/transformer_config.py
+#   Location: the field block after moe_router_bias_update_rate (~line 746), and the
+#     __post_init__ validation block after the existing rosenthal-loss checks (~line 1624).
+#
+#   File: megatron/training/arguments.py
+#   Function: _add_network_size_args() / _add_moe_args()
+#   Location: the TransformerConfig exclude list (~line 2025), and beside --moe-aux-loss-coeff
+#     (~line 3140).
+#
+# Known limitations:
+#   Verified single-GPU (DP=CP=TP=1), so the all-reduce this dispatches after has not been
+#   exercised at a reduce-group size above one, the same caveat patch 0003 already carries for the
+#   loss side of this same collective.
+#
+# How to fix on a future version:
+#   Find get_updated_expert_bias() in moe_utils.py and confirm the "sign" branch is still the two
+#   lines this patch dispatches around. Re-add the bias_update_rule/cost_family/lam parameters and
+#   the "rosenthal_price" branch, and update the finalize_model_grads.py call site and the two
+#   config files the same way.
+#
+# Applied to: Megatron-LM core_v0.18.0
+#
+diff --git a/megatron/core/distributed/finalize_model_grads.py b/megatron/core/distributed/finalize_model_grads.py
+index 60361e7..765c6f2 100644
+--- a/megatron/core/distributed/finalize_model_grads.py
++++ b/megatron/core/distributed/finalize_model_grads.py
+@@ -364,6 +364,9 @@ def _update_router_expert_bias(
+         stacked_expert_bias,
+         config.moe_router_bias_update_rate,
+         tp_dp_cp_group=tp_dp_cp_group,
++        bias_update_rule=config.moe_router_bias_update_rule,
++        cost_family=config.moe_rosenthal_cost,
++        lam=config.moe_rosenthal_lambda,
+     )
+ 
+     for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+index 8393a76..4691879 100644
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -1128,6 +1128,10 @@ def get_updated_expert_bias(
+     expert_bias: torch.Tensor,
+     expert_bias_update_rate: float,
+     tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
++    *,
++    bias_update_rule: str = "sign",
++    cost_family: Optional[str] = None,
++    lam: Optional[float] = None,
+ ) -> torch.Tensor:
+     """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
+ 
+@@ -1137,6 +1141,11 @@ def get_updated_expert_bias(
+         expert_bias_udpate_rate (float): The update rate for the expert bias.
+         tp_dp_cp_group (torch.distributed.ProcessGroup, optional): The group spanning the tensor,
+             data, and context parallel ranks that share the router expert-bias update.
++        bias_update_rule (str, optional): "sign" (default, unchanged) or "rosenthal_price"
++            (moe_congestion_routing patch), which steps against the congestion price instead of
++            the load-imbalance sign.
++        cost_family (str, optional): Congestion cost family, required for "rosenthal_price".
++        lam (float, optional): Congestion cost coefficient, required for "rosenthal_price".
+ 
+     Returns:
+         torch.Tensor: The updated expert bias.
+@@ -1150,9 +1159,25 @@ def get_updated_expert_bias(
+ 
+         # All Reduce Across TPxCPxDP group
+         torch.distributed.all_reduce(tokens_per_expert, group=tp_dp_cp_group)
+-        average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
+-        offset = average_tokens - tokens_per_expert
+-        updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
++        if bias_update_rule == "sign":
++            average_tokens = (
++                tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
++            )
++            offset = average_tokens - tokens_per_expert
++            updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
++        elif bias_update_rule == "rosenthal_price":
++            if cost_family is None or lam is None:
++                raise ValueError(
++                    "bias_update_rule='rosenthal_price' requires cost_family and lam"
++                )
++            from moe_congestion_routing.losses.rosenthal import price_bias_step
++
++            step = price_bias_step(tokens_per_expert, cost_family=cost_family, lam=lam)
++            updated_expert_bias = expert_bias - step * expert_bias_update_rate
++        else:
++            raise ValueError(
++                f"bias_update_rule must be 'sign' or 'rosenthal_price', got {bias_update_rule!r}"
++            )
+         return updated_expert_bias
+ 
+ 
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 74fce9b..e8e8bd0 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -746,6 +746,12 @@ class TransformerConfig(ModelParallelConfig):
+     and decreased for the experts with more assigned tokens.
+     The default value 1e-3 is same as that used in DeepSeekV3."""
+ 
++    moe_router_bias_update_rule: str = "sign"
++    """Which rule steps moe_router_enable_expert_bias's bias: "sign" (default, the DeepSeekV3
++    rule above, unchanged) or "rosenthal_price" (moe_congestion_routing patch), which steps
++    against the centered, clipped marginal congestion cost from moe_rosenthal_cost /
++    moe_rosenthal_lambda instead of the load-imbalance sign."""
++
+     moe_router_force_load_balancing: bool = False
+     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
+     and group-limited topk. This is an experimental feature and only for benchmark."""
+@@ -1618,6 +1624,35 @@ class TransformerConfig(ModelParallelConfig):
+                         "moe_aux_loss_coeff are what you intend."
+                     )
+ 
++        # Bias-update-rule validation (moe_congestion_routing patch), outside the rosenthal-loss
++        # branch above on purpose: this arm's moe_router_load_balancing_type is typically "none",
++        # so _rosenthal_types_selected is empty and none of the checks above ever run for it.
++        if self.moe_router_bias_update_rule not in ("sign", "rosenthal_price"):
++            raise ValueError(
++                "moe_router_bias_update_rule must be 'sign' or 'rosenthal_price', got "
++                f"{self.moe_router_bias_update_rule!r}"
++            )
++        if self.moe_router_bias_update_rule == "rosenthal_price":
++            if not self.moe_router_enable_expert_bias:
++                raise ValueError(
++                    "moe_router_bias_update_rule='rosenthal_price' requires "
++                    "moe_router_enable_expert_bias=True, otherwise finalize_model_grads.py skips "
++                    "the whole bias updater and the rule silently trains a plain control"
++                )
++            # Local import, reusing the same function-local shape as the rosenthal-loss checks
++            # above rather than importing at module load time.
++            from moe_congestion_routing.losses.cost_families import COST_FAMILIES
++
++            if self.moe_rosenthal_cost not in COST_FAMILIES:
++                raise ValueError(
++                    f"moe_rosenthal_cost must be one of {COST_FAMILIES}, got "
++                    f"{self.moe_rosenthal_cost!r}"
++                )
++            if self.moe_rosenthal_lambda <= 0:
++                raise ValueError(
++                    f"moe_rosenthal_lambda must be > 0, got {self.moe_rosenthal_lambda}"
++                )
++
+         # Outside the rosenthal branch on purpose, because it catches a stray flag on a run that
+         # is NOT rosenthal. Exactly one type, not merely including one, because the "cg" probe
+         # wraps the single logits tensor every aux loss reads, so a mixed list would report their
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 9a841a9..026b74b 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -2024,6 +2024,7 @@ def _add_network_size_args(parser):
+         "linear_attention_freq",
+         "moe_router_load_balancing_type",
+         "moe_aux_loss_coeff",
++        "moe_router_bias_update_rule",
+         "cp_comm_type",
+         "cuda_graph_modules",
+         "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
+@@ -3139,6 +3140,12 @@ def _add_moe_args(parser):
+                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "rosenthal"/"global_rosenthal" (moe_congestion_routing patch) price relative expert load through a congestion cost family instead of the Switch linear-in-load form, at micro-batch or global-batch level respectively; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
+     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
+                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
++    group.add_argument('--moe-router-bias-update-rule', type=str,
++                       choices=['sign', 'rosenthal_price'], default='sign',
++                       help='Which rule steps --moe-router-enable-expert-bias\'s bias: "sign" (default, '
++                            'DeepSeekV3\'s sign(mean_load - load)) or "rosenthal_price" (moe_congestion_routing '
++                            'patch), which steps against the congestion price from --moe-rosenthal-cost / '
++                            '--moe-rosenthal-lambda instead.')
+     # Token dispatcher arguments
+     # MoE communication overlap arguments
+ 

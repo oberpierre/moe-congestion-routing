@@ -19,3 +19,8 @@ config.sh
 hf_cache/
 .triton_cache/
 .inductor_cache/
+
+.claude/
+CLAUDE.md
+docs/
+.DS_Store

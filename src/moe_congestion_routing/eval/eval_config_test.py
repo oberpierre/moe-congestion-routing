@@ -357,7 +357,7 @@ def test_resolved_absolutises_load_and_tokenizer_model(tmp_path):
     assert resolved.tokenizer_model == str(tmp_path / "assets" / "tokenizer" / "gpt2")
 
 
-# --- resolved(): tokenizer_model is a hub id unless explicitly marked as a path (0026) --------
+# --- resolved(): tokenizer_model is a hub id unless explicitly marked as a path --------
 
 
 def test_resolved_passes_a_bare_hub_id_through_unchanged(tmp_path):

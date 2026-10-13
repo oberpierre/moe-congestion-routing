@@ -1,0 +1,10 @@
+# The full evaluation table: everything flame_suite runs plus tasks with signal at this scale
+group: extended_suite
+task:
+  - flame_suite
+  - sciq
+  - lambada_openai
+  - blimp
+  - gsm8k
+metadata:
+  version: 0.0

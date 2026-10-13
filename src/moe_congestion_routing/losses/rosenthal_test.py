@@ -1,13 +1,19 @@
+import math
 import pathlib
 
 import pytest
 import torch
 
-from moe_congestion_routing.losses.cost_families import pressure_bound
+from moe_congestion_routing.losses.cost_families import DEFAULT_LAMBDA, barrier_tau, pressure_bound
 from moe_congestion_routing.losses.rosenthal import (
+    _assert_conserves_global_mass,
+    balanced_load,
     congestion_potential,
+    cost,
     cost_antiderivative,
+    hard_relative_load,
     pressure,
+    price_bias_step,
     relative_loads,
     rosenthal_loss,
 )
@@ -569,22 +575,244 @@ def test_unknown_cost_family_raises_with_offending_value():
         congestion_potential(tokens_per_expert, 10.0, 2, 3, cost_family="bogus")
 
 
+def test_cost_antiderivative_barrier_matches_scipy_spence_across_the_inversion_branch():
+    # Pins the closed-form dilogarithm integral against scipy.special.spence, which computes the
+    # same function under spence(y) == Li2(1-y). The grid crosses the z > 0 fold the code
+    # branches on, and separately z = 88.7 where a naive exp would overflow float32, because a
+    # grid on one side of the fold would miss the failure it exists to catch.
+    #
+    # Compared relatively per point rather than with allclose, because C(x) falls to 9e-7 as
+    # z goes very negative, where an absolute tolerance would pass an implementation that
+    # returned zero. Worst measured relative error here is 3.5e-7, so 1e-5 keeps margin without
+    # asserting past float32.
+    from scipy.special import spence
+
+    lam, tau = 0.2, 0.1
+    zs = [-500.0, -50.0, -1.0, -0.001, 0.0, 0.001, 1.0, 50.0, 88.7, 200.0, 500.0, 629.9]
+    xs = torch.tensor([1.0 + z * tau for z in zs])
+
+    def li2(w: float) -> float:
+        return spence(1.0 - w)
+
+    const = li2(-math.exp(-1.0 / tau))
+    reference = torch.tensor(
+        [lam * tau * (const - li2(-math.exp(z))) for z in zs], dtype=torch.float32
+    )
+    mine = cost_antiderivative(xs, "softplus_barrier", lam=lam)
+    assert torch.isfinite(mine).all()
+    rel = ((mine - reference).abs() / reference.abs()).max().item()
+    assert rel < 1e-5, f"worst relative error {rel:.3g} over z={zs}"
+
+
+def test_rosenthal_loss_soft_variant_is_finite_for_the_barrier():
+    # The barrier's antiderivative is now an exact dilogarithm, so 'soft' must return a finite
+    # value instead of raising.
+    prob_sum = torch.ones(3)
+    tokens_per_expert = torch.ones(3)
+    loss = rosenthal_loss(
+        prob_sum,
+        tokens_per_expert,
+        10.0,
+        2,
+        3,
+        coeff=1.0,
+        lam=1.0,
+        variant="soft",
+        cost_family="softplus_barrier",
+    )
+    assert torch.isfinite(loss)
+
+
 def test_potential_closed_forms_key_mismatch_raises_at_import():
     # Same shape as cost_families.py's own guard: _POTENTIAL_CLOSED_FORMS must be checked against
-    # COST_FAMILIES as well as COST_EXPONENTS, since COST_FAMILIES is the literal every consumer
-    # actually validates membership against. Dropping a family's closed form here, with
-    # COST_EXPONENTS/COST_FAMILIES left untouched, must fail at import rather than falling through
-    # to whichever branch happened to be checked last in congestion_potential.
+    # COST_FAMILIES, the literal every consumer actually validates membership against. Dropping a
+    # family's closed form here, with COST_FAMILIES left untouched, must fail at import rather
+    # than falling through to whichever branch happened to be checked last in
+    # congestion_potential.
     import moe_congestion_routing.losses.rosenthal as rosenthal_module
 
     source = pathlib.Path(rosenthal_module.__file__).read_text()
     mutated = source.replace(
         "_POTENTIAL_CLOSED_FORMS: dict[str, Callable[[torch.Tensor, torch.Tensor, float], "
         'torch.Tensor]] = {\n    "linear": _potential_closed_form_linear,\n    '
-        '"quadratic": _potential_closed_form_quadratic,\n}',
+        '"quadratic": _potential_closed_form_quadratic,\n    '
+        '"softplus_barrier": _potential_closed_form_barrier,\n}',
         "_POTENTIAL_CLOSED_FORMS: dict[str, Callable[[torch.Tensor, torch.Tensor, float], "
         'torch.Tensor]] = {\n    "linear": _potential_closed_form_linear,\n}',
     )
     assert mutated != source  # guard against the replacement silently matching nothing
     with pytest.raises(ValueError, match="disagree"):
         exec(compile(mutated, "<mutated rosenthal>", "exec"), {"__name__": "mutated"})
+
+
+def test_barrier_potential_prefix_sum_matches_the_naive_per_expert_sum():
+    # The barrier has no closed form, so its potential is a prefix sum over one shared price
+    # vector rather than a loop of per-expert aranges. This pins that rewrite against the naive
+    # definition, and includes an idle expert because indexing a prefix sum built without a
+    # leading zero would charge every zero-count expert for its first arc, which is a silent
+    # overcount rather than a crash.
+    num_experts = 6
+    topk = 2
+    tokens_per_expert = torch.tensor([0.0, 1.0, 7.0, 20.0, 41.0, 3.0])
+    total_num_tokens = 20.0 * num_experts / topk  # N such that L = 20
+    load = balanced_load(total_num_tokens, topk, num_experts)
+    lam = 0.2
+
+    naive = sum(
+        float(cost(torch.arange(1, int(n) + 1).float() / load, "softplus_barrier", lam).sum())
+        for n in tokens_per_expert.tolist()
+        if int(n) > 0
+    )
+    phi = congestion_potential(
+        tokens_per_expert,
+        total_num_tokens,
+        topk,
+        num_experts,
+        lam=lam,
+        cost_family="softplus_barrier",
+    )
+    assert torch.allclose(phi, torch.tensor(naive / (total_num_tokens * topk)), atol=1e-6)
+
+
+def test_barrier_potential_is_zero_when_every_expert_is_idle():
+    # max_n == 0 is the branch the arange cannot take, and it must not raise.
+    phi = congestion_potential(torch.zeros(4), 40.0, 2, 4, lam=0.2, cost_family="softplus_barrier")
+    assert float(phi) == 0.0
+
+
+def test_conserves_global_mass_accepts_sigmoid_shaped_prob_sum():
+    # A sigmoid-normalized router sums each token's per-expert scores to 1, not to E times
+    # anything: rows here sum to 1 rather than to a softmax row's usual E/topk-scaled mass, and
+    # the invariant must still hold because it is a property of per-token normalization, not of
+    # softmax specifically.
+    num_experts = 6
+    total_num_tokens = 40
+    torch.manual_seed(3)
+    raw = torch.rand(total_num_tokens, num_experts)
+    scores = torch.sigmoid(raw)
+    scores = scores / scores.sum(dim=-1, keepdim=True)
+    prob_sum = scores.sum(dim=0)
+    u_glob, _ = relative_loads(prob_sum, torch.zeros(num_experts), total_num_tokens, 2, num_experts)
+    _assert_conserves_global_mass(u_glob, num_experts)  # must not raise
+
+
+def test_conserves_global_mass_rejects_unnormalized_prob_sum():
+    # If a future upstream change stopped normalizing the score function before summing (the
+    # fused kernel path this loss deliberately does not support), sum_e u_glob != E and this must
+    # fail here rather than surface only as a wrong number in a GPU log.
+    num_experts = 6
+    total_num_tokens = 40
+    torch.manual_seed(3)
+    raw = torch.rand(total_num_tokens, num_experts)
+    unnormalized_scores = torch.sigmoid(raw)  # rows do not sum to 1
+    prob_sum = unnormalized_scores.sum(dim=0)
+    u_glob, _ = relative_loads(prob_sum, torch.zeros(num_experts), total_num_tokens, 2, num_experts)
+    with pytest.raises(AssertionError, match="conservation invariant"):
+        _assert_conserves_global_mass(u_glob, num_experts)
+
+
+def test_power_families_are_unchanged_by_the_barrier_branch():
+    # The barrier added a branch to cost() and cost_antiderivative(). These pin the power
+    # families to their own closed forms, so a future edit to that branch cannot quietly move
+    # the arms the fleet has already trained.
+    x = torch.tensor([0.0, 0.25, 1.0, 3.0, 64.0])
+    for lam in (0.5, 1.0, 2.0):
+        assert torch.equal(cost(x, "linear", lam), lam * x)
+        assert torch.equal(cost(x, "quadratic", lam), lam * x**2)
+        assert torch.equal(cost_antiderivative(x, "linear", lam), lam * x**2 / 2)
+        assert torch.equal(cost_antiderivative(x, "quadratic", lam), lam * x**3 / 3)
+
+
+def test_barrier_cost_is_unchanged_by_the_antiderivative_branch():
+    # cost() is what the hard variant trains against, and hard is the arm already running on the
+    # cluster, so it is pinned to softplus directly rather than to the code under test.
+    x = torch.tensor([0.0, 0.5, 1.0, 1.555, 9.9, 64.0])
+    tau, lam = barrier_tau("softplus_barrier"), 0.2
+    want = lam * torch.nn.functional.softplus((x - 1.0) / tau)
+    assert torch.equal(cost(x, "softplus_barrier", lam), want)
+
+
+def _hot_cool_load(num_experts: int, hot_n: int, hot_level: float) -> torch.Tensor:
+    """A load vector conserving ``sum(u) == num_experts`` (mass-conserving, as every ``u`` here
+    must be): ``hot_n`` experts at ``hot_level`` and the rest at whatever level makes the mean 1.
+    """
+    cool_n = num_experts - hot_n
+    cool_level = (num_experts - hot_n * hot_level) / cool_n
+    u = torch.full((num_experts,), cool_level)
+    u[:hot_n] = hot_level
+    return u
+
+
+@pytest.mark.parametrize("cost_family", ["linear", "quadratic", "softplus_barrier"])
+def test_price_bias_step_matches_alflb_gap_at_total_collapse(cost_family):
+    # 8 winners carry the whole batch (8x the mean each) and 56 experts are dead, which is the
+    # two-valued load every family saturates its clip on. The applied bias delta (-step) must
+    # then match ALF-LB's +/- rate exactly: -1 on the winners, +1 on the dead.
+    u = torch.zeros(64)
+    u[:8] = 8.0
+    step = price_bias_step(u, cost_family=cost_family, lam=DEFAULT_LAMBDA[cost_family])
+    assert step[:8].tolist() == pytest.approx([1.0] * 8)
+    assert step[8:].tolist() == pytest.approx([-1.0] * 56)
+    delta = -step
+    assert delta[:8].tolist() == pytest.approx([-1.0] * 8)
+    assert delta[8:].tolist() == pytest.approx([1.0] * 56)
+    gap = (step[:8].mean() - step[8:].mean()).item()
+    assert gap == pytest.approx(2.0, abs=1e-4)
+
+
+@pytest.mark.parametrize(
+    "cost_family,expected_spread",
+    [("linear", 0.6667), ("quadratic", 0.7778), ("softplus_barrier", 0.9667)],
+)
+def test_price_bias_step_decelerates_near_balance(cost_family, expected_spread):
+    # 16 experts at 1.5x the mean and 48 at 0.8333x sit inside the clip for every family, so the
+    # step shrinks with the price gap instead of saturating at +/- rate, and the families order by
+    # how steeply their cost rises.
+    u = _hot_cool_load(num_experts=64, hot_n=16, hot_level=1.5)
+    step = price_bias_step(u, cost_family=cost_family, lam=DEFAULT_LAMBDA[cost_family])
+    assert step.abs().max().item() < 1.0  # nothing saturates the clip
+    spread = (step[:16].mean() - step[16:].mean()).item()
+    assert spread == pytest.approx(expected_spread, abs=1e-4)
+
+
+def test_price_bias_step_is_alflb_at_the_linear_family_by_sign():
+    # ALF-LB is the special case: a linear price through a sign nonlinearity is exactly
+    # sign(mean(u) - u), Megatron's own offset. Checked elementwise, including two experts tied
+    # at zero, where both rules must agree the step is zero.
+    u = torch.tensor([5.0, 3.0, 0.0, 0.0, 2.0, 4.0, 1.0, 1.0])
+    step = price_bias_step(u, cost_family="linear", lam=1.0)
+    alflb_offset = u.mean() - u
+    assert torch.equal(torch.sign(-step), torch.sign(alflb_offset))
+
+
+def test_price_bias_step_zero_layer_steps_by_zero_without_mixing_other_layers():
+    # Stacked (layers, experts) input: one all-zero layer's mean load is 0, which would make
+    # u/L a 0/0 without the guard. That layer must return exactly zero while a live layer in the
+    # same tensor is priced normally, matching sign(0 - 0) == 0 on the same degenerate input.
+    zero_layer = torch.zeros(8)
+    live_layer = torch.tensor([5.0, 3.0, 0.0, 0.0, 2.0, 4.0, 1.0, 1.0])
+    stacked = torch.stack([zero_layer, live_layer])
+    step = price_bias_step(stacked, cost_family="linear", lam=1.0)
+    assert torch.equal(step[0], torch.zeros(8))
+    assert torch.equal(step[1], price_bias_step(live_layer, cost_family="linear", lam=1.0))
+
+
+def test_price_bias_step_load_matches_hard_relative_load():
+    # price_bias_step divides by u.mean(dim=-1), which is algebraically hard_relative_load's
+    # E*n/(N*K) once counts conserve mass (sum(n) == N*K), the fourth site in this file computing
+    # that quantity. Linear cost at lam=1 is the identity, so this pins the two computations
+    # together directly instead of leaving them free to drift apart.
+    n = torch.tensor([1.0, 3.0, 5.0, 2.0, 4.0, 0.0, 6.0, 3.0])
+    total_num_tokens, topk, num_experts = 8, 3, 8
+    assert n.sum().item() == total_num_tokens * topk
+    u_hat = hard_relative_load(n, total_num_tokens, topk, num_experts)
+    expected = torch.clamp(u_hat - u_hat.mean(), -1.0, 1.0)
+    step = price_bias_step(n, cost_family="linear", lam=1.0)
+    assert torch.equal(step, expected)
+
+
+def test_price_bias_step_1d_and_2d_agree():
+    u = torch.tensor([5.0, 3.0, 0.0, 0.0, 2.0, 4.0, 1.0, 1.0])
+    flat = price_bias_step(u, cost_family="quadratic", lam=0.5)
+    stacked = price_bias_step(u.unsqueeze(0), cost_family="quadratic", lam=0.5)
+    assert torch.equal(flat, stacked.squeeze(0))

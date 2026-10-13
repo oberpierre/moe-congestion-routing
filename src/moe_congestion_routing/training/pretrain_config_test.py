@@ -1,6 +1,7 @@
 import dataclasses
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -163,6 +164,13 @@ def test_exit_on_missing_checkpoint_flag():
         _cfg(load="/run/checkpoints", exit_on_missing_checkpoint=True)
     )
     assert "--exit-on-missing-checkpoint" not in build_megatron_args(_cfg())
+
+
+def test_skip_train_flag():
+    # A bare flag, present only when True. Megatron's own argparse adds --no-load-optim on its
+    # own, so this harness emits nothing else for it.
+    assert "--skip-train" in build_megatron_args(_cfg(skip_train=True))
+    assert "--skip-train" not in build_megatron_args(_cfg())
 
 
 def test_resolved_expands_env_vars_in_paths(tmp_path, monkeypatch):
@@ -356,6 +364,25 @@ def test_router_pre_softmax_and_dtype_opt_in():
     assert _pairs(on)["--moe-router-dtype"] == "fp32"
 
 
+def test_force_load_balancing_opt_in():
+    off = build_megatron_args(_cfg())
+    assert "--moe-router-force-load-balancing" not in off
+    on = build_megatron_args(_cfg(moe_router_force_load_balancing=True))
+    assert "--moe-router-force-load-balancing" in on
+
+
+def test_aux_score_function_opt_in_and_defaults_absent():
+    off = build_megatron_args(_cfg())
+    assert "--moe-router-aux-score-function" not in off
+    on = build_megatron_args(_cfg(moe_router_aux_score_function="softmax"))
+    assert _pairs(on)["--moe-router-aux-score-function"] == "softmax"
+
+
+def test_unknown_aux_score_function_rejected():
+    with pytest.raises(ValueError, match="quux"):
+        build_megatron_args(_cfg(moe_router_aux_score_function="quux"))
+
+
 def test_grouped_gemm_and_distributed_optimizer_opt_in():
     # Both are pure throughput and memory levers with no effect on routing or loss, but grouped
     # GEMM swaps the expert module, so it has to be recorded in the launch command.
@@ -410,6 +437,14 @@ def test_base_cluster_config_pins_the_reference_architecture():
     # The common probe grid is structural: every arm shares one coarse interval so their dumps
     # land on identical steps. Pinning it here guards against a config drift.
     assert cfg.moe_probe_coarse_interval == 250
+    # A second dense window over the WSD anneal (train_iters - lr_wsd_decay_iters = 5000
+    # to train_iters = 5500), discriminating the two live explanations of the kappa decay.
+    assert cfg.moe_probe_dense_windows == ["0:500", "5000:5500"]
+    # 16 sequences give every asset two reportable 16,384-token units, whereas 8 would give
+    # only one.
+    assert cfg.moe_probe_seqs == 16
+    # All three committed standing assets, which is what the triad estimator needs on one run.
+    assert len(cfg.moe_probe_batch) == 3
 
 
 def test_base_cluster_active_params_match_flame_exactly():
@@ -735,14 +770,14 @@ def test_rosenthal_lambda_omitted_resolves_to_the_cost_familys_default():
         assert _pairs(args)["--moe-rosenthal-lambda"] == str(default)
 
 
-def test_rosenthal_rule4_requires_softmax_score_function():
-    with pytest.raises(ValueError, match="moe_router_score_function"):
-        build_megatron_args(
-            _cfg(
-                moe_router_load_balancing_type="rosenthal",
-                moe_router_score_function="sigmoid",
-            )
+def test_rosenthal_allows_sigmoid_score_function():
+    args = build_megatron_args(
+        _cfg(
+            moe_router_load_balancing_type="rosenthal",
+            moe_router_score_function="sigmoid",
         )
+    )
+    assert _pairs(args)["--moe-router-score-function"] == "sigmoid"
 
 
 def test_global_rosenthal_soft_no_longer_rejected():
@@ -753,6 +788,21 @@ def test_global_rosenthal_soft_no_longer_rejected():
         _cfg(moe_router_load_balancing_type="global_rosenthal", moe_rosenthal_variant="soft")
     )
     assert _pairs(args)["--moe-rosenthal-variant"] == "soft"
+
+
+def test_softplus_barrier_soft_no_longer_rejected():
+    # softplus_barrier's antiderivative is now an exact dilogarithm, so 'soft' must parse and
+    # emit the same flags as every other cost family, with no validation error.
+    args = build_megatron_args(
+        _cfg(
+            moe_router_load_balancing_type="rosenthal",
+            moe_rosenthal_cost="softplus_barrier",
+            moe_rosenthal_variant="soft",
+        )
+    )
+    pairs = _pairs(args)
+    assert pairs["--moe-rosenthal-cost"] == "softplus_barrier"
+    assert pairs["--moe-rosenthal-variant"] == "soft"
 
 
 def test_rosenthal_soft_no_longer_requires_tensor_model_parallel_size_one():
@@ -882,6 +932,33 @@ def test_probe_emits_all_flags_when_enabled():
     assert pairs["--moe-probe-dir"] == "/run/probes"
     i = args.index("--moe-probe-dense-windows")
     assert args[i + 1 : i + 2] == ["0:500"]
+
+
+def test_probe_emits_every_asset_in_a_multi_asset_list():
+    args = build_megatron_args(
+        _cfg(
+            moe_probe_batch=["assets/probe/standing_a_16x2048.npz", "assets/probe/strided_b.npz"],
+            moe_probe_coarse_interval=250,
+            moe_probe_dense_interval=25,
+            moe_probe_seqs=8,
+        )
+    )
+    i = args.index("--moe-probe-batch")
+    assert args[i + 1 : i + 3] == [
+        "assets/probe/standing_a_16x2048.npz",
+        "assets/probe/strided_b.npz",
+    ]
+    assert args[i + 3] == "--moe-probe-coarse-interval"  # the list ends before the next flag
+
+
+def test_probe_rejects_duplicate_asset_stems():
+    with pytest.raises(ValueError, match="unique stems"):
+        build_megatron_args(
+            _cfg(
+                moe_probe_batch=["assets/probe/dev.npz", "other/dir/dev.npz"],
+                moe_probe_coarse_interval=250,
+            )
+        )
 
 
 def test_probe_requires_an_asset_when_enabled():
@@ -1017,13 +1094,30 @@ def test_probe_windows_malformed_spec_rejected():
 
 
 def test_resolved_absolutises_moe_probe_paths(tmp_path):
+    # A bare string is still legal input and normalises to a one-element list.
     r = MoEPretrainConfig(
         train_data_path="/data/train",
         moe_probe_batch="assets/probe/dev.npz",
         moe_probe_dir="probes",
     ).resolved(tmp_path)
-    assert r.moe_probe_batch == str(tmp_path / "assets/probe/dev.npz")
+    assert r.moe_probe_batch == [str(tmp_path / "assets/probe/dev.npz")]
     assert r.moe_probe_dir == str(tmp_path / "probes")
+
+
+def test_moe_probe_batch_scalar_string_normalises_to_a_list():
+    cfg = MoEPretrainConfig(moe_probe_batch="assets/probe/dev.npz")
+    assert cfg.moe_probe_batch == ["assets/probe/dev.npz"]
+
+
+def test_resolved_absolutises_a_list_of_moe_probe_batch_assets(tmp_path):
+    r = MoEPretrainConfig(
+        train_data_path="/data/train",
+        moe_probe_batch=["assets/probe/standing.npz", "assets/probe/strided.npz"],
+    ).resolved(tmp_path)
+    assert r.moe_probe_batch == [
+        str(tmp_path / "assets/probe/standing.npz"),
+        str(tmp_path / "assets/probe/strided.npz"),
+    ]
 
 
 def test_pretrain_config_module_imports_no_torch():
@@ -1041,3 +1135,80 @@ def test_pretrain_config_module_imports_no_torch():
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_bias_update_rule_defaults_to_sign_and_emits_nothing_extra_by_default():
+    args = build_megatron_args(_cfg(moe_router_enable_expert_bias=True))
+    assert _pairs(args)["--moe-router-bias-update-rule"] == "sign"
+    assert "--moe-rosenthal-cost" not in args
+    assert "--moe-rosenthal-lambda" not in args
+
+
+def test_bias_update_rule_rejects_unknown_value():
+    with pytest.raises(ValueError, match="moe_router_bias_update_rule"):
+        build_megatron_args(
+            _cfg(moe_router_enable_expert_bias=True, moe_router_bias_update_rule="magnitude")
+        )
+
+
+def test_rosenthal_price_requires_expert_bias():
+    with pytest.raises(ValueError, match="moe_router_enable_expert_bias"):
+        build_megatron_args(
+            _cfg(
+                moe_router_enable_expert_bias=False,
+                moe_router_bias_update_rule="rosenthal_price",
+            )
+        )
+
+
+def test_rosenthal_price_emits_the_rule_and_the_cost_family_flags_with_no_balancing_loss():
+    # This arm's balancing type stays "none": without lifting the cost-family emission out of the
+    # ROSENTHAL_TYPES branch, this would silently price with linear/lam=1.0 instead of the family
+    # the config names.
+    cfg = _cfg(
+        moe_router_load_balancing_type="none",
+        moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+        moe_router_bias_update_rule="rosenthal_price",
+        moe_rosenthal_cost="softplus_barrier",
+    )
+    pairs = _pairs(build_megatron_args(cfg))
+    assert pairs["--moe-router-bias-update-rule"] == "rosenthal_price"
+    assert pairs["--moe-rosenthal-cost"] == "softplus_barrier"
+    assert pairs["--moe-rosenthal-lambda"] == str(DEFAULT_LAMBDA["softplus_barrier"])
+    # No loss-side flags: this arm carries no rosenthal balancing type.
+    assert "--moe-rosenthal-variant" not in build_megatron_args(cfg)
+
+
+def test_rosenthal_price_does_not_warn_the_pressure_bound_a_loss_coefficient_does_not_use():
+    # pressure_bound sizes moe_aux_loss_coeff, which a rosenthal_price-only arm never trains
+    # against, so an extreme lambda here must not raise the loss-side sanity warning.
+    cfg = _cfg(
+        moe_router_load_balancing_type="none",
+        moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+        moe_router_bias_update_rule="rosenthal_price",
+        moe_rosenthal_cost="linear",
+        moe_rosenthal_lambda=1000.0,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        build_megatron_args(cfg)  # must not raise
+
+
+def test_rosenthal_price_and_rosenthal_loss_together_emit_each_flag_once():
+    # A rosenthal_price bias rule stacked on top of a rosenthal balancing type shares the same
+    # cost-family/lambda pair, so --moe-rosenthal-cost/--moe-rosenthal-lambda must appear once,
+    # not twice, alongside the loss-only --moe-rosenthal-variant.
+    cfg = _cfg(
+        moe_router_load_balancing_type="rosenthal",
+        moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+        moe_router_bias_update_rule="rosenthal_price",
+        moe_rosenthal_cost="quadratic",
+    )
+    args = build_megatron_args(cfg)
+    assert args.count("--moe-rosenthal-cost") == 1
+    assert args.count("--moe-rosenthal-lambda") == 1
+    assert _pairs(args)["--moe-rosenthal-variant"] == "hard"
+    assert _pairs(args)["--moe-router-bias-update-rule"] == "rosenthal_price"

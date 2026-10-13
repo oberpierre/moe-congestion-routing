@@ -1,0 +1,52 @@
+# Pass the collapsed checkpoint on the command line:
+# sbatch scripts/train_moe_climblab.sbatch configs/train/collapse/race/<arm>.yaml \
+#   artifacts/collapse/induce_negaux/induce-negaux/checkpoints step125-<arm>
+# The third param is required, otherwise the launcher writes back into the run it loaded. It is a
+# NAME joined under this arm's output_dir, not a path, and it becomes the W&B run id verbatim, so
+# it has to be unique across the whole W&B project.
+extends: base.yaml
+
+# Load the weights, restart the counter at zero, take no optimizer, scheduler or RNG state. Every
+# arm therefore begins from identical weights on an identical fresh schedule, with no stale Adam
+# moments for the dead experts that could manufacture an apparent recovery on their own.
+finetune: true
+exit_on_missing_checkpoint: true
+
+# The last induction checkpoint before its learning-rate anneal. The collapse is as complete as at
+# step 50, but the surviving experts have trained alone for longer, so the starved experts start
+# further behind. Step 150 is avoided because the anneal itself widens that gap.
+ckpt_step: 125
+
+# base_cluster's value. The z-loss is the only term that penalises logit magnitude, so it is what
+# keeps the gate responsive for every balancing loss to act through.
+moe_z_loss_coeff: 1.0e-3
+
+# Different from the induction because `finetune` does not restore `consumed_train_samples`,
+# so each arm restarts its data iterator at sample 0. So this would replay the tokens the
+# induction just saw. Shared by every arm so that all arms get the same data stream.
+seed: 2687
+
+# 2000 steps at base.yaml's batch is 0.52B tokens, the same horizon for every arm. Every balancing
+# arm revived its dead experts within about 150 steps of the step-150 checkpoint, so this still
+# leaves over 1000 steps of held balance, which is what the criterion counts. Warmup and anneal keep
+# the lengths the 4000-step race used, so the schedules match up to step 1800.
+train_iters: 2000
+lr_warmup_iters: 40
+lr_wsd_decay_iters: 200
+
+# Dense early, because recovery happens early: the local pilot's arms reached their thresholds
+# between steps 40 and 140, so 25-step spacing over the first 500 is where the ranking is decided.
+# The second window brackets the anneal.
+moe_probe_dense_windows: ["0:500", "1600:2000"]
+
+# Sigmoid, for every arm. ALF-LB needs it (expert bias is only valid under sigmoid or
+# sqrtsoftplus), and running the other arms on a different score function would compare a method
+# against a checkpoint rather than against another method. The bias buffer is present but frozen,
+# matching the induction checkpoint, so only the ALF-LB arm raises its update rate.
+moe_router_score_function: sigmoid
+moe_router_enable_expert_bias: true
+moe_router_bias_update_rate: 0.0
+
+# Every step, because recovery is decided early. The logged loss is a mean over this interval, so
+# these runs cannot be compared step for step with runs logged at another interval.
+log_interval: 1

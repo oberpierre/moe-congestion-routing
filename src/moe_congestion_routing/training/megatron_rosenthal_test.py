@@ -134,7 +134,87 @@ def test_rosenthal_hard_linear_equals_switch_grad_wrt_scores(topk):
 
 
 # ---------------------------------------------------------------------------------------------
-# TransformerConfig validation rules 1-6 raise; rule 8 warns.
+# The equivalence above uses an arbitrary probability tensor, so it holds regardless of which
+# score function produced it. Patch 0008 lets the aux-loss carrier differ from selection, and the
+# risk it introduces is plumbing, not math: every aux-loss consumer (switch, rosenthal) reads the
+# same `scores_for_aux_loss` tensor from one `compute_routing_scores_for_aux_loss` call, so a
+# change that routed the carrier override to one loss and not the other would desync them. These
+# two tests run that real function under both score functions to pin against that.
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("carrier", ["sigmoid", "softmax"])
+def test_rosenthal_hard_linear_equals_switch_under_both_carriers(carrier):
+    torch.manual_seed(0)
+    num_tokens, num_experts, topk, coeff = 37, 8, 2, 0.02
+    logits = torch.randn(num_tokens, num_experts)
+    _, scores = _moe_utils.compute_routing_scores_for_aux_loss(logits, topk, carrier)
+    counts = torch.randint(0, 10, (num_experts,)).float()
+
+    switch = switch_load_balancing_loss_func(
+        probs=scores,
+        tokens_per_expert=counts,
+        total_num_tokens=num_tokens,
+        topk=topk,
+        num_experts=num_experts,
+        moe_aux_loss_coeff=coeff,
+        fused=False,
+    )
+    rosenthal = rosenthal_loss(
+        prob_sum=scores.sum(dim=0),
+        tokens_per_expert=counts,
+        total_num_tokens=num_tokens,
+        topk=topk,
+        num_experts=num_experts,
+        coeff=coeff,
+        lam=1.0,
+        variant="hard",
+        cost_family="linear",
+    )
+    assert torch.allclose(switch, rosenthal, atol=1e-5)
+
+
+@pytest.mark.parametrize("carrier", ["sigmoid", "softmax"])
+def test_rosenthal_hard_linear_equals_switch_grad_under_both_carriers(carrier):
+    torch.manual_seed(0)
+    num_tokens, num_experts, topk, coeff = 37, 8, 2, 0.02
+    counts = torch.randint(0, 10, (num_experts,)).float()
+
+    logits_switch = torch.randn(num_tokens, num_experts, requires_grad=True)
+    _, scores_switch = _moe_utils.compute_routing_scores_for_aux_loss(logits_switch, topk, carrier)
+    switch = switch_load_balancing_loss_func(
+        probs=scores_switch,
+        tokens_per_expert=counts,
+        total_num_tokens=num_tokens,
+        topk=topk,
+        num_experts=num_experts,
+        moe_aux_loss_coeff=coeff,
+        fused=False,
+    )
+    (switch_grad,) = torch.autograd.grad(switch, logits_switch)
+
+    logits_rosenthal = logits_switch.detach().clone().requires_grad_(True)
+    _, scores_rosenthal = _moe_utils.compute_routing_scores_for_aux_loss(
+        logits_rosenthal, topk, carrier
+    )
+    rosenthal = rosenthal_loss(
+        prob_sum=scores_rosenthal.sum(dim=0),
+        tokens_per_expert=counts,
+        total_num_tokens=num_tokens,
+        topk=topk,
+        num_experts=num_experts,
+        coeff=coeff,
+        lam=1.0,
+        variant="hard",
+        cost_family="linear",
+    )
+    (rosenthal_grad,) = torch.autograd.grad(rosenthal, logits_rosenthal)
+
+    assert torch.allclose(switch_grad, rosenthal_grad, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------------------------
+# TransformerConfig validation rules
 # ---------------------------------------------------------------------------------------------
 
 
@@ -153,17 +233,24 @@ def test_rule3_nonpositive_lambda_raises():
         _quiet_transformer_config(moe_rosenthal_lambda=0.0)
 
 
-def test_rule4_sigmoid_score_function_raises():
-    with pytest.raises(ValueError, match="moe_router_score_function"):
-        _quiet_transformer_config(moe_router_score_function="sigmoid")
+def test_rule4_retired_sigmoid_score_function_no_longer_rejected():
+    # Rule 4 is retired. compute_routing_scores_for_aux_loss already per-token normalizes sigmoid
+    # scores the same way it normalizes softmax, so the loss's conservation invariant holds under
+    # sigmoid too and a rosenthal type must construct without raising.
+    _quiet_transformer_config(moe_router_score_function="sigmoid")
 
 
 def test_global_rosenthal_soft_no_longer_rejected():
-    # Rules 5 and 6 are retired. The synced-coefficient construction makes 'soft' correct at any
-    # reduce-group size, so global_rosenthal with soft must construct without raising.
     _quiet_transformer_config(
         moe_router_load_balancing_type="global_rosenthal", moe_rosenthal_variant="soft"
     )
+
+
+def test_softplus_barrier_soft_no_longer_rejected():
+    # softplus_barrier's antiderivative is now an exact dilogarithm, so the patched
+    # TransformerConfig must construct without raising at the soft variant, mirroring the
+    # global_rosenthal retirement above.
+    _quiet_transformer_config(moe_rosenthal_cost="softplus_barrier", moe_rosenthal_variant="soft")
 
 
 def test_rosenthal_soft_no_longer_requires_tensor_model_parallel_size_one():
@@ -210,7 +297,7 @@ def test_rule8_pressure_above_sanity_bound_warns():
     # Deliberately not routed through _quiet_transformer_config, whose blanket
     # simplefilter("ignore") would swallow our own warning along with the unrelated ones.
     # pytest.warns needs only one matching warning, so the unrelated ones are harmless here.
-    with pytest.warns(UserWarning, match="congestion pressure at full imbalance"):
+    with pytest.warns(UserWarning, match="exceeds the sanity bound of 1 at full imbalance"):
         TransformerConfig(**_base_kwargs(moe_rosenthal_lambda=100.0))
 
 
@@ -218,7 +305,7 @@ def test_rule8_pressure_within_sanity_bound_does_not_warn_about_pressure():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         _quiet_transformer_config(moe_rosenthal_lambda=1.0)
-    assert not any("congestion pressure" in str(w.message) for w in caught)
+    assert not any("sanity bound" in str(w.message) for w in caught)
 
 
 def test_rule8_soft_variant_warns_with_the_soft_bound_expression():
@@ -230,6 +317,60 @@ def test_rule8_soft_variant_warns_with_the_soft_bound_expression():
 
 
 # ---------------------------------------------------------------------------------------------
+# moe_router_bias_update_rule validation. moe_router_load_balancing_type stays "none",
+# this arm's own setting, so these checks are provably reached outside the rosenthal-loss block
+# above, which _rosenthal_types_selected leaves empty for a "none" arm.
+# ---------------------------------------------------------------------------------------------
+
+
+def _price_rule_kwargs(**overrides) -> dict:
+    kwargs = {
+        "num_layers": 2,
+        "hidden_size": 64,
+        "num_attention_heads": 4,
+        "num_moe_experts": 8,
+        "moe_router_topk": 2,
+        "add_bias_linear": False,
+        "moe_router_load_balancing_type": "none",
+        "moe_router_enable_expert_bias": True,
+        "moe_router_score_function": "sigmoid",
+        "moe_router_bias_update_rule": "rosenthal_price",
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _quiet_price_rule_config(**overrides):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return TransformerConfig(**_price_rule_kwargs(**overrides))
+
+
+def test_bias_rule_unknown_rule_raises():
+    with pytest.raises(ValueError, match="moe_router_bias_update_rule"):
+        _quiet_price_rule_config(moe_router_bias_update_rule="bogus")
+
+
+def test_bias_rule_rosenthal_price_without_expert_bias_raises():
+    with pytest.raises(ValueError, match="moe_router_enable_expert_bias"):
+        _quiet_price_rule_config(moe_router_enable_expert_bias=False)
+
+
+def test_bias_rule_rosenthal_price_unknown_cost_family_raises():
+    with pytest.raises(ValueError, match="moe_rosenthal_cost"):
+        _quiet_price_rule_config(moe_rosenthal_cost="not_a_real_family")
+
+
+def test_bias_rule_rosenthal_price_nonpositive_lambda_raises():
+    with pytest.raises(ValueError, match="moe_rosenthal_lambda"):
+        _quiet_price_rule_config(moe_rosenthal_lambda=-3.0)
+
+
+def test_bias_rule_rosenthal_price_with_valid_settings_does_not_raise():
+    _quiet_price_rule_config()
+
+
+# ---------------------------------------------------------------------------------------------
 # List-form moe_router_load_balancing_type. The field holds either a string or a list, since
 # argparse's nargs='+' always produces a list and validate_args collapses only a single-element
 # one. So a list combining rosenthal with another type, or selecting both rosenthal types at once,
@@ -237,14 +378,15 @@ def test_rule8_soft_variant_warns_with_the_soft_bound_expression():
 # ---------------------------------------------------------------------------------------------
 
 
-def test_rule4_sigmoid_score_function_raises_for_rosenthal_combined_with_another_type():
-    with pytest.raises(ValueError, match="moe_router_score_function"):
-        _quiet_transformer_config(
-            moe_router_load_balancing_type=["seq_aux_loss", "rosenthal"],
-            # One coefficient per entry, as Megatron's own list-form validation requires.
-            moe_aux_loss_coeff=[0.01, 0.01],
-            moe_router_score_function="sigmoid",
-        )
+def test_rule4_retired_sigmoid_score_function_no_longer_rejected_when_combined_with_another_type():
+    # Same retirement as the scalar case above, checked through the list-form path so a future
+    # change to that path's own normalization is not missed just because it always tests scalar.
+    _quiet_transformer_config(
+        moe_router_load_balancing_type=["seq_aux_loss", "rosenthal"],
+        # One coefficient per entry, as Megatron's own list-form validation requires.
+        moe_aux_loss_coeff=[0.01, 0.01],
+        moe_router_score_function="sigmoid",
+    )
 
 
 def test_rosenthal_and_global_rosenthal_together_raises_exclusivity_error():
@@ -314,3 +456,64 @@ def test_is_aux_loss_enabled_false_when_coeff_is_zero():
 
 def test_is_aux_loss_enabled_false_for_none_balancing():
     assert _bare_router("none", 0.0).is_aux_loss_enabled() is False
+
+
+def test_is_aux_loss_enabled_true_for_negative_coeff():
+    # A negative coefficient rewards concentration instead of penalizing it (the collapse
+    # induction's lever), so the router must not treat it as off the way it treats zero.
+    assert _bare_router("rosenthal", -0.01).is_aux_loss_enabled() is True
+
+
+# ---------------------------------------------------------------------------------------------
+# rosenthal_price sign convention, checked through the real get_updated_expert_bias.
+# torch.distributed.all_reduce inside it is unconditional, so a single-rank no-op gloo group
+# (the same pattern game/alflb_test.py uses) makes it callable on CPU.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_price_rule_moves_bias_against_load_and_matches_alflb_at_collapse(tmp_path):
+    started_here = not torch.distributed.is_initialized()
+    if started_here:
+        torch.distributed.init_process_group(
+            backend="gloo", world_size=1, rank=0, init_method=f"file://{tmp_path / 'store'}"
+        )
+    try:
+        rate = 1e-3
+        counts = torch.tensor([1.0, 3.0, 5.0, 2.0, 4.0, 0.0, 6.0, 3.0])  # mean 3.0
+        bias = torch.zeros_like(counts)
+        updated = _moe_utils.get_updated_expert_bias(
+            counts.clone(),
+            bias,
+            rate,
+            tp_dp_cp_group=torch.distributed.group.WORLD,
+            bias_update_rule="rosenthal_price",
+            cost_family="linear",
+            lam=1.0,
+        )
+        delta = updated - bias
+        above_mean = counts > counts.mean()
+        below_mean = counts < counts.mean()
+        assert (delta[above_mean] < 0).all()
+        assert (delta[below_mean] > 0).all()
+        assert delta.abs().max().item() <= rate + 1e-6  # fp32 rounding at the clip boundary
+
+        # Total collapse (one winner at 8x the mean, the rest dead) saturates the clip on both
+        # sides, so the step must equal the rate exactly rather than merely stay bounded by it.
+        collapse = torch.zeros(8)
+        collapse[0] = 8.0
+        collapse_bias = torch.zeros(8)
+        collapse_updated = _moe_utils.get_updated_expert_bias(
+            collapse.clone(),
+            collapse_bias,
+            rate,
+            tp_dp_cp_group=torch.distributed.group.WORLD,
+            bias_update_rule="rosenthal_price",
+            cost_family="linear",
+            lam=1.0,
+        )
+        collapse_delta = collapse_updated - collapse_bias
+        assert collapse_delta[0].item() == pytest.approx(-rate)
+        assert collapse_delta[1:].tolist() == pytest.approx([rate] * 7)
+    finally:
+        if started_here:
+            torch.distributed.destroy_process_group()

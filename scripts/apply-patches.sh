@@ -7,8 +7,21 @@
 #
 # Idempotent by RESET: each submodule is reset to the commit the project records for it
 # (`git rev-parse HEAD:<submodule>`) before its patches are (re)applied, so this is safe to rerun
-# in any state -- already-patched, half-patched, with a dirty index, or after a submodule update.
+# in any state: already-patched, half-patched, with a dirty index, or after a submodule update.
+#
+# That reset is destructive while it runs, so two of these racing on one shared checkout leave a
+# window where the tree on disk is the unpinned original. A job importing megatron.core in that
+# window gets the unpatched router and, on a none/aux_loss arm, trains to completion writing no
+# probes at all. Pass --verify to check the patches are present without touching anything, which
+# is what a job on a shared workdir should do.
 set -euo pipefail
+
+mode=apply
+case "${1:-}" in
+    --verify) mode=verify ;;
+    "") ;;
+    *) echo "usage: $(basename "$0") [--verify]" >&2; exit 2 ;;
+esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 patches_root="$repo_root/patches"
@@ -31,6 +44,29 @@ for submodule_dir in "$patches_root"/*/; do
 
     patches=("$submodule_dir"*.patch)
     if [[ ${#patches[@]} -eq 0 ]]; then
+        continue
+    fi
+
+    if [[ "$mode" == verify ]]; then
+        # The marker is the longest line each patch adds, taken from the patch itself rather than
+        # from a list here, so a patch added later is checked without anyone remembering to.
+        for patch in "${patches[@]}"; do
+            name="$submodule/$(basename "$patch")"
+            found="$(awk '/^\+\+\+ / {f=substr($0,7); next} /^\+/ {line=substr($0,2); if (length(line) > maxlen) {maxlen=length(line); best=line; bestf=f}} END {print bestf "\t" best}' "$patch")"
+            marker_file="${found%%$'\t'*}"
+            marker="${found#*$'\t'}"
+            if [[ -z "$marker_file" || -z "$marker" ]]; then
+                echo "[apply-patches] ERROR: $name adds no lines, so it cannot be verified." >&2
+                exit 1
+            fi
+            if grep -qF -- "$marker" "$target/$marker_file"; then
+                applied=$((applied + 1))
+            else
+                echo "[apply-patches] ERROR: $name is NOT applied to $submodule." >&2
+                echo "  Run ./scripts/apply-patches.sh once, on an idle workdir, before launching." >&2
+                exit 1
+            fi
+        done
         continue
     fi
 
@@ -62,4 +98,8 @@ for submodule_dir in "$patches_root"/*/; do
     done
 done
 
-echo "[apply-patches] done: $applied applied"
+if [[ "$mode" == verify ]]; then
+    echo "[apply-patches] verified: $applied patches present, nothing modified"
+else
+    echo "[apply-patches] done: $applied applied"
+fi

@@ -1,0 +1,17 @@
+extends: base_cluster.yaml
+
+moe_router_load_balancing_type: none
+moe_aux_loss_coeff: 0.0
+moe_router_enable_expert_bias: true
+moe_router_score_function: sigmoid
+moe_router_bias_update_rate: 1.0e-3
+moe_router_bias_update_rule: rosenthal_price
+moe_rosenthal_cost: softplus_barrier
+# moe_rosenthal_lambda omitted: inherits the barrier's slope-matched default (0.2) from
+# DEFAULT_LAMBDA in src/moe_congestion_routing/losses/cost_families.py.
+
+# Matches alflb.yaml's windows: this arm also carries an expert_bias buffer, so the same early
+# and anneal-boundary dense points are the ones worth the extra probe cost.
+moe_probe_dense_windows: ["0:1000", "4500:5500"]
+
+output_dir: artifacts/exp1/rosenthal_price_barrier

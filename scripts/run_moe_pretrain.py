@@ -116,6 +116,11 @@ def main() -> None:
     # also requires a non-empty run name, so derive one from the config + timestamp when unset.
     if not cfg.tensorboard_dir:
         cfg = replace(cfg, tensorboard_dir=str(run_dir / "tensorboard"))
+    # The probe dir defaults the same way, and it is not optional: validate_probe_setup() calls
+    # Path() on it unconditionally, so leaving it None raises TypeError at the first training
+    # step, long after model init and the dataset index build.
+    if not cfg.moe_probe_dir:
+        cfg = replace(cfg, moe_probe_dir=str(run_dir / "probes"))
     if cfg.wandb_project:
         updates = {}
         if not cfg.wandb_save_dir:

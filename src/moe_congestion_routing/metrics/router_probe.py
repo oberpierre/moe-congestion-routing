@@ -13,17 +13,12 @@ from typing import Any
 import numpy
 import torch
 
+from moe_congestion_routing.metrics.probe_dump_format import (
+    ROUTING_MAP_BITORDER,
+    TOKEN_AXIS_CONVENTION,
+)
+
 logger = logging.getLogger(__name__)
-
-# Every array is written in this row order: row n = sequence * seq_length + position, counting
-# every probed sequence across every microbatch in probe-batch order. The router's own flatten
-# is row n = position * micro_batch_size + sequence within a microbatch. ProbeCapture.record
-# changes the ordering, so they are comparable across microbatche sizes.
-TOKEN_AXIS_CONVENTION = "sequence-major: row n = sequence * seq_length + position"
-
-# numpys default made explicit: if num_experts is not divisible by 8 the routing_map array is padded
-# with zeros. Bitorder `big` controls that these bits appear on the right for big-endian.
-ROUTING_MAP_BITORDER = "big"
 
 
 class ProbeCapture:

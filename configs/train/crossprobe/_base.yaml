@@ -1,0 +1,46 @@
+# Base for the 2x2 cross-probe: one saved checkpoint, probed against one asset, no training.
+#
+# The probe's init-state dump fires only when Megatron's iteration counter is zero, which a resume
+# never is. `finetune: true` loads the model weights and restarts that counter, so the dump
+# captures the checkpoint's own router state before any optimizer step moves it. The one training
+# iteration below happens after the dump is already on disk, and exists only because Megatron's
+# train loop needs a horizon.
+#
+# `moe_probe_batch` and `moe_probe_seqs` are the instrument axis whereas `load` is the run axis,
+# so a concrete arm sets those three and nothing else. Two of the four cells reproduce a dump we
+# already have from training, which is the check that this path measures what the training probe
+# measured.
+extends: ../base_cluster.yaml
+
+finetune: true
+exit_on_missing_checkpoint: true
+ckpt_step: 500
+
+# One iteration, and no save: the dump is written before the loop and the weights must not move.
+train_iters: 1
+exit_interval: 1
+save: null
+save_interval: null
+lr_warmup_iters: 0
+lr_wsd_decay_iters: 1
+
+# Freeze both things that would make the measured state differ from the checkpoint's. lr 0 is
+# belt-and-braces, because the dump precedes the first step, but a zero here means a mistake in the
+# ordering costs nothing instead of silently reporting a stepped model.
+lr: 0.0
+min_lr: 0.0
+moe_router_bias_update_rate: 0.0
+
+# The probe must be on for validate_probe_setup and the init dump to run at all. The interval is
+# never reached, because the run exits at iteration 1.
+moe_probe_coarse_interval: 1
+moe_probe_dense_interval: 0
+moe_probe_dense_windows: null
+
+# Same balancing as the arm the checkpoints come from, so the loaded state dict matches the model.
+moe_router_load_balancing_type: none
+moe_aux_loss_coeff: 0.0
+moe_router_enable_expert_bias: true
+moe_router_score_function: sigmoid
+
+output_dir: artifacts/exp1/crossprobe

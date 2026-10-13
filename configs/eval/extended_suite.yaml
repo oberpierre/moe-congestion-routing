@@ -1,0 +1,5 @@
+#   sbatch --time=02:00:00 scripts/eval_moe.sbatch configs/eval/extended_suite.yaml \
+#       artifacts/<run>/checkpoints <step>
+extends: base_cluster.yaml
+
+tasks: [extended_suite]

@@ -1,0 +1,14 @@
+# The sigmoid twin of induce_softmax.yaml. It exists because ALF-LB cannot run on a softmax
+# checkpoint: expert bias is validated against a sigmoid or sqrtsoftplus score function.
+extends: induce_softmax.yaml
+
+moe_router_score_function: sigmoid
+
+# The bias buffer exists in the checkpoint but never moves, because its update rate is zero. It
+# keeps the induction honest, since a live ALF-LB bias balances and would prevent the collapse
+# being induced, and it means the ALF-LB race arm loads into a matching state dict rather than one
+# missing a key.
+moe_router_enable_expert_bias: true
+moe_router_bias_update_rate: 0.0
+
+output_dir: artifacts/collapse/induce_sigmoid

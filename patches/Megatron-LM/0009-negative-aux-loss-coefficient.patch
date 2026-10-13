@@ -1,0 +1,34 @@
+# Patch: Let a negative moe_aux_loss_coeff reach the router
+# ==================================
+# Problem: is_aux_loss_enabled gates the whole aux-loss block on the coefficient being > 0, so a
+#   negative moe_aux_loss_coeff, which rewards concentration instead of penalizing it, is treated
+#   as off and silently dropped. The run trains with no balancing at all while the config says
+#   otherwise, with no error. _apply_aux_loss already has its own `if aux_loss_coeff == 0: return
+#   probs`, so this guard is the only place a negative coefficient needs relaxing.
+#
+# What this patch does:
+#   - router.py: is_aux_loss_enabled tests `!= 0` instead of `> 0`.
+#
+# Where in the code:
+#   File: megatron/core/transformer/moe/router.py
+#   Function: TopKRouter.is_aux_loss_enabled()
+#
+# How to fix on a future version:
+#   Find is_aux_loss_enabled's loop over aux_loss_type and confirm it still compares
+#   get_aux_loss_coeff(aux_loss_type) against zero, then change the comparison from > 0 to != 0.
+#
+# Applied to: Megatron-LM core_v0.18.0
+#
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 998ae2b06..5b4bd87cb 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -309,7 +309,7 @@ class TopKRouter(Router):
+             "rosenthal",
+             "global_rosenthal",
+         ]:
+-            if self.get_aux_loss_coeff(aux_loss_type) > 0:
++            if self.get_aux_loss_coeff(aux_loss_type) != 0:
+                 return True
+         return False
+ 
